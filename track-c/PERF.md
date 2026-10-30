@@ -16,6 +16,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 9 | push 376e3cdfa655, scored ok | 376e3cd · Track C (run-5cfdae8378cd) | 0.13 | 22 | 57.2 |
 | 10 | push b80b71eaed3a, scored ok | b80b71e · Track C (run-6b0aeec09c5b) | 0.13 | 22 | 57.0 |
 | 11 | push 704a88eb6e9f, scored ok | 704a88e · Track C (run-96e1148bb559) | 0.14 | 16 | 57.5 |
+| 12 | push 442dbe7fbe59, scored ok | 442dbe7 · Track C (run-75fe344f3f7e) | 0.10 | 16 | 61.0 |
 
 ## Experiment log
 
@@ -42,3 +43,10 @@ Each experiment's numbers are added here once the live board has measured it and
 - Probes P8 (never lifted, wrong output on purpose): nolookup (d3d89b7, a stand-in for the intern lookup) and noowner
   (7632abe, the round's owner step removed). Their box phase lines put the lookups at about a third of pass 2 and the
   owner step at about a fifth.
+- c-9 owner, commit 829f91b: each worker files its round pairs into one bucket per owning worker, through a group
+  table built once, so an owner reads only the buckets addressed to it. Verdict KEEP, box K 16.54 (board row 12,
+  442dbe7 · Track C). The variant with
+  twice the bucket capacity (538d5b6) scored box K 16.33 and was not shipped.
+- c-9.1 fix, commit 7fa72a4 (correctness fix): the shared name arena allocated a block again after a reservation skipped
+  several blocks (a very long name), losing the names already in it; the block is now allocated by its own directory
+  pointer. Found by the correctness kit's long-name cases.

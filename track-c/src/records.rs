@@ -37,6 +37,28 @@ impl Slot {
     }
 }
 
+/// Index of the first `c` at or after `i`. Compares 32 bytes a step (AVX2 compare, movemask, trailing
+/// zeros) instead of one byte a step; the last 31 bytes of the mapping go byte by byte, so nothing is
+/// read past its end. Measured (this VM, 12 workers, full seed 1, interleaved medians): pass2+names
+/// 294 -> 244 ms.
+#[inline]
+fn find(b: &[u8], mut i: usize, c: u8) -> usize {
+    #[cfg(target_feature = "avx2")]
+    while i + 32 <= b.len() {
+        use std::arch::x86_64::*;
+        // SAFETY: the 32 bytes at i lie inside `b`; AVX2 is on at compile time (x86-64-v3).
+        let m = unsafe {
+            let block = _mm256_loadu_si256(b.as_ptr().add(i) as *const __m256i);
+            _mm256_movemask_epi8(_mm256_cmpeq_epi8(block, _mm256_set1_epi8(c as i8))) as u32
+        };
+        if m != 0 {
+            return i + m.trailing_zeros() as usize;
+        }
+        i += 32;
+    }
+    i + b[i..].iter().position(|&x| x == c).expect("unterminated field")
+}
+
 /// One text field (name or note) starting at `i`, which is followed by a comma.
 /// Returns where the raw bytes between the quotes start and how many there are (escapes kept),
 /// the value's length once `""` is unescaped, and the index just past the comma.
@@ -44,7 +66,7 @@ impl Slot {
 fn text_field(b: &[u8], i: usize) -> (usize, usize, u64, usize) {
     if b[i] != b'"' {
         // Unquoted: everything up to the comma (c-join.md:28).
-        let end = i + b[i..].iter().position(|&c| c == b',').expect("unterminated field");
+        let end = find(b, i, b',');
         return (i, end - i, (end - i) as u64, end + 1);
     }
     // Quoted: ends at the first `"` not part of a `""` pair (c-join.md:33). Commas, LF and BOM
@@ -53,7 +75,7 @@ fn text_field(b: &[u8], i: usize) -> (usize, usize, u64, usize) {
     let mut j = start;
     let mut escapes = 0u64;
     loop {
-        let q = j + b[j..].iter().position(|&c| c == b'"').expect("unterminated quoted field");
+        let q = find(b, j, b'"');
         if b.get(q + 1) == Some(&b'"') {
             escapes += 1;
             j = q + 2;
@@ -116,12 +138,11 @@ pub fn parse_range<L: Lookup + ?Sized>(
         let (_, _, note_len, next) = text_field(b, next);
         let (region_id, next) = uint_until(b, next, b',');
         let (cents, next) = amount(b, next);
-        // Terminator: CRLF, LF, or end of file (c-join.md:21).
-        *i = match b.get(next) {
-            Some(b'\r') => next + 2,
-            Some(b'\n') => next + 1,
-            _ => next,
-        };
+        // Terminator: CRLF or LF (c-join.md:21), skipped without a branch: one byte, plus one for a CR.
+        // At the end of a file without a final terminator this is one past the end, which ends the
+        // range all the same. Measured (this VM, 12 workers, full seed 1, interleaved medians of 9):
+        // pass2+names 259 -> 255 ms, inside the noise; it is kept for being four lines shorter.
+        *i = next + 1 + (b.get(next) == Some(&b'\r')) as usize;
 
         let group = lookup.group(region_id as usize);
         let s = &mut slots[group];

@@ -165,9 +165,13 @@ impl Arena {
         }
         assert!(a.used + len < u32::MAX as usize, "names over 4 GiB");
         let k = block_of(a.used);
-        if a.blocks.len() <= k {
-            // A block is allocated only when a reservation first lands in it (k = blocks.len() here,
-            // since `used` only moves forward one block at a time).
+        // A block is allocated when a reservation first lands in it, decided by block k's own
+        // directory pointer. The skip above can pass over several blocks (a reservation longer than
+        // the next block, e.g. a name of 4 KiB or more, c-join.md:50), so testing `blocks.len() <= k`
+        // instead allocated block k again on its next reservation and overwrote its pointer, losing
+        // the records already in it (names_distinct wrong from 2 workers up; kit group intern-edge,
+        // check/c-kit bf91502). `blocks` only owns the allocations.
+        if self.blocks[k].load(Ordering::Relaxed).is_null() {
             let block = Box::<[UnsafeCell<u8>]>::new_uninit_slice(ARENA_BLOCK << k);
             self.blocks[k].store(block.as_ptr() as *mut u8, Ordering::Relaxed);
             a.blocks.push(block);
