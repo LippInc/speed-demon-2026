@@ -1,6 +1,6 @@
 # Track A: Ingest
 
-K 32.08 (box `sd-bench/A`, official, the lower reading; fresh 32.24): T 0.035 s, M 25.3 MB, S 651, D 1,
+K 32.53 (box `sd-bench/A`, fresh, the lower reading; official 32.58): T 0.034 s, M 25.1 MB, S 680, D 1,
 sha 5/5+5/5.
 Reproduce with `sdrig run --track-dir track-a --track A --data <seed-1 full dir> --expected-sha <hash> --runs 5`.
 
@@ -8,7 +8,7 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Approach
 
-Rust, standard library only. The program maps `/data/requests.log` read-only (`src/main.rs` `map_file`) and
+Rust, standard library only. The binary links the C runtime statically (probe a-26), so no dynamic loader runs before main. The program maps `/data/requests.log` read-only (`src/main.rs` `map_file`) and
 cuts it into one byte range per worker, each starting at a line start (`line_ranges`). Every thread walks its
 range once with private tables, so threads share nothing (`scan`, `Table`), then drops that range's page-table
 entries (`release_range`) so the process exit has fewer to tear down. The key has two levels: a small
@@ -29,11 +29,14 @@ one merge, one step per distinct endpoint, gives every endpoint a global rank (`
 order needs only integer sorts.
 
 The tail runs in parallel, split by hour (`format_hour`): hours are disjoint and contiguous in the output, so
-each hour is merged across threads, its percentiles found by selection (`percentiles`) and its lines formatted
+each hour is merged across threads, its percentiles found (`percentiles`: groups of up to 32 latencies are sorted, larger ones are
+selected in ascending rank order, each rank inside the part right of the previous one) and its lines formatted
 by one thread. That hour's latency blocks are dropped as soon as it is formatted, which returns their pages.
 The main thread writes the hours' buffers in output order as they finish.
 
-The worker count is `available_parallelism`; `SD_WORKERS` overrides it for the hash tests only.
+The worker count is `available_parallelism`; `SD_WORKERS` overrides it for the hash tests only. Each
+output number is written from its low end two digits at a time from a 200-byte table; a number with an odd
+digit count writes its top digit alone.
 
 ## Dependencies
 

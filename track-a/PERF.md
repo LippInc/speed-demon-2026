@@ -24,6 +24,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 17 | push 22b6620692eb, scored ok | 22b6620 · Track A (run-ef28cacbc64d) | 0.04 | 25 | 74.6 |
 | 18 | push 90c864ad6d4e, scored ok | 90c864a · Track A (run-500a6311f2e5) | 0.04 | 25 | 74.7 |
 | 19 | push 2e2ee13a2258, scored ok | 2e2ee13 · Track A (run-77b664eb8d78) | 0.04 | 25 | 74.5 |
+| 20 | push 48c9f564734d, scored ok | 48c9f56 · Track A (run-79c3f2b20fb0) | 0.04 | 26 | 75.4 |
 
 ## What each push carried
 
@@ -50,6 +51,9 @@ The board re-runs the same code on every push, so several rows can carry one exp
 
 Experiments measured on our bench box only, with no board run (their box status is the evidence):
 
+- Row 20 carries a-17: the gap between the scan and the tail. Endpoint bytes copied into a small pool per thread,
+  so nothing after the scan refaults the released input mapping, and the global endpoint merge takes one step per
+  distinct endpoint instead of one per (thread, endpoint).
 - a-2, failed: a two-pass counting sort into one flat latency array. `K 14.63 | T 0.152s | M 47.4MB | S 405 | sha
   5/5+5/5 OK` against a-1's K 15.46: the second pass cost as much as the one-thread tail it removed.
 - a-7, failed, no code kept: batched prefetching of the table slots, groups and chunk writes (batch 4, 8 and 16).
@@ -83,3 +87,15 @@ Experiments measured on our bench box only, with no board run (their box status 
   the scan refaults the released input mapping, and the global endpoint merge takes one step per distinct endpoint
   instead of one per (thread, endpoint). `K 32.08 (official; fresh 32.24) | T 0.035s | M 25.3MB | S 651 | sha
   5/5+5/5 OK` against a-13's K 30.17-30.50 (T 0.039-0.041s).
+- a-18, failed (dropped): latency chunks that double from 3 to 24 slots instead of 3 then 15. On our test machine
+  it lowered peak memory by 0.8 to 1.0 MB and the latency storage by 1.0 MB; the box read `K 31.40 (official; fresh
+  31.58) | T 0.036s | M 26.0MB | S 655 | sha 5/5+5/5 OK`, below a-17's K 31.83-32.44 and above its M 24.9-25.3MB, so
+  the test machine's 1 MB cut did not reach the box.
+- a-20: the tail's percentile select. Groups of up to 32 latencies are sorted; larger ones are selected in ascending
+  rank order (p50 on all values, p95 right of it, p99 right of that), about 1.55n of select work against 2.9n.
+  `K 32.36 (official; fresh 32.44) | T 0.035s | M 25.2MB | S 664 | sha 5/5+5/5 OK`, and K 32.21 official / 32.66 fresh
+  on a second reading, against a-17's K 31.83-32.44: just above, inside the spread; merged into a-21.
+- a-19: the output number formatter, built by a spec-driven builder: two digits per step from a 200-byte table.
+  Box K 32.25 official / 31.48 fresh, inside a-17's spread alone; merged into a-21.
+- a-21: a-20's select and a-19's formatter together, boxed as one. `K 32.53 (fresh; official 32.58) | T 0.034s |
+  M 25.1MB | S 680 | sha 5/5+5/5 OK` against a-17's K 31.83-32.44 (T 0.035s).

@@ -392,16 +392,39 @@ fn scan(data: &'static [u8], start: usize, end: usize) -> Table {
     table
 }
 
+// The per-digit loop cost about 376 instructions and 4.0 conditional mispredicts per output line in
+// a-17's cachegrind (seed 7 sample, 1 worker; six numbers of 1 to 10 digits per line); writing two digits per
+// step from a 200-byte table halves the loop turns (the `% 100` and `/ 100` of a step compile to one
+// multiply-high pair). Experiment a-19; with a-20 (a-21, same cachegrind): 376 -> 295 instructions per output
+// line, mispredicts about level (4.1 -> 4.3), since the turn count still follows the digit count.
+/// "00" to "99" as 200 ASCII bytes, built at compile time: push_u64 writes two digits per step.
+const DIGITS2: [u8; 200] = {
+    let mut t = [0u8; 200];
+    let mut i = 0;
+    while i < 100 {
+        t[2 * i] = b'0' + (i / 10) as u8;
+        t[2 * i + 1] = b'0' + (i % 10) as u8;
+        i += 1;
+    }
+    t
+};
+
 fn push_u64(out: &mut Vec<u8>, mut v: u64) {
     let mut buf = [0u8; 20];
     let mut i = buf.len();
-    loop {
+    while v >= 100 {
+        let r = (v % 100) as usize * 2;
+        v /= 100;
+        i -= 2;
+        buf[i..i + 2].copy_from_slice(&DIGITS2[r..r + 2]);
+    }
+    if v >= 10 {
+        let r = v as usize * 2;
+        i -= 2;
+        buf[i..i + 2].copy_from_slice(&DIGITS2[r..r + 2]);
+    } else {
         i -= 1;
-        buf[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-        if v == 0 {
-            break;
-        }
+        buf[i] = b'0' + v as u8;
     }
     out.extend_from_slice(&buf[i..]);
 }
@@ -421,16 +444,29 @@ fn push_hour(out: &mut Vec<u8>, hour: u32) {
     out.extend_from_slice(b":00:00Z");
 }
 
-/// Exact nearest-rank p50, p95, p99 of an unsorted slice by selection, which is linear where a full sort is not.
+/// A group of at most this many latencies is sorted outright: below it a sort is cheaper than three selects. The
+/// cut depends only on the group's own count. Measured on this VM (seed 1 full, select time summed over threads):
+/// 16 lost at 4 and 12 workers; 32 and 64 measured alike, and 32 is kept.
+const SORT_MAX: usize = 32;
+
+/// Exact nearest-rank p50, p95, p99 of an unsorted slice: a small group is sorted; a larger one is selected in
+/// ascending rank order, each rank inside the part right of the one before (everything there is no smaller):
+/// p50 on all n values, p95 on about n/2, p99 on about n/20, about 1.55n of select work against about 2.9n when
+/// the highest rank went first and each lower one searched the part left of it.
+/// Measured on this VM, seed 1 full, select time summed over threads, against that highest-first order (a-17):
+/// 25.3 -> 19.5 ms at 1 worker, 29.8 -> 21.7 at 4, 37.6 -> 26.5 at 12; the shuffled file 35.3 -> 28.2 ms at 4.
+/// Cachegrind (seed 7 sample, 1 worker): 3,106 -> 2,857 instructions per output line.
 fn percentiles(lat: &mut [u32]) -> [u32; 3] {
     // Spec 3.4: 0-based index of rank ceil(p * n / 100).
     let idx = |p: usize| (p * lat.len() + 99) / 100 - 1;
     let (i50, i95, i99) = (idx(50), idx(95), idx(99));
-    // Select the highest rank first: everything left of it is no larger, so each lower rank is selected
-    // within the left part only.
-    let (_, &mut v99, _) = lat.select_nth_unstable(i99);
-    let (_, &mut v95, _) = lat[..=i99].select_nth_unstable(i95);
-    let (_, &mut v50, _) = lat[..=i95].select_nth_unstable(i50);
+    if lat.len() <= SORT_MAX {
+        lat.sort_unstable();
+        return [lat[i50], lat[i95], lat[i99]];
+    }
+    let (_, &mut v50, above50) = lat.select_nth_unstable(i50);
+    let v95 = if i95 == i50 { v50 } else { *above50.select_nth_unstable(i95 - i50 - 1).1 };
+    let v99 = if i99 == i95 { v95 } else { *lat[i95 + 1..].select_nth_unstable(i99 - i95 - 1).1 };
     [v50, v95, v99]
 }
 
