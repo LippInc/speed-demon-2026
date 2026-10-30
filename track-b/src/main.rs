@@ -4,8 +4,6 @@
 //! tokenizes every document and decides every BOOL query (per document, or 64 documents at a time) and every
 //! PHRASE pattern (by anchor checks) for it; nothing is indexed.
 
-use std::collections::HashMap;
-use std::fmt::Write as _;
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -76,9 +74,22 @@ struct Dict<'q> {
 }
 
 impl<'q> Dict<'q> {
-    fn with_capacity(max_terms: usize) -> Self {
-        let size = (2 * max_terms).next_power_of_two().max(2); // load factor at most 1/2
-        Dict { terms: Vec::new(), hashes: Vec::new(), slots: vec![0; size], shift: 32 - size.trailing_zeros() }
+    /// The table doubles as terms arrive, so it ends at load factor 1/4 to 1/2 of the distinct count. b-9 sized it
+    /// from every term occurrence (4 MB of slots), and the random inserts into it were most of the query parse.
+    fn new() -> Self {
+        Dict { terms: Vec::new(), hashes: Vec::new(), slots: vec![0; 16], shift: 28 }
+    }
+
+    fn grow(&mut self) {
+        let size = self.slots.len() * 2;
+        (self.slots, self.shift) = (vec![0; size], self.shift - 1);
+        for (t, &h) in self.hashes.iter().enumerate() {
+            let mut i = self.slot(h);
+            while self.slots[i] != 0 {
+                i = (i + 1) & (size - 1);
+            }
+            self.slots[i] = t as u32 + 1;
+        }
     }
 
     #[inline]
@@ -107,6 +118,9 @@ impl<'q> Dict<'q> {
         let h = term.iter().fold(FNV_OFFSET, |h, &c| fnv_step(h, c));
         if let Some(t) = self.find(term, h) {
             return t;
+        }
+        if 2 * (self.terms.len() + 1) > self.slots.len() {
+            self.grow();
         }
         let mask = self.slots.len() - 1;
         let mut i = self.slot(h);
@@ -162,6 +176,15 @@ impl TermTable {
             table.bytes[t].0[..term.len()].copy_from_slice(term);
         }
         table
+    }
+
+    /// Gives term `order[n]` the id n in place: the slots keep their hash and get the new id, and the entries move
+    /// (cheaper than rebuilding the table after the df sample).
+    fn renumber(&mut self, order: &[usize], new_id: &[u32]) {
+        for s in self.slots.iter_mut().filter(|s| **s != 0) {
+            *s = (*s >> 32) << 32 | (new_id[(*s as u32 - 1) as usize] as u64 + 1);
+        }
+        self.bytes = order.iter().map(|&t| self.bytes[t]).collect();
     }
 
     fn set_roles(&mut self, plan: &BoolPlan) {
@@ -303,33 +326,50 @@ fn tokenize_doc(data: &[u8], mut i: usize, dict: &TermTable, mut on_token: impl 
 const SAMPLE_WINDOWS: usize = 64;
 const SAMPLE_SHARE: usize = 128;
 
-fn estimate_df(docs: &[u8], dict: &TermTable) -> (Vec<u32>, u32) {
+fn estimate_df(docs: &[u8], dict: &TermTable, workers: usize) -> (Vec<u32>, u32) {
     let n_terms = dict.bytes.len();
-    let mut df = vec![0u32; n_terms];
-    let mut seen = vec![0u32; n_terms];
-    let mut stamp = 0u32;
     let window = docs.len() / SAMPLE_SHARE / SAMPLE_WINDOWS;
-    for k in 0..SAMPLE_WINDOWS {
-        let from = docs.len() * k / SAMPLE_WINDOWS;
-        let mut i = match docs[from..].iter().position(|&b| b == b'\n') {
-            _ if from == 0 => 0,
-            Some(p) => from + p + 1,
-            None => continue,
-        };
-        let stop = (i + window).min(docs.len());
-        while i < stop {
-            stamp += 1;
-            i = tokenize_doc(docs, parse_id(docs, i).1, dict, |t| {
-                if let Some(t) = t {
-                    if seen[t as usize] != stamp {
-                        seen[t as usize] = stamp;
-                        df[t as usize] += 1;
+    // The windows are spread over the workers (window k on worker k % n) and their counts summed: the sample was
+    // 15 ms of serial prologue on the box.
+    let n = workers.clamp(1, SAMPLE_WINDOWS);
+    let parts: Vec<(Vec<u32>, u32)> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..n)
+            .map(|w| {
+                s.spawn(move || {
+                    let mut df = vec![0u32; n_terms];
+                    let mut seen = vec![0u32; n_terms];
+                    let mut stamp = 0u32;
+                    for k in (w..SAMPLE_WINDOWS).step_by(n) {
+                        let from = docs.len() * k / SAMPLE_WINDOWS;
+                        let mut i = match docs[from..].iter().position(|&b| b == b'\n') {
+                            _ if from == 0 => 0,
+                            Some(p) => from + p + 1,
+                            None => continue,
+                        };
+                        let stop = (i + window).min(docs.len());
+                        while i < stop {
+                            stamp += 1;
+                            i = tokenize_doc(docs, parse_id(docs, i).1, dict, |t| {
+                                if let Some(t) = t {
+                                    if seen[t as usize] != stamp {
+                                        seen[t as usize] = stamp;
+                                        df[t as usize] += 1;
+                                    }
+                                }
+                            });
+                        }
                     }
-                }
-            });
-        }
+                    (df, stamp)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let mut df = vec![0u32; n_terms];
+    for (part, _) in &parts {
+        df.iter_mut().zip(part).for_each(|(d, p)| *d += p);
     }
-    (df, stamp)
+    (df, parts.iter().map(|p| p.1).sum())
 }
 
 /// BOOL queries evaluated per document inside the pass, so no posting list is ever stored (b-2 kept 47.6 MB of
@@ -722,6 +762,7 @@ struct BoolQuery {
     rest: Vec<(Op, u32)>,
 }
 
+#[derive(Clone, Copy)]
 enum Query {
     Bool(usize),
     Phrase(usize),
@@ -744,25 +785,26 @@ fn main() {
     // Queries: intern every term, dedupe BOOL lines and PHRASE term sequences.
     let qtext = map_file(&format!("{data_dir}/queries.txt"));
     let lines: Vec<&[u8]> = qtext.split(|&b| b == b'\n').filter(|l| !l.is_empty()).collect();
-    let mut dict = Dict::with_capacity(qtext.iter().filter(|&&b| b == b' ').count() + lines.len());
+    let mut dict = Dict::new();
+    // Lines are deduplicated through the same FNV table type as the terms (std's SipHash maps and a cloned
+    // Vec<u32> key per phrase were most of the parse). Under spec 2.3's grammar (single spaces, lower-case terms)
+    // two PHRASE lines are equal exactly when their term sequences are, so the line is the phrase's key too.
+    let mut line_ids = Dict::new();
+    let mut line_query: Vec<Query> = Vec::new(); // by distinct line
     let mut bools: Vec<BoolQuery> = Vec::new();
-    let mut bool_ids: HashMap<&[u8], usize> = HashMap::new();
     let mut patterns: Vec<Vec<u32>> = Vec::new();
-    let mut pattern_ids: HashMap<Vec<u32>, usize> = HashMap::new();
     let mut queries = Vec::with_capacity(lines.len());
     for &line in &lines {
+        let l = line_ids.intern(line) as usize;
+        if l < line_query.len() {
+            queries.push(line_query[l]);
+            continue;
+        }
         if let Some(body) = line.strip_prefix(b"PHRASE \"") {
-            let terms: Vec<u32> = body[..body.len() - 1].split(|&b| b == b' ').map(|t| dict.intern(t)).collect();
-            let next = patterns.len();
-            let p = *pattern_ids.entry(terms.clone()).or_insert(next);
-            if p == next {
-                patterns.push(terms);
-            }
-            queries.push(Query::Phrase(p));
+            patterns.push(body[..body.len() - 1].split(|&b| b == b' ').map(|t| dict.intern(t)).collect());
+            line_query.push(Query::Phrase(patterns.len() - 1));
         } else {
-            let next = bools.len();
-            let b = *bool_ids.entry(line).or_insert(next);
-            if b == next {
+            {
                 // spec 2.3: "BOOL" term *(op term), single spaces.
                 let mut parts = line[5..].split(|&b| b == b' ');
                 let first = dict.intern(parts.next().unwrap());
@@ -777,14 +819,20 @@ fn main() {
                 }
                 bools.push(BoolQuery { first, rest });
             }
-            queries.push(Query::Bool(b));
+            line_query.push(Query::Bool(bools.len() - 1));
         }
+        queries.push(line_query[l]);
     }
+    drop(line_ids);
     let n_terms = dict.terms.len();
     lap("queries");
 
     let docs = map_file(&format!("{data_dir}/docs.txt"));
-    let (df, sampled_docs) = estimate_df(docs, &TermTable::new(&dict));
+    let mut terms = TermTable::new(&dict);
+    drop(dict);
+    lap("table");
+    let (df, sampled_docs) = estimate_df(docs, &terms, workers);
+    lap("sample");
     // Renumber the terms by descending sampled df, so the terms most tokens hit have neighbouring ids and their
     // per-term entries, roles and bits share a few hundred KB of cache lines. Only speed depends on the order.
     let mut order: Vec<usize> = (0..n_terms).collect();
@@ -793,19 +841,20 @@ fn main() {
     for (new, &old) in order.iter().enumerate() {
         new_id[old] = new as u32;
     }
-    (dict.terms, dict.hashes) = order.iter().map(|&t| (dict.terms[t], dict.hashes[t])).unzip();
+    terms.renumber(&order, &new_id);
     let df: Vec<u32> = order.iter().map(|&t| df[t]).collect();
     for q in &mut bools {
         q.first = new_id[q.first as usize];
         q.rest.iter_mut().for_each(|(_, t)| *t = new_id[*t as usize]);
     }
     patterns.iter_mut().flatten().for_each(|t| *t = new_id[*t as usize]);
-    let mut terms = TermTable::new(&dict);
-    drop(dict);
-    let plan = BoolPlan::new(&bools, n_terms, &df, sampled_docs);
+    // The two plans are independent: build them on two threads.
+    let (plan, phrases) = std::thread::scope(|s| {
+        let phrases = s.spawn(|| PhrasePlan::new(&patterns, n_terms, &df));
+        (BoolPlan::new(&bools, n_terms, &df, sampled_docs), phrases.join().unwrap())
+    });
     terms.set_roles(&plan);
-    let phrases = PhrasePlan::new(&patterns, n_terms, &df);
-    lap("sample");
+    lap("plans");
 
     // The pass: one doc range per worker, cut at line starts.
     let first_ids = FirstIds::new(plan.query_of_slot.len());
@@ -843,18 +892,37 @@ fn main() {
     }
     lap("phrase");
 
-    let mut out = String::with_capacity(lines.len() * 32);
+    let mut out = Vec::with_capacity(lines.len() * 32);
     for q in &queries {
         let a = match *q {
             Query::Bool(b) => &bool_results[b],
             Query::Phrase(p) => &phrase_results[p],
         };
-        write!(out, "{} {}", a.count, a.sum).unwrap();
-        for id in &a.first {
-            write!(out, " {id}").unwrap();
+        push_decimal(&mut out, a.count);
+        for n in std::iter::once(a.sum).chain(a.first.iter().map(|&id| id as u64)) {
+            out.push(b' ');
+            push_decimal(&mut out, n);
         }
-        out.push('\n');
+        out.push(b'\n');
     }
     std::fs::write(format!("{out_dir}/results.txt"), out).expect("write results.txt");
     lap("write");
+    // results.txt is written and closed: exit now, without dropping the tables (frees and unmaps the run does
+    // not need).
+    std::process::exit(0);
+}
+
+/// Appends n in decimal without leading zeros (spec 4); `write!` through fmt was most of the output's time.
+fn push_decimal(out: &mut Vec<u8>, mut n: u64) {
+    let mut digits = [0u8; 20];
+    let mut i = digits.len();
+    loop {
+        i -= 1;
+        digits[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    out.extend_from_slice(&digits[i..]);
 }
