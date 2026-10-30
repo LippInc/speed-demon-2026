@@ -4,6 +4,7 @@
 //! tokenizes every document and decides every BOOL query (per document, or 64 documents at a time) and every
 //! PHRASE pattern (by anchor checks) for it; nothing is indexed.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -65,79 +66,10 @@ fn fnv_step(h: u32, c: u8) -> u32 {
 }
 const FNV_OFFSET: u32 = 0x811c_9dc5;
 
-/// Open-addressing table of the query terms; a hit compares the full bytes.
-struct Dict<'q> {
-    terms: Vec<&'q [u8]>,
-    hashes: Vec<u32>,
-    slots: Vec<u32>, // term id + 1, 0 = empty
-    shift: u32,
-}
-
-impl<'q> Dict<'q> {
-    /// The table doubles as terms arrive, so it ends at load factor 1/4 to 1/2 of the distinct count. b-9 sized it
-    /// from every term occurrence (4 MB of slots), and the random inserts into it were most of the query parse.
-    fn new() -> Self {
-        Dict { terms: Vec::new(), hashes: Vec::new(), slots: vec![0; 16], shift: 28 }
-    }
-
-    fn grow(&mut self) {
-        let size = self.slots.len() * 2;
-        (self.slots, self.shift) = (vec![0; size], self.shift - 1);
-        for (t, &h) in self.hashes.iter().enumerate() {
-            let mut i = self.slot(h);
-            while self.slots[i] != 0 {
-                i = (i + 1) & (size - 1);
-            }
-            self.slots[i] = t as u32 + 1;
-        }
-    }
-
-    #[inline]
-    fn slot(&self, h: u32) -> usize {
-        (h.wrapping_mul(0x9e37_79b1) >> self.shift) as usize
-    }
-
-    #[inline]
-    fn find(&self, token: &[u8], h: u32) -> Option<u32> {
-        let mask = self.slots.len() - 1;
-        let mut i = self.slot(h);
-        loop {
-            let s = self.slots[i];
-            if s == 0 {
-                return None;
-            }
-            let t = (s - 1) as usize;
-            if self.hashes[t] == h && self.terms[t] == token {
-                return Some(t as u32);
-            }
-            i = (i + 1) & mask;
-        }
-    }
-
-    fn intern(&mut self, term: &'q [u8]) -> u32 {
-        let h = term.iter().fold(FNV_OFFSET, |h, &c| fnv_step(h, c));
-        if let Some(t) = self.find(term, h) {
-            return t;
-        }
-        if 2 * (self.terms.len() + 1) > self.slots.len() {
-            self.grow();
-        }
-        let mask = self.slots.len() - 1;
-        let mut i = self.slot(h);
-        while self.slots[i] != 0 {
-            i = (i + 1) & mask;
-        }
-        self.terms.push(term);
-        self.hashes.push(h);
-        self.slots[i] = self.terms.len() as u32;
-        self.terms.len() as u32 - 1
-    }
-}
-
-/// The table the pass probes for every token, built once the distinct term count is known. A slot holds the term's
-/// hash and id + 1 in one u64, so a miss reads one cache line; a hash match is then confirmed against the term's
-/// bytes, stored inline and zero-padded to 32 B (one more line). b-4 probed slots sized from every term occurrence
-/// (4 MB), a separate hash array, and a slice into queries.txt per term.
+/// The query terms: interned into it while queries.txt is parsed, then probed for every token of the pass. A slot
+/// holds the term's hash and id + 1 in one u64, so a miss reads one cache line; a hash match is then confirmed
+/// against the term's bytes, stored inline and zero-padded to 32 B (one more line). b-4 probed slots sized from
+/// every term occurrence (4 MB), a separate hash array, and a slice into queries.txt per term.
 struct TermTable {
     slots: Vec<u64>, // hash << 32 | (term id + 1), 0 = empty
     shift: u32,
@@ -161,21 +93,38 @@ struct TermRoles {
 struct TermBytes([u8; MAX_TERM]);
 
 impl TermTable {
-    fn new(dict: &Dict) -> Self {
-        assert!(dict.terms.len() < u32::MAX as usize);
-        // Load factor at most 2/3 of the distinct terms: 1 MB of slots on seed 1. Measured here against 1/2 (2 MB)
-        // and 1/4 (4 MB): the smallest table was fastest, since misses now cost more than probe steps.
-        let size = (dict.terms.len() + dict.terms.len() / 2).next_power_of_two().max(2);
-        let mut table = TermTable { slots: vec![0; size], shift: 32 - size.trailing_zeros(), bytes: vec![TermBytes([0; MAX_TERM]); dict.terms.len()], roles: Vec::new() };
-        for (t, (&term, &h)) in dict.terms.iter().zip(&dict.hashes).enumerate() {
-            let mut i = table.slot(h);
-            while table.slots[i] != 0 {
-                i = (i + 1) & (size - 1);
-            }
-            table.slots[i] = (h as u64) << 32 | (t as u64 + 1);
-            table.bytes[t].0[..term.len()].copy_from_slice(term);
+    fn new() -> Self {
+        TermTable { slots: vec![0; 2], shift: 31, bytes: Vec::new(), roles: Vec::new() }
+    }
+
+    /// The id of `term` (spec 2.3: 1 to 32 bytes), added if new. The slots double whenever they would pass load 2/3,
+    /// rehashed from the hash each slot keeps: 1 MB of slots on seed 1. Measured against load 1/2 (2 MB) and 1/4
+    /// (4 MB): the smallest table was fastest, since misses cost more than probe steps.
+    fn intern(&mut self, term: &[u8]) -> u32 {
+        let h = term.iter().fold(FNV_OFFSET, |h, &c| fnv_step(h, c));
+        if let Some(t) = self.find(term, h) {
+            return t;
         }
-        table
+        if 3 * (self.bytes.len() + 1) > 2 * self.slots.len() {
+            let size = self.slots.len() * 2;
+            let old = std::mem::replace(&mut self.slots, vec![0; size]);
+            self.shift -= 1;
+            old.into_iter().filter(|&s| s != 0).for_each(|s| self.place(s));
+        }
+        let mut entry = TermBytes([0; MAX_TERM]);
+        entry.0[..term.len()].copy_from_slice(term);
+        self.bytes.push(entry);
+        self.place((h as u64) << 32 | self.bytes.len() as u64);
+        assert!(self.bytes.len() < u32::MAX as usize);
+        self.bytes.len() as u32 - 1
+    }
+
+    fn place(&mut self, s: u64) {
+        let mut i = self.slot((s >> 32) as u32);
+        while self.slots[i] != 0 {
+            i = (i + 1) & (self.slots.len() - 1);
+        }
+        self.slots[i] = s;
     }
 
     /// Gives term `order[n]` the id n in place: the slots keep their hash and get the new id, and the entries move
@@ -417,9 +366,9 @@ fn cover(q: &BoolQuery, df: &[u32]) -> Vec<u32> {
     let mut cover = vec![q.first];
     for &(op, t) in &q.rest {
         match op {
-            Op::Or => cover.push(t),
-            Op::And if (df[t as usize] as u64) < cover.iter().map(|&c| df[c as usize] as u64).sum() => cover = vec![t],
-            Op::And | Op::Not => {}
+            OP_OR => cover.push(t),
+            OP_AND if (df[t as usize] as u64) < cover.iter().map(|&c| df[c as usize] as u64).sum() => cover = vec![t],
+            _ => {}
         }
     }
     cover.sort_unstable();
@@ -465,7 +414,7 @@ impl BoolPlan {
             }
             let code = compile(q, &mut |t| t);
             // A query of OR operators only has all its terms as triggers, so being triggered is a match.
-            let always = if q.rest.iter().all(|&(op, _)| matches!(op, Op::Or)) { ALWAYS } else { 0 };
+            let always = if q.rest.iter().all(|&(op, _)| op == OP_OR) { ALWAYS } else { 0 };
             let query = qi as u32 | always | if cover.len() > 1 { MULTI } else { 0 };
             for &t in cover {
                 triggers[fill[t as usize] as usize] = Trigger { query, code };
@@ -500,11 +449,6 @@ fn compile(q: &BoolQuery, term: &mut impl FnMut(u32) -> u32) -> [u32; MAX_BOOL_T
     let mut code = [NIL; MAX_BOOL_TERMS];
     code[0] = term(q.first);
     for (w, &(op, t)) in code[1..].iter_mut().zip(&q.rest) {
-        let op = match op {
-            Op::And => OP_AND,
-            Op::Or => OP_OR,
-            Op::Not => OP_NOT,
-        };
         *w = op << OP_SHIFT | term(t);
     }
     code
@@ -625,7 +569,6 @@ impl FirstIds {
 struct Shard {
     bool_acc: Vec<BoolAcc>,
     matches: Vec<(u32, u32)>,    // (pattern, doc), docs ascending
-    evaluations: u64,            // (doc, query) evaluations, reported by SD_PHASES
 }
 
 /// Splits the corpus into `n` ranges that each start at the beginning of a line.
@@ -648,7 +591,6 @@ fn scan(data: &[u8], dict: &TermTable, phrases: &PhrasePlan, plan: &BoolPlan, fi
     let mut shard = Shard {
         bool_acc: vec![BoolAcc::default(); plan.query_of_slot.len()],
         matches: Vec::new(),
-        evaluations: 0,
     };
     // The window path's term bits for the current 64-doc window (doc ids id / 64 equal).
     let mut window_words = vec![0u64; plan.n_window_terms];
@@ -711,7 +653,6 @@ fn scan(data: &[u8], dict: &TermTable, phrases: &PhrasePlan, plan: &BoolPlan, fi
                     }
                     shard.bool_acc[q].done = stamp;
                 }
-                shard.evaluations += 1;
                 if trig.query & ALWAYS != 0 || holds(&trig.code, &present) {
                     let acc = &mut shard.bool_acc[q];
                     acc.count += 1;
@@ -750,16 +691,9 @@ impl Answer {
     }
 }
 
-#[derive(Clone, Copy)]
-enum Op {
-    And,
-    Or,
-    Not,
-}
-
 struct BoolQuery {
     first: u32,
-    rest: Vec<(Op, u32)>,
+    rest: Vec<(u32, u32)>, // (OP_AND / OP_OR / OP_NOT, term)
 }
 
 #[derive(Clone, Copy)]
@@ -785,52 +719,45 @@ fn main() {
     // Queries: intern every term, dedupe BOOL lines and PHRASE term sequences.
     let qtext = map_file(&format!("{data_dir}/queries.txt"));
     let lines: Vec<&[u8]> = qtext.split(|&b| b == b'\n').filter(|l| !l.is_empty()).collect();
-    let mut dict = Dict::new();
-    // Lines are deduplicated through the same FNV table type as the terms (std's SipHash maps and a cloned
-    // Vec<u32> key per phrase were most of the parse). Under spec 2.3's grammar (single spaces, lower-case terms)
-    // two PHRASE lines are equal exactly when their term sequences are, so the line is the phrase's key too.
-    let mut line_ids = Dict::new();
+    let mut terms = TermTable::new();
+    // Under spec 2.3's grammar (single spaces, lower-case terms) two PHRASE lines are equal exactly when their term
+    // sequences are, so whole lines are the dedupe key for both kinds (b-9 also hashed a cloned Vec<u32> per phrase).
+    let mut line_ids: HashMap<&[u8], usize> = HashMap::new();
     let mut line_query: Vec<Query> = Vec::new(); // by distinct line
     let mut bools: Vec<BoolQuery> = Vec::new();
     let mut patterns: Vec<Vec<u32>> = Vec::new();
     let mut queries = Vec::with_capacity(lines.len());
     for &line in &lines {
-        let l = line_ids.intern(line) as usize;
-        if l < line_query.len() {
-            queries.push(line_query[l]);
-            continue;
-        }
-        if let Some(body) = line.strip_prefix(b"PHRASE \"") {
-            patterns.push(body[..body.len() - 1].split(|&b| b == b' ').map(|t| dict.intern(t)).collect());
-            line_query.push(Query::Phrase(patterns.len() - 1));
-        } else {
-            {
+        let next = line_query.len();
+        let l = *line_ids.entry(line).or_insert(next);
+        if l == next {
+            if let Some(body) = line.strip_prefix(b"PHRASE \"") {
+                patterns.push(body[..body.len() - 1].split(|&b| b == b' ').map(|t| terms.intern(t)).collect());
+                line_query.push(Query::Phrase(patterns.len() - 1));
+            } else {
                 // spec 2.3: "BOOL" term *(op term), single spaces.
                 let mut parts = line[5..].split(|&b| b == b' ');
-                let first = dict.intern(parts.next().unwrap());
+                let first = terms.intern(parts.next().unwrap());
                 let mut rest = Vec::new();
                 while let (Some(op), Some(t)) = (parts.next(), parts.next()) {
                     let op = match op {
-                        b"AND" => Op::And,
-                        b"OR" => Op::Or,
-                        _ => Op::Not,
+                        b"AND" => OP_AND,
+                        b"OR" => OP_OR,
+                        _ => OP_NOT,
                     };
-                    rest.push((op, dict.intern(t)));
+                    rest.push((op, terms.intern(t)));
                 }
                 bools.push(BoolQuery { first, rest });
+                line_query.push(Query::Bool(bools.len() - 1));
             }
-            line_query.push(Query::Bool(bools.len() - 1));
         }
         queries.push(line_query[l]);
     }
     drop(line_ids);
-    let n_terms = dict.terms.len();
+    let n_terms = terms.bytes.len();
     lap("queries");
 
     let docs = map_file(&format!("{data_dir}/docs.txt"));
-    let mut terms = TermTable::new(&dict);
-    drop(dict);
-    lap("table");
     let (df, sampled_docs) = estimate_df(docs, &terms, workers);
     lap("sample");
     // Renumber the terms by descending sampled df, so the terms most tokens hit have neighbouring ids and their
@@ -865,10 +792,6 @@ fn main() {
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    if phases {
-        let evaluations: u64 = shards.iter().map(|s| s.evaluations).sum();
-        eprintln!("(doc, query) BOOL evaluations: {evaluations}; window queries: {}", plan.window_code.len());
-    }
     lap("pass");
 
     let mut bool_results = vec![Answer::default(); bools.len()];

@@ -20,6 +20,10 @@ Every step from the reference to your final version, each with the live-board ru
 | 13 | push b80b71eaed3a, scored ok | b80b71e · Track B (run-907df3b3a958) | 0.41 | 34 | 63.2 |
 | 14 | push 704a88eb6e9f, scored ok | 704a88e · Track B (run-d882db67789e) | 0.42 | 34 | 63.1 |
 | 15 | push cac9dd156516, scored ok | cac9dd1 · Track B (run-05c9f41a7ac2) | 0.41 | 35 | 63.2 |
+| 16 | push 442dbe7fbe59, scored ok | 442dbe7 · Track B (run-a2acaf6607c2) | 0.41 | 35 | 63.1 |
+| 17 | push 948854aaefec, scored ok | 948854a · Track B (run-c17c1fc20c9c) | 0.40 | 36 | 63.4 |
+| 18 | push dc6ca650346c, scored ok | dc6ca65 · Track B (run-9543cd485a3e) | 0.38 | 33 | 63.9 |
+| 19 | push 22b6620692eb, scored ok | 22b6620 · Track B (run-84d4cd47b2fa) | 0.38 | 35 | 63.8 |
 
 What each push carried (the board re-runs the same code on every push):
 
@@ -34,11 +38,13 @@ What each push carried (the board re-runs the same code on every push):
   - b-6: a compact term table, sized from the distinct terms, with inline term bytes.
   - b-7: per-term BOOL roles read once per document.
 - **Steps 13-14: experiment b-8.** Phrases are matched by rarest-term anchor checks, and the automaton is removed.
-- **Step 15: experiment b-9.** Term ids are renumbered by sampled document frequency.
+- **Steps 15-17: experiment b-9.** Term ids are renumbered by sampled document frequency.
+- **Steps 18-19: experiment b-11.** The serial prologue and epilogue are cut: lines are deduplicated in FNV tables that grow, the df sample is spread over the workers, the term table is renumbered in place, the two plans are built in parallel, and the output uses a small decimal writer with an exit right after the write.
 
 Experiments measured only on the bench box (sd-bench/B), with no board run:
 
 - **b-0**, the data probes; the box measured the unchanged reference on that branch: `K 1.01 (lower: official) | official K 1.01 T 55.763s | fresh K 1.01 T 55.320s | M 2098.1MB M>=input S ? | sha 5/5+5/5 OK`.
 - **b-5**, an AVX2 tokenizer. It was dropped: no gain, and S grew by 50 lines. `K 16.23 (lower: fresh) | official K 16.26 T 0.517s (0.513-0.520) | fresh K 16.23 T 0.519s (0.517-0.542) | M 37.2MB S 874 L | sha 5/5+5/5 OK`.
 - **b-10**, a phase probe on b-9 with stderr lines only; it is never lifted. `K 18.32 (lower: official) | official K 18.32 T 0.404s | fresh K 18.36 T 0.402s | M 34.8MB S 902 L | sha 5/5+5/5 OK`.
-- **b-11**, a cut of the serial prologue and epilogue. It is not on the board yet. `K 18.97 (lower: official) | official K 18.97 T 0.376s | fresh K 18.98 T 0.376s | M 32.3MB S 906 L | sha 5/5+5/5 OK`.
+- **b-12**, buffering a document's tokens and prefetching their table slots before probing. It was dropped: slower on the box than b-11 (0.376 s). `K 18.26 (lower: fresh) | official K 18.28 T 0.401s (0.400-0.404) | fresh K 18.26 T 0.403s (0.400-0.444) | M 33.1MB S 930 L | sha 5/5+5/5 OK`.
+- **b-13**, the S trim: one term table for interning and the probe, plus the removal of a duplicate enum and a debug counter. It is not on the board yet. `K 19.14 (lower: official) | official K 19.14 T 0.379s | fresh K 19.16 T 0.379s | M 32.9MB S 827 L | sha 5/5+5/5 OK`.

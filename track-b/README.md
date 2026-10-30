@@ -1,21 +1,21 @@
 # Track B: Index
 
-Track B (index), Rust, standard library only. K 18.97 = T 0.376 s, M 32.3 MB, S 906, D 1 (box sd-bench/B on commit f471d447).
+Track B (index), Rust, standard library only. K 19.14 = T 0.379 s, M 32.9 MB, S 827, D 1 (box sd-bench/B on commit d165e91d).
 Reproduce: `docker build -t b track-b && docker run --rm -v <data>:/data:ro -v <out>:/out b`.
 
-- One pass over the memory-mapped corpus ([`map_file`](src/main.rs#L47)), one doc range per thread ([`scan`](src/main.rs#L647)), looking up only the query terms in a compact table ([`TermTable`](src/main.rs#L141)).
-- Phrases are matched by anchor checks in the same pass: each phrase is checked only where its rarest term occurs, by comparing term ids ([`PhrasePlan`](src/main.rs#L229)).
-- BOOL queries are decided per document inside the pass, with no posting list stored. Each query is evaluated only on the docs that contain one of its trigger terms ([`cover`](src/main.rs#L416)); the strict left fold is applied to the doc's term set ([`holds`](src/main.rs#L568)), and the smallest ids are shared across workers ([`FirstIds`](src/main.rs#L597)).
-- Queries whose cover is estimated to hold at least 1 doc in 64 are folded 64 docs at a time with word operations ([`fold_window`](src/main.rs#L516)); counts come from popcount and id sums from bit-sliced popcounts ([`flush_window`](src/main.rs#L544)).
-- Trigger terms and window queries are picked with document frequencies estimated on 1/128 of the corpus ([`estimate_df`](src/main.rs#L329)). The estimate only chooses an evaluation order; answers never depend on it.
-- PERF.md: board steps 1-15 cover b-1 to b-9; box-only experiments are listed under the table.
+- One pass over the memory-mapped corpus ([`map_file`](src/main.rs#L48)), one doc range per thread ([`scan`](src/main.rs#L590)), looking up only the query terms in a compact table ([`TermTable`](src/main.rs#L73)).
+- Phrases are matched by anchor checks in the same pass: each phrase is checked only where its rarest term occurs, by comparing term ids ([`PhrasePlan`](src/main.rs#L178)).
+- BOOL queries are decided per document inside the pass, with no posting list stored. Each query is evaluated only on the docs that contain one of its trigger terms ([`cover`](src/main.rs#L365)); the strict left fold is applied to the doc's term set ([`holds`](src/main.rs#L512)), and the smallest ids are shared across workers ([`FirstIds`](src/main.rs#L541)).
+- Queries whose cover is estimated to hold at least 1 doc in 64 are folded 64 docs at a time with word operations ([`fold_window`](src/main.rs#L460)); counts come from popcount and id sums from bit-sliced popcounts ([`flush_window`](src/main.rs#L488)).
+- Trigger terms and window queries are picked with document frequencies estimated on 1/128 of the corpus ([`estimate_df`](src/main.rs#L278)). The estimate only chooses an evaluation order; answers never depend on it.
+- PERF.md: board steps 1-19 cover b-1 to b-11; box-only experiments are listed under the table.
 - Honest limit: tokenizing and the term-table probe are now about half of the pass, and both still run one byte or one token at a time.
 
 The task, the input files and the exact output format are in the [spec](https://github.com/hackathon-raptors/speed-demon-2026/blob/main/specs/b-index.md).
 
 ## Approach
 
-The program reads `queries.txt` first. It deduplicates whole lines and interns every term, both in FNV-hashed open-addressing tables that double as they fill. Once the distinct terms are known, it builds the table the pass probes. That table has open addressing at a load factor of at most 2/3. Each 8-byte slot holds the term's hash and id, so a miss reads one cache line. A hash match is confirmed against the term's bytes, which are stored inline and zero-padded in a 32-byte entry: one more line. Each distinct phrase becomes one pattern with one anchor, its term with the lowest estimated document frequency.
+The program reads `queries.txt` first. It deduplicates whole lines and interns every term straight into the table the pass later probes. That table uses FNV hashes and open addressing, and doubles whenever it would pass a load factor of 2/3. Each 8-byte slot holds the term's hash and id, so a miss reads one cache line. A hash match is confirmed against the term's bytes, which are stored inline and zero-padded in a 32-byte entry: one more line. Each distinct phrase becomes one pattern with one anchor, its term with the lowest estimated document frequency.
 
 Under the spec's strict left fold, whether a document is in a BOOL query's result depends only on which of the query's terms the document contains, so every query can be decided per document. A document can only be in R if it contains a term of the query's cover. The cover starts as the first term; each OR operand is added to it; an AND operand may replace the cover when its estimated document frequency is lower. Every query is listed, with its code inline, under each term of its cover. Before the pass, document frequencies are estimated on 64 evenly spaced windows covering 1/128 of the corpus, only to make those choices. The sample's 64 windows are spread over the worker threads. The terms are then renumbered by descending estimated frequency, in place in the term table, so the terms most tokens hit have neighbouring ids and their table entries and per-term records share cache lines. The BOOL and phrase plans are built on two threads.
 
