@@ -26,6 +26,7 @@ mod sys {
     pub const PROT_READ: i32 = 1;
     pub const MAP_PRIVATE: i32 = 2;
     pub const MADV_WILLNEED: i32 = 3;
+    pub const MADV_DONTNEED: i32 = 4;
     unsafe extern "C" {
         pub fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
         pub fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
@@ -41,6 +42,20 @@ fn map_file(file: &File, len: usize) -> &'static [u8] {
         sys::madvise(p, len, sys::MADV_WILLNEED);
         // The mapping is never unmapped, so the slice lives for the whole run.
         std::slice::from_raw_parts(p as *const u8, len)
+    }
+}
+
+/// Drops the page-table entries of data[start..end] once its scan is done, so the exit has fewer to tear down.
+/// The mapping is private and never written: a later read of these bytes (an endpoint the tail prints)
+/// faults the same bytes back in from the page cache. Only whole pages inside the range are released.
+/// Measured on this VM (seed 1 full, 20 runs): output closed -> process reaped 1.9-2.0 -> 0.8-1.3 ms at 1, 4
+/// and 12 workers; the work before it unchanged within noise.
+fn release_range(data: &[u8], start: usize, end: usize) {
+    const PAGE: usize = 4096;
+    let (lo, hi) = (start.div_ceil(PAGE) * PAGE, end / PAGE * PAGE);
+    if lo < hi {
+        // Safety: [lo, hi) lies inside the mapping, which nothing writes.
+        unsafe { sys::madvise(data.as_ptr().add(lo) as *mut std::ffi::c_void, hi - lo, sys::MADV_DONTNEED) };
     }
 }
 
@@ -161,28 +176,35 @@ fn key_hash(hour: u32, ep: &[u8]) -> u64 {
     fold_mul(h ^ d, K)
 }
 
-/// Latency storage in 4-byte words. Blocks are large enough that the allocator maps each one separately
-/// (glibc's mmap threshold starts at 128 KiB), so a block's untouched tail stays off RSS and dropping a block
-/// returns its pages to the kernel at once.
-const BLOCK: usize = 1 << 18;
+/// Latency storage in bytes. Blocks are large enough that the allocator maps each one separately (glibc's
+/// mmap threshold starts at 128 KiB), so a block's untouched tail stays off RSS and dropping a block returns
+/// its pages to the kernel at once.
+const BLOCK: usize = 1 << 20;
 
-/// A chunk is `len - 1` latencies followed by one link word holding the next chunk's address. A group's
-/// first chunk is small because most (thread, group) pairs hold few latencies; later chunks are 16 words,
-/// so a large group wastes under 16 words plus one link per 15 latencies.
-const FIRST_CHUNK: usize = 4;
-const CHUNK: usize = 16;
+/// Latencies are stored as 3-byte slots: a slot below ESCAPE is the latency itself; a latency of ESCAPE
+/// (0xFF0000, 16.7 s) or more takes two slots, ESCAPE | its top byte, then its low 24 bits, so every value
+/// in 0..=4294967295 (spec 2) stays exact. On seed 1 full 1,498 of 3.1M latencies take the two-slot form.
+/// Measured against 4-byte words (a-10), this VM, seed 1 full: peak RssAnon 20.3 -> 16.0 MB at 1 worker,
+/// 21.5 -> 17.3 at 4, 23.8 -> 19.2 at 12; time unchanged within noise.
+const ESCAPE: u32 = 0xFF_0000;
+const SLOT: usize = 3;
+
+/// A chunk is `slots` 3-byte slots followed by a 4-byte link to the next chunk. A group's first chunk is small
+/// because most (thread, group) pairs hold few latencies; later chunks hold 15 slots.
+const FIRST_SLOTS: u32 = 3;
+const SLOTS: u32 = 15;
 
 /// One thread's latencies for one hour, kept apart per hour so the tail can drop them as soon as that
-/// hour is merged. An address is block index * BLOCK + offset; chunks never straddle blocks.
-/// Measured against per-group Vecs (a-3), this VM, 12 workers: peak RssAnon 39.9 -> 26.7 MB, same time.
+/// hour is merged. An address is block index * BLOCK + byte offset; chunks never straddle blocks.
 struct Arena {
     hour: u32,
-    blocks: Vec<Vec<u32>>,
-    used: usize, // words used in the last block
+    blocks: Vec<Vec<u8>>,
+    used: usize, // bytes used in the last block
 }
 
 impl Arena {
-    fn alloc(&mut self, len: usize) -> u32 {
+    fn alloc(&mut self, slots: u32) -> u32 {
+        let len = slots as usize * SLOT + 4;
         if self.blocks.is_empty() || self.used + len > BLOCK {
             // vec! of zeros is calloc, which leaves fresh mapped pages untouched until written.
             self.blocks.push(vec![0; BLOCK]);
@@ -193,19 +215,34 @@ impl Arena {
         addr as u32
     }
 
-    fn word(&mut self, addr: u32) -> &mut u32 {
-        &mut self.blocks[addr as usize / BLOCK][addr as usize % BLOCK]
+    fn bytes(&mut self, addr: u32, n: usize) -> &mut [u8] {
+        let off = addr as usize % BLOCK;
+        &mut self.blocks[addr as usize / BLOCK][off..off + n]
     }
 }
 
-/// One (hour, endpoint) group as one thread saw it: 20 bytes. Its key is where it sits: the hour's arena
-/// map, at the endpoint's id.
+/// One (hour, endpoint) group as one thread saw it: 16 bytes. Its key is where it sits: the hour's arena
+/// map, at the endpoint's id; the free room in its current chunk follows from `slots`.
 struct Group {
-    chunk_left: u8, // free latency words in the current chunk
-    count: u32,
+    slots: u32,  // 3-byte slots written, two for an escaped latency
     errors: u32,
-    head: u32, // address of the first chunk
-    next: u32, // address of the next free latency word, or of the link word when the chunk is full
+    head: u32,   // address of the first chunk
+    next: u32,   // address of the next free slot, or of the link when the chunk is full
+}
+
+impl Group {
+    /// Writes one slot, chaining a new chunk when the current one is full.
+    fn push_slot(&mut self, a: &mut Arena, v: u32) {
+        let full = self.slots == FIRST_SLOTS || (self.slots > FIRST_SLOTS && (self.slots - FIRST_SLOTS) % SLOTS == 0);
+        if full {
+            let addr = a.alloc(SLOTS);
+            a.bytes(self.next, 4).copy_from_slice(&addr.to_le_bytes());
+            self.next = addr;
+        }
+        a.bytes(self.next, SLOT).copy_from_slice(&v.to_le_bytes()[..SLOT]);
+        self.next += SLOT as u32;
+        self.slots += 1;
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -284,25 +321,20 @@ impl Table {
             u32::MAX => {
                 let id = self.groups.len();
                 map[e] = id as u32;
-                let head = self.arenas[arena].alloc(FIRST_CHUNK);
-                self.groups.push(Group { chunk_left: FIRST_CHUNK as u8 - 1, count: 0, errors: 0, head, next: head });
+                let head = self.arenas[arena].alloc(FIRST_SLOTS);
+                self.groups.push(Group { slots: 0, errors: 0, head, next: head });
                 id
             }
             id => id as usize,
         };
         let g = &mut self.groups[id];
         let a = &mut self.arenas[arena];
-        if g.chunk_left == 0 {
-            // The chunk is full and `next` is its link word: chain a new, larger chunk.
-            let addr = a.alloc(CHUNK);
-            *a.word(g.next) = addr;
-            g.next = addr;
-            g.chunk_left = CHUNK as u8 - 1;
+        if latency < ESCAPE {
+            g.push_slot(a, latency);
+        } else {
+            g.push_slot(a, ESCAPE | latency >> 24);
+            g.push_slot(a, latency & 0xFF_FFFF);
         }
-        *a.word(g.next) = latency;
-        g.next += 1;
-        g.chunk_left -= 1;
-        g.count += 1;
         g.errors += (500..=599).contains(&status) as u32;
     }
 
@@ -434,26 +466,36 @@ fn global_ranks(data: &'static [u8], scanned: &[Scanned], sorted: &[Vec<(u128, u
     }
 }
 
-/// Appends a group's latencies by walking its chunk chain.
-fn read_latencies(blocks: &[Vec<u32>], g: &Group, out: &mut Vec<u32>) {
-    let (mut left, mut addr, mut cap) = (g.count as usize, g.head as usize, FIRST_CHUNK - 1);
+/// Appends a group's latencies by walking its chunk chain and decoding its slots.
+fn read_latencies(blocks: &[Vec<u8>], g: &Group, out: &mut Vec<u32>) {
+    let (mut left, mut addr, mut cap) = (g.slots as usize, g.head as usize, FIRST_SLOTS as usize);
+    let mut top: Option<u32> = None; // the top byte of an escaped latency, waiting for its low slot
     loop {
-        let n = left.min(cap);
         let block = &blocks[addr / BLOCK];
-        out.extend_from_slice(&block[addr % BLOCK..addr % BLOCK + n]);
-        left -= n;
-        if left == 0 {
+        let off = addr % BLOCK;
+        for i in 0..left.min(cap) {
+            let b = &block[off + i * SLOT..off + i * SLOT + SLOT];
+            let v = u32::from_le_bytes([b[0], b[1], b[2], 0]);
+            match top.take() {
+                Some(t) => out.push(t << 24 | v),
+                None if v >= ESCAPE => top = Some(v & 0xFF),
+                None => out.push(v),
+            }
+        }
+        if left <= cap {
             return;
         }
-        addr = block[addr % BLOCK + cap] as usize;
-        cap = CHUNK - 1;
+        left -= cap;
+        let link = &block[off + cap * SLOT..off + cap * SLOT + 4];
+        addr = u32::from_le_bytes(link.try_into().unwrap()) as usize;
+        cap = SLOTS as usize;
     }
 }
 
 /// Merges every thread's groups of one hour and formats their output lines, in endpoint order (spec 4).
 /// `parts[t]` is thread t's latency blocks and endpoint -> group map for this hour; groups are ordered by
 /// global endpoint rank, an integer sort with no byte compares.
-fn format_hour(scanned: &[Scanned], all: &[&[u8]], ranks: &[Vec<u32>], parts: &[(Vec<Vec<u32>>, Vec<u32>)], hour: u32, scratch: &mut Vec<u32>) -> Vec<u8> {
+fn format_hour(scanned: &[Scanned], all: &[&[u8]], ranks: &[Vec<u32>], parts: &[(Vec<Vec<u8>>, Vec<u32>)], hour: u32, scratch: &mut Vec<u32>) -> Vec<u8> {
     let mut refs: Vec<(u32, usize, &Group)> = Vec::new();
     for (t, (_, map)) in parts.iter().enumerate() {
         for (e, &g) in map.iter().enumerate().filter(|&(_, &g)| g != u32::MAX) {
@@ -487,6 +529,14 @@ fn format_hour(scanned: &[Scanned], all: &[&[u8]], ranks: &[Vec<u32>], parts: &[
 }
 
 fn main() {
+    unsafe extern "C" {
+        fn mallopt(param: i32, value: i32) -> i32;
+    }
+    // Pin glibc's mmap threshold (M_MMAP_THRESHOLD, -3) at its 128 KiB default. Left dynamic, freeing the first
+    // latency block raises it to 1 MiB, so the tail's output buffers come from the heap and their freed pages
+    // stay charged while the output file grows. Measured (this VM, 12 workers, peak of RssAnon + output size):
+    // 22.4 -> 19.8 MB median.
+    unsafe { mallopt(-3, 128 * 1024) };
     let file = File::open(INPUT).expect("open input");
     let len = file.metadata().expect("stat input").len() as usize;
     let mut out = File::create(OUTPUT).expect("create output");
@@ -506,6 +556,7 @@ fn main() {
             .map(|&(a, b)| {
                 s.spawn(move || {
                     let Table { groups, eps, maps, arenas, .. } = scan(data, a, b);
+                    release_range(data, a, b);
                     // This thread's endpoint ids in byte order, sorted here in parallel for the global merge.
                     let bytes = |&(off, len): &(u32, u8)| &data[off as usize..off as usize + len as usize];
                     let mut sorted: Vec<(u128, u32)> = (0..eps.len() as u32).map(|e| (prefix_key(bytes(&eps[e as usize])), e)).collect();
@@ -532,7 +583,7 @@ fn main() {
     // Each hour's job owns every thread's latency blocks and endpoint map for that hour, so they are dropped
     // as soon as the hour is formatted. Each mutex is taken exactly once, by the thread that claims the hour:
     // never contended.
-    let mut jobs: Vec<Vec<(Vec<Vec<u32>>, Vec<u32>)>> =
+    let mut jobs: Vec<Vec<(Vec<Vec<u8>>, Vec<u32>)>> =
         (0..hours.len()).map(|_| (0..workers).map(|_| (Vec::new(), Vec::new())).collect()).collect();
     for (t, (thread_arenas, maps)) in arenas.iter_mut().enumerate() {
         for (a, map) in thread_arenas.iter_mut().zip(maps.iter_mut()) {
@@ -540,7 +591,7 @@ fn main() {
         }
     }
     drop(arenas);
-    let jobs: Vec<Mutex<Vec<(Vec<Vec<u32>>, Vec<u32>)>>> = jobs.into_iter().map(Mutex::new).collect();
+    let jobs: Vec<Mutex<Vec<(Vec<Vec<u8>>, Vec<u32>)>>> = jobs.into_iter().map(Mutex::new).collect();
 
     // Threads take the next hour from a shared counter, so uneven hours still balance.
     let next = AtomicUsize::new(0);
