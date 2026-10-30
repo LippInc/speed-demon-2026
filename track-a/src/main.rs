@@ -124,6 +124,19 @@ fn line_fields(data: &[u8], p: usize) -> (usize, usize) {
     }
 }
 
+/// The space before the latency, the last field of the line ending at lf: the highest space among the 16 bytes
+/// before the LF (spec 2: latency is at most 10 digits, and every line is at least 40 bytes, so the load stays
+/// inside the line). Measured on this VM, seed 1 full, against walking back byte by byte: scan 86 -> 80 ns per
+/// line at 4 workers, 82 -> 81 at 1 (the only part tried in a-6 that paid).
+fn latency_space(data: &[u8], lf: usize) -> usize {
+    use std::arch::x86_64::*;
+    let v = &data[lf - 16..lf];
+    // Safety: v is 16 readable bytes and SSE2 is part of every x86-64 baseline.
+    let spaces = unsafe { _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(v.as_ptr() as *const __m128i), _mm_set1_epi8(b' ' as i8))) };
+    assert!(spaces != 0, "no space before the latency");
+    lf - 16 + (31 - (spaces as u32).leading_zeros()) as usize
+}
+
 fn fold_mul(a: u64, b: u64) -> u64 {
     let p = a as u128 * b as u128;
     (p as u64) ^ ((p >> 64) as u64)
@@ -312,11 +325,7 @@ fn scan(data: &'static [u8], start: usize, end: usize) -> Table {
             prev_prefix = prefix;
         }
         let (ep_start, lf) = line_fields(data, p);
-        // Latency is the last field, so walk back from the line end to its space.
-        let mut sp = lf - 1;
-        while data[sp] != b' ' {
-            sp -= 1;
-        }
+        let sp = latency_space(data, lf);
         let latency = parse_u32(&data[sp + 1..lf]);
         // Spec 2 grammar: status is exactly three digits followed by SP.
         let st = &data[sp - 3..sp];
