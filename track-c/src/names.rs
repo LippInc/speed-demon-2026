@@ -43,11 +43,13 @@ pub fn hash(b: &[u8], start: usize, len: usize) -> (u64, u64, u64) {
     (mum(lo ^ acc ^ 0xa076_1d64_78bd_642f, hi ^ 0xe703_7ed1_a0b4_28db), lo, hi)
 }
 
-/// One slot: 0 while empty, else `(low 32 hash bits) << 32 | (record offset + 1)`, where the record is
-/// the name's entry in the arena (`Arena`). 8 bytes, where c-6's slot was 16 (meta plus a name
-/// pointer), and records replace a per-name entry: measured (sdrig, this VM) M 19.5 -> 15.6 MiB, T
-/// unchanged (0.386 -> 0.381 s). The stored hash bits pick the home slot again when the table
-/// doubles, and filter probes before the byte compare.
+/// One slot: 0 while empty, else `(16 hash bits) << 48 | the record's address`, the record being the
+/// name's entry in the arena (`Arena`; x86-64 user addresses fit in 48 bits, checked on insert). 8
+/// bytes, where c-6's slot was 16 (meta plus a name pointer): measured (sdrig, this VM) M 19.5 ->
+/// 15.6 MiB, T unchanged. Holding the address rather than an arena offset (c-7 to c-11) spares a hit
+/// the offset's block arithmetic and directory load before the record; this VM could not resolve it
+/// (interleaved medians of pass2+names: +9 % in one run, -7 % in the next), so the box decides. The hash bits
+/// filter probes before the compare; growth finds a name's home slot again by rehashing its record.
 type Slot = AtomicU64;
 
 /// One generation of a shard's slots (a power of two of them).
@@ -65,22 +67,52 @@ impl Slots {
     /// ends the probe. A slot is published (record written, then the slot stored with Release) before
     /// it is seen non-zero here (Acquire), so the record it names is complete.
     #[inline]
-    fn find(&self, arena: &Arena, key: (&[u8], u64, u64), tag: u32) -> Result<u32, usize> {
-        let mut pos = tag as usize & self.mask;
+    fn find(&self, key: (&[u8], u64, u64), h: u64) -> Result<u32, usize> {
+        let mut pos = h as usize & self.mask;
         loop {
             let slot = self.slots[pos].load(Ordering::Acquire);
             if slot == 0 {
                 return Err(pos);
             }
-            if (slot >> 32) as u32 == tag {
+            if slot >> 48 == h >> 32 & 0xFFFF {
                 // SAFETY: a published slot names a complete record in an arena block that lives,
                 // unmoved, as long as the Intern does.
-                if let Some(id) = unsafe { arena.matches(slot as u32 - 1, key) } {
+                if let Some(id) = unsafe { matches(record(slot), key) } {
                     return Ok(id);
                 }
             }
             pos = (pos + 1) & self.mask;
         }
+    }
+}
+
+/// The record a published slot names.
+#[inline]
+fn record(slot: u64) -> *const u8 {
+    std::ptr::with_exposed_provenance(slot as usize & ((1 << 48) - 1))
+}
+
+/// The id of the record at `p` if its name is `key` (its bytes, first and last word as
+/// `hash` returns them). Lengths first, then for up to 16 bytes the two words against the record's
+/// (zero-padded to 8 bytes, so the masked word of a short name compares whole), and a byte compare
+/// only for longer names: no length-dependent compare loop for nearly every name. Measured (this
+/// VM, 12 workers, full seed 1, interleaved medians): pass2+names 240 -> 234 ms in one A/B of 9,
+/// 219 -> 219 ms in a second of 11, so at most a small gain.
+///
+/// # Safety
+/// `p` must come from a slot published after its record was written (`Writer::store`).
+#[inline]
+unsafe fn matches(p: *const u8, (key, lo, hi): (&[u8], u64, u64)) -> Option<u32> {
+    unsafe {
+        let len = u32::from_le_bytes(*(p as *const [u8; 4])) as usize;
+        let at = |k: usize| u64::from_le_bytes(*(p.add(8 + k) as *const [u8; 8]));
+        let same = len == key.len()
+            && match len {
+                0..8 => at(0) == lo,
+                8..=16 => at(0) == lo && at(len - 8) == hi,
+                _ => std::slice::from_raw_parts(p.add(8), len) == key,
+            };
+        same.then(|| u32::from_le_bytes(*(p.add(4) as *const [u8; 4])))
     }
 }
 
@@ -147,35 +179,6 @@ impl Arena {
         }
     }
 
-    /// The id of the record at `offset` if its name is `key` (its bytes, first and last word as
-    /// `hash` returns them). Lengths first, then for up to 16 bytes the two words against the record's
-    /// (zero-padded to 8 bytes, so the masked word of a short name compares whole), and a byte compare
-    /// only for longer names: no length-dependent compare loop for nearly every name. Measured (this
-    /// VM, 12 workers, full seed 1, interleaved medians): pass2+names 240 -> 234 ms in one A/B of 9,
-    /// 219 -> 219 ms in a second of 11, so at most a small gain.
-    ///
-    /// # Safety
-    /// `offset` must come from a slot published after its record was written (`Writer::store`).
-    #[inline]
-    unsafe fn matches(&self, offset: u32, (key, lo, hi): (&[u8], u64, u64)) -> Option<u32> {
-        let offset = offset as usize;
-        let k = block_of(offset);
-        // Relaxed: the block pointer was stored before the slot that names this record was
-        // published with Release, and the caller loaded that slot with Acquire.
-        let p = unsafe { self.blocks[k].load(Ordering::Relaxed).add(offset - block_start(k)) };
-        unsafe {
-            let len = u32::from_le_bytes(*(p as *const [u8; 4])) as usize;
-            let at = |k: usize| u64::from_le_bytes(*(p.add(8 + k) as *const [u8; 8]));
-            let same = len == key.len()
-                && match len {
-                    0..8 => at(0) == lo,
-                    8..=16 => at(0) == lo && at(len - 8) == hi,
-                    _ => std::slice::from_raw_parts(p.add(8), len) == key,
-                };
-            same.then(|| u32::from_le_bytes(*(p.add(4) as *const [u8; 4])))
-        }
-    }
-
     /// Reserves `len` bytes (a multiple of RESERVE, so a reservation never straddles a block; blocks
     /// are multiples of it too) and returns their offset. Allocates the block on first use.
     fn reserve(&self, len: usize) -> usize {
@@ -224,7 +227,7 @@ struct Writer {
 impl Writer {
     /// Writes the record for `key` with `id` into this shard's reservation, reserving more first if
     /// it does not fit; returns its offset.
-    fn store(&mut self, arena: &Arena, key: &[u8], id: u32) -> u32 {
+    fn store(&mut self, arena: &Arena, key: &[u8], id: u32) -> *mut u8 {
         // At least 8 name bytes, zero beyond the name, so `matches` can read a whole word.
         let need = 8 + key.len().max(8);
         if self.next + need > self.end {
@@ -241,9 +244,8 @@ impl Writer {
             ptr::copy_nonoverlapping(key.as_ptr(), at.add(8), key.len());
             ptr::write_bytes(at.add(8 + key.len()), 0, need - 8 - key.len());
         }
-        let offset = self.next as u32;
         self.next += need;
-        offset
+        arena.at(self.next - need)
     }
 
     /// Doubles the slots: copies every published slot into a new generation (only this thread
@@ -255,7 +257,12 @@ impl Writer {
         for slot in old.slots.iter() {
             let slot = slot.load(Ordering::Relaxed);
             if slot != 0 {
-                let mut pos = (slot >> 32) as usize & new.mask;
+                // SAFETY: a published slot names a complete record (`Writer::store`).
+                let name = unsafe {
+                    let p = record(slot);
+                    std::slice::from_raw_parts(p.add(8), u32::from_le_bytes(*(p as *const [u8; 4])) as usize)
+                };
+                let mut pos = hash(name, 0, name.len()).0 as usize & new.mask;
                 while new.slots[pos].load(Ordering::Relaxed) != 0 {
                     pos = (pos + 1) & new.mask;
                 }
@@ -328,18 +335,17 @@ impl Intern {
     pub fn id(&self, b: &[u8], start: usize, len: usize) -> u32 {
         let (h, lo, hi) = hash(b, start, len);
         let key = (&b[start..start + len], lo, hi);
-        let tag = h as u32;
         let shard = &self.shards[(h >> (64 - SHARD_BITS)) as usize];
         // SAFETY: `current` always points at a generation owned by the shard's writer; a generation
         // this lookup can reach is freed only at a quiescent point, when no lookup is in flight.
         let slots = unsafe { &*shard.current.load(Ordering::Acquire) };
-        if let Ok(id) = slots.find(&self.arena, key, tag) {
+        if let Ok(id) = slots.find(key, h) {
             return id;
         }
         // Miss: take the lock, re-check the current generation (another worker may have inserted
         // it, or grown the table), then insert and publish.
         let mut w = shard.writer.lock().unwrap();
-        let mut pos = match w.generations.last().unwrap().find(&self.arena, key, tag) {
+        let mut pos = match w.generations.last().unwrap().find(key, h) {
             Ok(id) => return id,
             Err(pos) => pos,
         };
@@ -349,14 +355,15 @@ impl Intern {
         // stress runs at SD_INTERN_SLOTS=2.
         if (w.names + 1) * 2 > w.generations.last().unwrap().slots.len() {
             w.grow(&shard.current);
-            pos = w.generations.last().unwrap().find(&self.arena, key, tag).expect_err("name absent before the grow");
+            pos = w.generations.last().unwrap().find(key, h).expect_err("name absent before the grow");
         }
         // New name: its id is taken under the shard lock, so ids stay dense across shards.
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         assert!(id < u32::MAX, "more than 2^32 - 1 distinct names");
-        let offset = w.store(&self.arena, key.0, id);
+        let addr = w.store(&self.arena, key.0, id).expose_provenance() as u64;
+        assert!(addr >> 48 == 0, "a record address above 48 bits");
         // Release: a reader that sees this slot (Acquire) sees the record and its block pointer.
-        w.generations.last().unwrap().slots[pos].store((tag as u64) << 32 | (offset as u64 + 1), Ordering::Release);
+        w.generations.last().unwrap().slots[pos].store((h >> 32 & 0xFFFF) << 48 | addr, Ordering::Release);
         w.names += 1;
         id
     }

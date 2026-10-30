@@ -54,14 +54,23 @@ fn main() {
     let b = mmap::map_file(&format!("{data}/records.csv"));
     // Name offsets are stored as u32.
     assert!(b.len() < u32::MAX as usize, "records.csv over 4 GiB");
-    let starts = cuts::record_starts(b, records::header_end(b), workers);
+    let first = records::header_end(b);
+    let starts = cuts::record_starts(b, first, workers);
     let t_cuts = start.elapsed();
 
-    let intern = Intern::new(intern_slots());
-    let pass2 = match &regions.table {
-        RegionTable::Narrow(t) => pass2::run(b, &starts, t.as_slice(), groups, &intern),
-        RegionTable::Wide(t) => pass2::run(b, &starts, t.as_slice(), groups, &intern),
+    let run = |starts: &[usize], intern: &Intern| match &regions.table {
+        RegionTable::Narrow(t) => pass2::run(b, starts, t.as_slice(), groups, intern),
+        RegionTable::Wide(t) => pass2::run(b, starts, t.as_slice(), groups, intern),
     };
+    let mut intern = Intern::new(intern_slots());
+    let mut pass2 = run(&starts, &intern);
+    if !pass2.exact {
+        // e1: a cut was not a record start, so the parse is untrustworthy and the intern holds
+        // names from wrong records; rerun on one worker over the whole file, where the start
+        // (`first`) is always right.
+        intern = Intern::new(intern_slots());
+        pass2 = run(&[first, b.len()], &intern);
+    }
     let t_parse = start.elapsed();
 
     let mut totals = vec![Slot::default(); groups];

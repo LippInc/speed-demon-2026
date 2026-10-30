@@ -6,7 +6,7 @@
 //! buckets. Name memory is the intern table, the bitsets and workers x ROUND_PAIRS pairs, never a
 //! function of the record count.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Barrier, RwLock};
 use std::time::{Duration, Instant};
 
@@ -28,6 +28,9 @@ pub struct Pass2 {
     /// Per worker, the time until its range was parsed.
     pub times: Vec<Duration>,
     pub rounds: usize,
+    /// False when some worker did not stop exactly on its cut, i.e. some start was not a record
+    /// start (e1); the caller must then rerun on safe cuts.
+    pub exact: bool,
 }
 
 /// One worker's result.
@@ -55,11 +58,13 @@ pub fn run<L: Lookup + ?Sized + Sync>(b: &[u8], starts: &[usize], lookup: &L, gr
         (0..workers).map(|_| RwLock::new((0..workers).map(|_| Vec::with_capacity(cap)).collect())).collect();
     let barrier = Barrier::new(workers);
     let finished = AtomicUsize::new(0);
+    let exact = AtomicBool::new(true);
 
     let results: Vec<Worker> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..workers)
             .map(|w| {
-                let (buckets, route, barrier, finished) = (&buckets, &route, &barrier, &finished);
+                let (buckets, route, barrier, finished, exact) =
+                    (&buckets, &route, &barrier, &finished, &exact);
                 s.spawn(move || {
                     let t = Instant::now();
                     let mut me = Worker {
@@ -89,6 +94,8 @@ pub fn run<L: Lookup + ?Sized + Sync>(b: &[u8], starts: &[usize], lookup: &L, gr
                                     done = true;
                                     me.time = t.elapsed();
                                     finished.fetch_add(1, Ordering::Relaxed);
+                                    // Pairwise end check (e1): the parse must stop exactly on the cut.
+                                    exact.fetch_and(i == end, Ordering::Relaxed);
                                 }
                             }
                         }
@@ -130,5 +137,6 @@ pub fn run<L: Lookup + ?Sized + Sync>(b: &[u8], starts: &[usize], lookup: &L, gr
         rounds: results[0].rounds,
         slots: results.into_iter().map(|r| r.slots).collect(),
         distinct,
+        exact: exact.load(Ordering::Relaxed),
     }
 }

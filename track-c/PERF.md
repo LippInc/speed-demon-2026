@@ -20,6 +20,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 13 | push dc6ca650346c, scored ok | dc6ca65 · Track C (run-f7359dc6db71) | 0.10 | 16 | 60.8 |
 | 14 | push 90c864ad6d4e, scored ok | 90c864a · Track C (run-63963655e56f) | 0.09 | 16 | 62.3 |
 | 15 | push 2e2ee13a2258, scored ok | 2e2ee13 · Track C (run-4ff8954aecb6) | 0.13 | 16 | 58.1 |
+| 16 | push 1e9607b023c2, scored ok | 1e9607b · Track C (run-a11e7d85f631) | 0.08 | 16 | 63.7 |
+| 17 | push 48c9f564734d, scored ok | 48c9f56 · Track C (run-e9c771d0a5cd) | 0.08 | 16 | 63.1 |
 
 ## Experiment log
 
@@ -57,3 +59,6 @@ Each experiment's numbers are added here once the live board has measured it and
   and the CR-or-LF terminator skipped without a branch. Verdict KEEP, box K 17.97. SWAR parsing of the digit runs was
   tried and dropped: exact, but no gain in two local A/Bs (plus seven and minus three percent of pass 2) for about
   fourteen lines, as the numbers here are at most eight digits.
+- c-11 lookup, commits 01326a0 and e843890: the name hash built from the name's first and last words with one 128-bit
+  multiply, and names up to sixteen bytes compared as two words. Verdict KEEP, box K 19.01 (board row 16,
+  1e9607b · Track C).

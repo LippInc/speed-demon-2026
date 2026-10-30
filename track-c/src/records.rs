@@ -3,7 +3,7 @@
 
 use crate::regions::Lookup;
 
-const BOM: &[u8] = b"\xEF\xBB\xBF";
+pub(crate) const BOM: &[u8] = b"\xEF\xBB\xBF";
 
 /// One worker's running aggregates of one output line (c-join.md:109-118), names_distinct aside.
 #[derive(Default, Clone)]
