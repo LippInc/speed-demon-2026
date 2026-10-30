@@ -12,8 +12,12 @@ use std::thread;
 const INPUT: &str = "/data/requests.log";
 const OUTPUT: &str = "/out/summary.txt";
 
-// Spec 2 grammar: ts is always 27 bytes, then SP, so the method starts at byte 28.
-const METHOD_START: usize = 28;
+// Spec 2 grammar: ts (27 bytes), SP, method (3 to 7 bytes), SP: the endpoint starts at byte 32 to 36 of a line.
+const ENDPOINT_MIN: usize = 32;
+
+// The line search below uses AVX2, part of the x86-64-v3 baseline set in .cargo/config.toml.
+#[cfg(not(target_feature = "avx2"))]
+compile_error!("build with -C target-cpu=x86-64-v3");
 // Spec 2 grammar: ts = "YYYY-MM-DDTHH..."; bytes 0..13 name the UTC hour.
 const HOUR_PREFIX: usize = 13;
 
@@ -83,6 +87,41 @@ fn parse_u32(s: &[u8]) -> u32 {
     s.iter()
         .try_fold(0u32, |acc, &b| acc.checked_mul(10)?.checked_add(digit(b)))
         .expect("latency overflows u32")
+}
+
+/// Byte mask of `byte` in data[i..i + 32], one bit per byte.
+fn mask32(data: &[u8], i: usize, byte: u8) -> u32 {
+    use std::arch::x86_64::*;
+    let v = &data[i..i + 32];
+    // Safety: v is 32 readable bytes and AVX2 is enabled at compile time.
+    unsafe {
+        let v = _mm256_loadu_si256(v.as_ptr() as *const __m256i);
+        _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(byte as i8))) as u32
+    }
+}
+
+/// The endpoint's first byte and the LF of the line starting at p. The method holds no '/', so the first '/'
+/// from byte 32 opens the endpoint; one 32-byte load finds it and, for most lines, the LF too.
+/// Measured on this VM (seed 1 full, 4 workers): scan 108 -> 79 ns per line against byte-by-byte searches
+/// (an AVX2 LF search alone gave 95, adding a SWAR '/' search 86).
+fn line_fields(data: &[u8], p: usize) -> (usize, usize) {
+    let mut i = p + ENDPOINT_MIN;
+    if i + 32 > data.len() {
+        // Near the end of the input, where a 32-byte load would overrun: byte by byte.
+        let ep = i + data[i..].iter().position(|&b| b == b'/').expect("no endpoint");
+        return (ep, ep + data[ep..].iter().position(|&b| b == b'\n').unwrap_or(data.len() - ep));
+    }
+    let ep = i + mask32(data, i, b'/').trailing_zeros() as usize;
+    loop {
+        let lf = mask32(data, i, b'\n');
+        if lf != 0 {
+            return (ep, i + lf.trailing_zeros() as usize);
+        }
+        i += 32;
+        if i + 32 > data.len() {
+            return (ep, i + data[i..].iter().position(|&b| b == b'\n').unwrap_or(data.len() - i));
+        }
+    }
 }
 
 fn fold_mul(a: u64, b: u64) -> u64 {
@@ -272,9 +311,7 @@ fn scan(data: &'static [u8], start: usize, end: usize) -> Table {
             arena = table.arena(parse_hour(prefix));
             prev_prefix = prefix;
         }
-        // The method never contains '/', so the first '/' after it opens the endpoint.
-        let ep_start = p + METHOD_START + data[p + METHOD_START..].iter().position(|&b| b == b'/').expect("no endpoint");
-        let lf = ep_start + data[ep_start..].iter().position(|&b| b == b'\n').unwrap_or(data.len() - ep_start);
+        let (ep_start, lf) = line_fields(data, p);
         // Latency is the last field, so walk back from the line end to its space.
         let mut sp = lf - 1;
         while data[sp] != b' ' {
