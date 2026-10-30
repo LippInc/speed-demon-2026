@@ -5,7 +5,7 @@
 use std::fs::File;
 use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex};
 use std::os::fd::AsRawFd;
 use std::thread;
 
@@ -109,63 +109,147 @@ fn key_hash(hour: u32, ep: &[u8]) -> u64 {
     fold_mul(h ^ d, K)
 }
 
-struct Group {
+/// Latency storage in 4-byte words. Blocks are large enough that the allocator maps each one separately
+/// (glibc's mmap threshold starts at 128 KiB), so a block's untouched tail stays off RSS and dropping a block
+/// returns its pages to the kernel at once.
+const BLOCK: usize = 1 << 18;
+
+/// A chunk is `len - 1` latencies followed by one link word holding the next chunk's address. A group's
+/// first chunk is small because most (thread, group) pairs hold few latencies; later chunks are 16 words,
+/// so a large group wastes under 16 words plus one link per 15 latencies.
+const FIRST_CHUNK: usize = 4;
+const CHUNK: usize = 16;
+
+/// One thread's latencies for one hour, kept apart per hour so the tail can drop them as soon as that
+/// hour is merged. An address is block index * BLOCK + offset; chunks never straddle blocks.
+/// Measured against per-group Vecs (a-3), this VM, 12 workers: peak RssAnon 39.9 -> 26.7 MB, same time.
+struct Arena {
     hour: u32,
-    ep: &'static [u8],
-    latencies: Vec<u32>,
-    errors: u64,
+    blocks: Vec<Vec<u32>>,
+    used: usize, // words used in the last block
+}
+
+impl Arena {
+    fn alloc(&mut self, len: usize) -> u32 {
+        if self.blocks.is_empty() || self.used + len > BLOCK {
+            // vec! of zeros is calloc, which leaves fresh mapped pages untouched until written.
+            self.blocks.push(vec![0; BLOCK]);
+            self.used = 0;
+        }
+        let addr = (self.blocks.len() - 1) * BLOCK + self.used;
+        self.used += len;
+        addr as u32
+    }
+
+    fn word(&mut self, addr: u32) -> &mut u32 {
+        &mut self.blocks[addr as usize / BLOCK][addr as usize % BLOCK]
+    }
+}
+
+/// One (hour, endpoint) group as one thread saw it: 24 bytes, against 56 for a key slice plus a Vec.
+struct Group {
+    ep_off: u32,
+    ep_len: u8,        // spec 2: an endpoint is 1 to 125 bytes
+    chunk_left: u8,    // free latency words in the current chunk
+    arena: u16,        // index of the hour's arena in this thread; spec 2: the span is 72 hours
+    count: u32,
+    errors: u32,
+    head: u32,         // address of the first chunk
+    next: u32,         // address of the next free latency word, or of the link word when the chunk is full
+}
+
+impl Group {
+    fn ep(&self, data: &'static [u8]) -> &'static [u8] {
+        &data[self.ep_off as usize..self.ep_off as usize + self.ep_len as usize]
+    }
 }
 
 #[derive(Clone, Copy)]
 struct Slot {
-    hash: u64,
+    tag: u32, // high hash bits, to skip most key compares
     group: u32, // u32::MAX marks an empty slot
 }
 
-const EMPTY: Slot = Slot { hash: 0, group: u32::MAX };
+const EMPTY: Slot = Slot { tag: 0, group: u32::MAX };
 
 /// Open-addressing (linear probing) table from (hour, endpoint) to a group; grows at half load.
 struct Table {
     slots: Vec<Slot>,
     groups: Vec<Group>,
+    arenas: Vec<Arena>,
 }
 
 impl Table {
     fn new() -> Self {
-        Table { slots: vec![EMPTY; 1024], groups: Vec::new() }
+        Table { slots: vec![EMPTY; 1024], groups: Vec::new(), arenas: Vec::new() }
     }
 
-    fn group(&mut self, hour: u32, ep: &'static [u8]) -> &mut Group {
-        let h = key_hash(hour, ep);
+    fn arena(&mut self, hour: u32) -> usize {
+        match self.arenas.iter().position(|a| a.hour == hour) {
+            Some(i) => i,
+            None => {
+                self.arenas.push(Arena { hour, blocks: Vec::new(), used: 0 });
+                self.arenas.len() - 1
+            }
+        }
+    }
+
+    fn add(&mut self, data: &'static [u8], arena: usize, ep: &'static [u8], status: u32, latency: u32) {
+        let h = key_hash(self.arenas[arena].hour, ep);
         let mask = self.slots.len() - 1;
-        let mut i = (h >> 32) as usize & mask;
-        loop {
+        let mut i = h as usize & mask;
+        let id = loop {
             let s = self.slots[i];
             if s.group == u32::MAX {
-                break;
+                let id = self.groups.len();
+                self.slots[i] = Slot { tag: (h >> 32) as u32, group: id as u32 };
+                let head = self.arenas[arena].alloc(FIRST_CHUNK);
+                let ep_off = ep.as_ptr() as usize - data.as_ptr() as usize;
+                self.groups.push(Group {
+                    ep_off: ep_off as u32,
+                    ep_len: u8::try_from(ep.len()).expect("endpoint longer than spec 2 allows"),
+                    chunk_left: FIRST_CHUNK as u8 - 1,
+                    arena: arena as u16,
+                    count: 0,
+                    errors: 0,
+                    head,
+                    next: head,
+                });
+                if self.groups.len() * 2 > self.slots.len() {
+                    self.grow(data);
+                }
+                break id;
             }
-            if s.hash == h {
+            if s.tag == (h >> 32) as u32 {
                 let g = &self.groups[s.group as usize];
-                if g.hour == hour && g.ep == ep {
-                    return &mut self.groups[s.group as usize];
+                if g.arena as usize == arena && g.ep(data) == ep {
+                    break s.group as usize;
                 }
             }
             i = (i + 1) & mask;
+        };
+        let g = &mut self.groups[id];
+        let a = &mut self.arenas[arena];
+        if g.chunk_left == 0 {
+            // The chunk is full and `next` is its link word: chain a new, larger chunk.
+            let addr = a.alloc(CHUNK);
+            *a.word(g.next) = addr;
+            g.next = addr;
+            g.chunk_left = CHUNK as u8 - 1;
         }
-        let id = self.groups.len();
-        self.slots[i] = Slot { hash: h, group: id as u32 };
-        self.groups.push(Group { hour, ep, latencies: Vec::new(), errors: 0 });
-        if self.groups.len() * 2 > self.slots.len() {
-            self.grow();
-        }
-        &mut self.groups[id]
+        *a.word(g.next) = latency;
+        g.next += 1;
+        g.chunk_left -= 1;
+        g.count += 1;
+        g.errors += (500..=599).contains(&status) as u32;
     }
 
-    fn grow(&mut self) {
+    fn grow(&mut self, data: &'static [u8]) {
         let mut slots = vec![EMPTY; self.slots.len() * 2];
         let mask = slots.len() - 1;
         for s in self.slots.iter().filter(|s| s.group != u32::MAX) {
-            let mut i = (s.hash >> 32) as usize & mask;
+            let g = &self.groups[s.group as usize];
+            let mut i = key_hash(self.arenas[g.arena as usize].hour, g.ep(data)) as usize & mask;
             while slots[i].group != u32::MAX {
                 i = (i + 1) & mask;
             }
@@ -176,16 +260,16 @@ impl Table {
 }
 
 /// Aggregates every line starting in data[start..end].
-fn scan(data: &'static [u8], start: usize, end: usize) -> Vec<Group> {
+fn scan(data: &'static [u8], start: usize, end: usize) -> Table {
     let mut table = Table::new();
     let mut prev_prefix: &[u8] = &[];
-    let mut hour = 0u32;
+    let mut arena = 0;
     let mut p = start;
     while p < end {
         // Lines usually share the previous line's hour, so compare the prefix before parsing it.
         let prefix = &data[p..p + HOUR_PREFIX];
         if prefix != prev_prefix {
-            hour = parse_hour(prefix);
+            arena = table.arena(parse_hour(prefix));
             prev_prefix = prefix;
         }
         // The method never contains '/', so the first '/' after it opens the endpoint.
@@ -200,13 +284,10 @@ fn scan(data: &'static [u8], start: usize, end: usize) -> Vec<Group> {
         // Spec 2 grammar: status is exactly three digits followed by SP.
         let st = &data[sp - 3..sp];
         let status = digit(st[0]) * 100 + digit(st[1]) * 10 + digit(st[2]);
-        let ep = &data[ep_start..sp - 4];
-        let g = table.group(hour, ep);
-        g.latencies.push(latency);
-        g.errors += (500..=599).contains(&status) as u64;
+        table.add(data, arena, &data[ep_start..sp - 4], status, latency);
         p = lf + 1;
     }
-    table.groups
+    table
 }
 
 fn push_u64(out: &mut Vec<u8>, mut v: u64) {
@@ -251,29 +332,54 @@ fn percentiles(lat: &mut [u32]) -> [u32; 3] {
     [v50, v95, v99]
 }
 
+/// What a scan thread hands to the tail: its groups sorted by (hour, endpoint) and each arena's hour.
+struct Scanned {
+    groups: Vec<Group>,
+    arena_hours: Vec<u32>,
+}
+
+/// Appends a group's latencies by walking its chunk chain.
+fn read_latencies(blocks: &[Vec<u32>], g: &Group, out: &mut Vec<u32>) {
+    let (mut left, mut addr, mut cap) = (g.count as usize, g.head as usize, FIRST_CHUNK - 1);
+    loop {
+        let n = left.min(cap);
+        let block = &blocks[addr / BLOCK];
+        out.extend_from_slice(&block[addr % BLOCK..addr % BLOCK + n]);
+        left -= n;
+        if left == 0 {
+            return;
+        }
+        addr = block[addr % BLOCK + cap] as usize;
+        cap = CHUNK - 1;
+    }
+}
+
 /// Merges every thread's groups of one hour and formats their output lines, in endpoint order (spec 4).
-/// Each thread's groups are sorted by (hour, endpoint), so the hour is one contiguous run in each of them.
-fn format_hour(tables: &[Vec<Group>], hour: u32, scratch: &mut Vec<u32>) -> Vec<u8> {
-    let mut refs: Vec<&Group> = tables
-        .iter()
-        .flat_map(|gs| &gs[gs.partition_point(|g| g.hour < hour)..gs.partition_point(|g| g.hour <= hour)])
-        .collect();
-    refs.sort_unstable_by(|x, y| x.ep.cmp(y.ep));
+/// Each thread's groups are sorted by (hour, endpoint), so the hour is one contiguous run in each of them;
+/// `blocks[t]` holds thread t's latencies for this hour.
+fn format_hour(data: &'static [u8], scanned: &[Scanned], blocks: &[Vec<Vec<u32>>], hour: u32, scratch: &mut Vec<u32>) -> Vec<u8> {
+    let mut refs: Vec<(usize, &Group)> = Vec::new();
+    for (t, sc) in scanned.iter().enumerate() {
+        let hour_of = |g: &Group| sc.arena_hours[g.arena as usize];
+        let run = &sc.groups[sc.groups.partition_point(|g| hour_of(g) < hour)..sc.groups.partition_point(|g| hour_of(g) <= hour)];
+        refs.extend(run.iter().map(|g| (t, g)));
+    }
+    refs.sort_unstable_by(|x, y| x.1.ep(data).cmp(y.1.ep(data)));
     let mut hour_text = Vec::with_capacity(20);
     push_hour(&mut hour_text, hour);
     let mut buf = Vec::new();
-    for run in refs.chunk_by(|x, y| x.ep == y.ep) {
+    for run in refs.chunk_by(|x, y| x.1.ep(data) == y.1.ep(data)) {
         scratch.clear();
         let mut errors = 0u64;
-        for g in run {
-            scratch.extend_from_slice(&g.latencies);
-            errors += g.errors;
+        for &(t, g) in run {
+            read_latencies(&blocks[t], g, scratch);
+            errors += g.errors as u64;
         }
         let count = scratch.len() as u64;
         let [p50, p95, p99] = percentiles(scratch);
         buf.extend_from_slice(&hour_text);
         buf.push(b' ');
-        buf.extend_from_slice(run[0].ep);
+        buf.extend_from_slice(run[0].1.ep(data));
         // Spec 3.6: error_ppm = floor(errors * 1000000 / count), in 64 bits.
         for v in [count, p50 as u64, p95 as u64, p99 as u64, errors, errors * 1_000_000 / count] {
             buf.push(b' ');
@@ -292,39 +398,53 @@ fn main() {
         // Spec 3.7: an empty log gives an empty summary.
         return;
     }
+    // Groups keep endpoint offsets as u32; spec 2's lines are at most 176 bytes, so 3.1M lines stay far below 4 GiB.
+    assert!(len <= u32::MAX as usize, "input over 4 GiB");
     let data = map_file(&file, len);
 
     let workers = worker_count();
     let ranges = line_ranges(data, workers);
-    let tables: Vec<Vec<Group>> = thread::scope(|s| {
+    let (scanned, mut arenas): (Vec<Scanned>, Vec<Vec<Arena>>) = thread::scope(|s| {
         let handles: Vec<_> = ranges
             .iter()
             .map(|&(a, b)| {
                 s.spawn(move || {
+                    let Table { mut groups, arenas, .. } = scan(data, a, b);
+                    let arena_hours: Vec<u32> = arenas.iter().map(|a| a.hour).collect();
                     // Sorted here, in parallel, so the tail finds each hour as one run per thread.
-                    let mut groups = scan(data, a, b);
-                    groups.sort_unstable_by(|x, y| (x.hour, x.ep).cmp(&(y.hour, y.ep)));
-                    groups
+                    groups.sort_unstable_by(|x, y| {
+                        (arena_hours[x.arena as usize], x.ep(data)).cmp(&(arena_hours[y.arena as usize], y.ep(data)))
+                    });
+                    (Scanned { groups, arena_hours }, arenas)
                 })
             })
             .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
+        handles.into_iter().map(|h| h.join().unwrap()).unzip()
     });
 
     // The tail is split by hour: hours are disjoint parts of the key space that are also contiguous in the
-    // output, so each part is merged, selected and formatted by one thread with no locks, and the parts are
-    // written in order. The hours come from the input itself.
-    let mut hours: Vec<u32> =
-        tables.iter().flat_map(|gs| gs.chunk_by(|x, y| x.hour == y.hour).map(|run| run[0].hour)).collect();
+    // output, so each part is merged, selected and formatted by one thread with no shared writes, and the
+    // parts are written in order. The hours come from the input itself.
+    let mut hours: Vec<u32> = arenas.iter().flatten().map(|a| a.hour).collect();
     hours.sort_unstable();
     hours.dedup();
+    // Each hour's job owns every thread's latency blocks for that hour, so they are dropped as soon as the
+    // hour is formatted. Each mutex is taken exactly once, by the thread that claims the hour: never contended.
+    let mut jobs: Vec<Vec<Vec<Vec<u32>>>> = (0..hours.len()).map(|_| (0..workers).map(|_| Vec::new()).collect()).collect();
+    for (t, thread_arenas) in arenas.iter_mut().enumerate() {
+        for a in thread_arenas {
+            jobs[hours.binary_search(&a.hour).unwrap()][t] = std::mem::take(&mut a.blocks);
+        }
+    }
+    drop(arenas);
+    let jobs: Vec<Mutex<Vec<Vec<Vec<u32>>>>> = jobs.into_iter().map(Mutex::new).collect();
 
     // Threads take the next hour from a shared counter, so uneven hours still balance.
     let next = AtomicUsize::new(0);
     let (tx, rx) = mpsc::channel::<(usize, Vec<u8>)>();
     thread::scope(|s| {
         for _ in 0..workers {
-            let (tables, hours, next, tx) = (&tables, &hours, &next, tx.clone());
+            let (scanned, jobs, hours, next, tx) = (&scanned, &jobs, &hours, &next, tx.clone());
             s.spawn(move || {
                 let mut scratch = Vec::new();
                 loop {
@@ -332,7 +452,10 @@ fn main() {
                     if i >= hours.len() {
                         break;
                     }
-                    tx.send((i, format_hour(tables, hours[i], &mut scratch))).unwrap();
+                    let blocks = std::mem::take(&mut *jobs[i].lock().unwrap());
+                    let buf = format_hour(data, scanned, &blocks, hours[i], &mut scratch);
+                    drop(blocks);
+                    tx.send((i, buf)).unwrap();
                 }
             });
         }
