@@ -6,8 +6,6 @@
 //! source with no out-edges), then a bidirectional Dijkstra per query on a worker thread, with
 //! per-thread scratch sized by the search, not by n.
 
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 use std::ffi::c_void;
 use std::fs::File;
 use std::os::fd::AsRawFd;
@@ -170,6 +168,86 @@ fn build_graph(graph: &[u8], body: usize, n: usize, threads: usize, t: &mut Vec<
     (Csr { end: ends(out_cur), edges: fwd }, Csr { end: ends(in_cur), edges: rev })
 }
 
+/// A heap entry: 12 bytes packed instead of the 16 a (u64, u32) tuple takes.
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+struct Entry {
+    key: u64,
+    node: u32,
+}
+
+/// Monotone radix heap (Ahuja, Mehlhorn, Orlin, Tarjan) over u64 keys. Entry k sits in bucket
+/// 64 - lzcnt(k ^ last), where last is the most recent minimum taken: bucket 0 holds keys equal to
+/// last, bucket b keys whose highest bit differing from last is b - 1, so 65 buckets cover the key
+/// width. Valid because Dijkstra only pushes keys >= the key it just popped. An entry moves only to
+/// lower buckets, at most 64 times, instead of paying log(len) compares per pop like a binary heap.
+/// Measured (local, full seed 1, interleaved with the floor's BinaryHeap): queries phase 1.09-1.10 s
+/// -> 0.85-0.87 s at 12 workers, 1.00-1.08 s -> 0.87-0.95 s at 4.
+struct RadixHeap {
+    buckets: [Vec<Entry>; 65],
+    last: u64,
+    len: usize,
+}
+
+impl RadixHeap {
+    fn new() -> Self {
+        RadixHeap { buckets: std::array::from_fn(|_| Vec::new()), last: 0, len: 0 }
+    }
+
+    fn clear(&mut self) {
+        self.buckets.iter_mut().for_each(Vec::clear);
+        self.last = 0;
+        self.len = 0;
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline(always)]
+    fn bucket(&self, key: u64) -> usize {
+        64 - (key ^ self.last).leading_zeros() as usize
+    }
+
+    #[inline(always)]
+    fn push(&mut self, key: u64, node: u32) {
+        debug_assert!(key >= self.last, "radix heap keys must not go below the last minimum");
+        let b = self.bucket(key);
+        self.buckets[b].push(Entry { key, node });
+        self.len += 1;
+    }
+
+    /// The exact minimum key, the same value BinaryHeap::peek gives. When bucket 0 is empty this
+    /// advances last to the minimum of the lowest non-empty bucket and spreads that bucket into lower
+    /// ones; the set of entries does not change. Safe for later pushes: a side only pushes after it
+    /// pops its own minimum, and pushes keys >= that minimum.
+    fn top(&mut self) -> Option<u64> {
+        if self.len == 0 {
+            return None;
+        }
+        if self.buckets[0].is_empty() {
+            let b = self.buckets.iter().position(|v| !v.is_empty()).unwrap();
+            let moving = std::mem::take(&mut self.buckets[b]);
+            self.last = moving.iter().map(|e| e.key).min().unwrap();
+            for &e in &moving {
+                let to = self.bucket(e.key);
+                self.buckets[to].push(e);
+            }
+            // Hand the emptied vector's capacity back to bucket b for reuse.
+            self.buckets[b] = moving;
+            self.buckets[b].clear();
+        }
+        Some(self.last)
+    }
+
+    fn pop(&mut self) -> Option<(u64, u32)> {
+        self.top()?;
+        let e = self.buckets[0].pop().unwrap();
+        self.len -= 1;
+        Some((e.key, e.node))
+    }
+}
+
 /// One node's labels in the current search: tentative distance from s (side 0) and to t (side 1).
 #[derive(Clone, Copy)]
 struct Label {
@@ -185,13 +263,13 @@ struct Scratch {
     labels: Vec<Label>,
     used: usize,
     generation: u32,
-    heaps: [BinaryHeap<Reverse<(u64, u32)>>; 2],
+    heaps: [RadixHeap; 2],
 }
 
 impl Scratch {
     fn new() -> Self {
         let empty = Label { node: 0, generation: 0, dist: [INF; 2] };
-        Scratch { labels: vec![empty; 1 << 12], used: 0, generation: 0, heaps: [BinaryHeap::new(), BinaryHeap::new()] }
+        Scratch { labels: vec![empty; 1 << 12], used: 0, generation: 0, heaps: [RadixHeap::new(), RadixHeap::new()] }
     }
 
     fn reset(&mut self) {
@@ -258,12 +336,13 @@ fn bidirectional(g: [&Csr; 2], sc: &mut Scratch, s: u32, t: u32) -> (u64, u64) {
     for (side, root) in [(0, s), (1, t)] {
         let i = sc.slot(root);
         sc.labels[i].dist[side] = 0;
-        sc.heaps[side].push(Reverse((0, root)));
+        sc.heaps[side].push(0, root);
     }
     let mut mu = INF;
     let mut settles = 0;
     loop {
-        let (Some(&Reverse((top_f, _))), Some(&Reverse((top_b, _)))) = (sc.heaps[0].peek(), sc.heaps[1].peek()) else {
+        // Each top is the side's exact minimum key (RadixHeap::top), so the stop test is the floor's.
+        let (Some(top_f), Some(top_b)) = (sc.heaps[0].top(), sc.heaps[1].top()) else {
             break;
         };
         // Both tops are below 2^63, so the sum cannot overflow.
@@ -274,7 +353,7 @@ fn bidirectional(g: [&Csr; 2], sc: &mut Scratch, s: u32, t: u32) -> (u64, u64) {
         // backward search sweep the whole main body while a forward search from an island waits
         // behind its near-2^32 spur weights (local A/B: twice the settles, 3x the query time).
         let side = if sc.heaps[0].len() <= sc.heaps[1].len() { 0 } else { 1 };
-        let Reverse((d, u)) = sc.heaps[side].pop().unwrap();
+        let (d, u) = sc.heaps[side].pop().unwrap();
         let iu = sc.slot(u);
         if d > sc.labels[iu].dist[side] {
             continue; // stale: u was relabelled lower after this entry was pushed
@@ -290,7 +369,7 @@ fn bidirectional(g: [&Csr; 2], sc: &mut Scratch, s: u32, t: u32) -> (u64, u64) {
                 if other != INF {
                     mu = mu.min(nd + other);
                 }
-                sc.heaps[side].push(Reverse((nd, v)));
+                sc.heaps[side].push(nd, v);
             }
         }
     }
