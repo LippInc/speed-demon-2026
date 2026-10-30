@@ -216,12 +216,15 @@ const ROOT_CHUNK: usize = 4096;
 /// are random seeds: a fixed rule, not a chosen node), claiming each node once through an atomic
 /// flag; a worker whose frontier is blocked takes new roots from a shared counter. New ids are the
 /// workers' BFS orders one after the other. The forward CSR is then copied row by row into the new
-/// ids (heads mapped, rows prefetched ahead); the old one comes back for the rev build to reuse.
+/// ids (heads mapped): each worker reads its range of old rows in old-id order, a stream, and
+/// scatters the writes to the new rows; the old CSR comes back for the rev build to reuse.
 /// Which worker claims a node depends on thread timing, so the ids differ from run to run; no answer
 /// depends on them (a distance is a property of the graph, not of how it is numbered).
 /// Why: the generator shuffles ids, so a settle's neighbours sit in random CSR rows, each a DRAM miss;
-/// in BFS order they share cache lines and pages. Measured (exp/d-13-probe-claimch, box): T
-/// 0.271 / 0.285 -> 0.248 / 0.258 s; locally queries -35-38 % and the rev build 63-92 -> 34-45 ms.
+/// in BFS order they share cache lines and pages. Measured on the box (d-13b): base d898824 T
+/// 0.271 / 0.285 s, K 16.10 -> fe87585 T 0.257 / 0.267 s, K 16.33 (the uncompacted probe
+/// exp/d-13-probe-claimch read 0.248 / 0.258 s); locally queries -35-45 % and the rev build
+/// 63-92 -> 34-45 ms.
 /// Returns the new CSR, the old one and new_id[old id].
 fn relabel(old: Csr, threads: usize) -> (Csr, Csr, Vec<u32>) {
     let n = old.end.len();
@@ -260,7 +263,8 @@ fn relabel(old: Csr, threads: usize) -> (Csr, Csr, Vec<u32>) {
             let x = new_id[u] as usize;
             for (j, (v, w)) in old.row(u).enumerate() {
                 let at = g.start(x) + j;
-                // SAFETY: row x of g lies in this worker's range of new ids; no other worker writes it.
+                // SAFETY: new_id is a bijection, so new row x is written only for old row u, and u is
+                // in exactly one worker's range of old ids: no two workers write the same slot.
                 unsafe { edges.put(at, edge(new_id[v as usize], w as u32)) };
                 heavy.extend((w >= HEAVY as u64).then_some((at as u32, w as u32)));
             }
@@ -500,7 +504,19 @@ impl Table {
 /// Measured locally (4-core VM, full seed 1, interleaved with the single growing table): 10.6 % of
 /// queries outgrow the small table; queries phase 837-998 ms vs 865-1045 ms at 4 workers, 889-986 ms
 /// vs 803-861 ms at 12 (three threads share each core's L2 here); M 108.9 vs about 121 MiB.
+/// Slots of each thread's direct-mapped label table (a design constant, 2^16 x 20 B = 1.3 MB). After
+/// the relabel a query's nodes sit in a few runs of nearby ids, so node & (DIRECT_SLOTS - 1) puts them
+/// in nearby slots: neighbours' labels share cache lines, where a hash scatters them; a node whose
+/// slot another node holds goes to the hashed tables. Measured locally (full seed 1, interleaved with
+/// d-15a): queries at 12 workers 2^12 / 2^14 / 2^16 / 2^17 slots 362-382 / 318-378 / 261-297 /
+/// 237-261 ms vs 321-384 ms; cgroup M at 12 workers 2^16 118.6-119.3 MiB, 2^17 130.5-130.9, vs
+/// 124.1-125.3 (fewer queries grow the large table).
+const DIRECT_SLOTS: usize = 1 << 16;
+/// Flags a slot index into the hashed tables.
+const OVERFLOW: usize = 1 << 31;
+
 struct Scratch {
+    direct: Table,
     small: Table,
     large: Table,
     in_large: bool,
@@ -510,6 +526,7 @@ struct Scratch {
 impl Scratch {
     fn new() -> Self {
         Scratch {
+            direct: Table::with_slots(DIRECT_SLOTS),
             small: Table::with_slots(SMALL_SLOTS),
             large: Table::with_slots(SMALL_SLOTS * 2),
             in_large: false,
@@ -518,6 +535,7 @@ impl Scratch {
     }
 
     fn reset(&mut self) {
+        self.direct.clear();
         self.small.clear();
         self.large.clear();
         self.in_large = false;
@@ -527,16 +545,32 @@ impl Scratch {
 
     #[inline(always)]
     fn label(&mut self, i: usize) -> &mut Label {
-        if self.in_large { &mut self.large.slots[i] } else { &mut self.small.slots[i] }
+        match (i & OVERFLOW != 0, self.in_large) {
+            (false, _) => &mut self.direct.slots[i],
+            (true, true) => &mut self.large.slots[i & !OVERFLOW],
+            (true, false) => &mut self.small.slots[i & !OVERFLOW],
+        }
     }
 
-    /// Index of node's label in the current table. Indices last until the next insert.
+    /// Index of node's label: its direct slot (node & (DIRECT_SLOTS - 1)) if free or its own, else its
+    /// slot in the hashed table, flagged OVERFLOW. A direct slot keeps its node for the whole query, so
+    /// a node is always found where it was put. Indices last until the next insert.
     #[inline(always)]
     fn slot(&mut self, node: u32) -> usize {
+        let d = node as usize & (DIRECT_SLOTS - 1);
+        match { self.direct.slots[d].node } {
+            here if here == node => return d,
+            EMPTY => {
+                self.direct.slots[d] = Label { node, dist: [INF; 2] };
+                self.direct.touched.push(d as u32);
+                return d;
+            }
+            _ => {}
+        }
         loop {
             let table = if self.in_large { &mut self.large } else { &mut self.small };
             if let Some(i) = table.find_or_insert(node) {
-                return i;
+                return i | OVERFLOW;
             }
             self.make_room();
         }
@@ -657,13 +691,18 @@ fn main() {
         pairs.push((new_id[read_num(queries, &mut i) as usize], new_id[read_num(queries, &mut i) as usize]));
     }
 
+    // Queries run in order of their relabelled (s, t), answers still land by input index: after the
+    // relabel, neighbouring sources search overlapping regions, so the workers running them at the
+    // same time share CSR rows in cache.
+    let mut order: Vec<usize> = (0..pairs.len()).collect();
+    order.sort_unstable_by_key(|&q| pairs[q]);
     let next = AtomicUsize::new(0);
     let mut answers = vec![(0u64, 0u64, false); pairs.len()];
     let results = on_threads(threads, |_| {
         let (mut sc, mut done) = (Scratch::new(), Vec::new());
         loop {
-            let q = next.fetch_add(1, Ordering::Relaxed);
-            let Some(&(src, dst)) = pairs.get(q) else { return done };
+            let Some(&q) = order.get(next.fetch_add(1, Ordering::Relaxed)) else { return done };
+            let (src, dst) = pairs[q];
             done.push((q, answer(&fwd, &rev, &mut sc, src, dst)));
         }
     });
