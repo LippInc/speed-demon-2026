@@ -84,11 +84,18 @@ impl<T> Slots<T> {
     }
 }
 
-/// Compressed adjacency: the edges of node u are edges[start(u)..end[u]], each packed as
-/// (weight << 32) | head.
+/// One CSR entry, 6 bytes: the head as two u16 halves, then the weight, or HEAVY for a weight of
+/// HEAVY or more (u32 weights, spec section 2), which Csr::heavy holds by edge index.
+/// Why: the two CSRs were 80 MB of u64 entries, most of the query phase's memory, while nearly all
+/// weights fit 16 bits (full seed 1: 50 of 5,000,000 do not). 6 bytes cut them to 60 MB.
+type Edge = [u16; 3];
+const HEAVY: u16 = u16::MAX;
+
+/// Compressed adjacency: the edges of node u are edges[start(u)..end[u]].
 struct Csr {
     end: Vec<u32>,
-    edges: Vec<u64>,
+    edges: Vec<Edge>,
+    heavy: Vec<(u32, u32)>,
 }
 
 impl Csr {
@@ -100,9 +107,14 @@ impl Csr {
     fn degree(&self, u: usize) -> u32 {
         self.end[u] - self.start(u) as u32
     }
+    /// (head, weight) of each edge of u.
     #[inline(always)]
-    fn adj(&self, u: usize) -> &[u64] {
-        &self.edges[self.start(u)..self.end[u] as usize]
+    fn row(&self, u: usize) -> impl Iterator<Item = (u32, u64)> + '_ {
+        (self.start(u)..self.end[u] as usize).map(move |i| {
+            let (e, heavy) = (self.edges[i], || self.heavy[self.heavy.partition_point(|h| h.0 < i as u32)].1);
+            let w = Some(e[2]).filter(|&w| w < HEAVY).map_or_else(heavy, u32::from);
+            (e[0] as u32 | (e[1] as u32) << 16, w as u64)
+        })
     }
 }
 
@@ -144,12 +156,12 @@ fn place(buckets: &[Vec<Vec<Record>>], first: usize, shift: u32, g: &mut Csr, th
     }
     let (edges, end) = (Slots(g.edges.as_mut_ptr()), Slots(g.end.as_mut_ptr()));
     let next = AtomicUsize::new(0);
-    on_threads(threads, |_| {
-        let mut cursor = Vec::new();
+    let heavy = on_threads(threads, |_| {
+        let (mut cursor, mut heavy) = (Vec::new(), Vec::new());
         loop {
             let p = next.fetch_add(1, Ordering::Relaxed);
             if p + 1 >= first_slot.len() {
-                return;
+                return heavy;
             }
             let lo = (first + p) << shift;
             cursor.clear();
@@ -165,11 +177,15 @@ fn place(buckets: &[Vec<Vec<Record>>], first: usize, shift: u32, g: &mut Csr, th
             for r in records() {
                 let c = &mut cursor[r.0 as usize - lo];
                 // SAFETY: c walks this row's own slots inside partition p's slice of edges.
-                unsafe { edges.put(*c as usize, (r.2 as u64) << 32 | r.1 as u64) };
+                let e = [r.1 as u16, (r.1 >> 16) as u16, r.2.min(HEAVY as u32) as u16];
+                unsafe { edges.put(*c as usize, e) };
+                heavy.extend((r.2 >= HEAVY as u32).then_some((*c, r.2)));
                 *c += 1;
             }
         }
     });
+    g.heavy.extend(heavy.into_iter().flatten());
+    g.heavy.sort_unstable();
 }
 
 /// Builds both CSRs without atomics. Parse: each thread parses its byte range once and files every
@@ -199,11 +215,11 @@ fn build_graph(graph: &[u8], body: usize, n: usize, threads: usize, t: &mut Phas
     t.push(("parse", Instant::now()));
     let m = by_tail.iter().flatten().map(Vec::len).sum();
     assert!(m <= u32::MAX as usize, "CSR offsets are u32");
-    let mut fwd = Csr { end: vec![0; n], edges: vec![0; m] };
+    let mut fwd = Csr { end: vec![0; n], edges: vec![[0; 3]; m], heavy: Vec::new() };
     place(&by_tail, 0, shift, &mut fwd, threads);
     drop(by_tail);
     t.push(("fwd", Instant::now()));
-    let mut rev = Csr { end: vec![0; n], edges: vec![0; m] };
+    let mut rev = Csr { end: vec![0; n], edges: vec![[0; 3]; m], heavy: Vec::new() };
     for slab in 0..REV_SLABS {
         let (first, last) = (parts * slab / REV_SLABS, parts * (slab + 1) / REV_SLABS);
         let next = AtomicUsize::new(0);
@@ -211,10 +227,10 @@ fn build_graph(graph: &[u8], body: usize, n: usize, threads: usize, t: &mut Phas
             let mut mine = vec![Vec::new(); last - first];
             while let Some(p) = Some(next.fetch_add(1, Ordering::Relaxed)).filter(|&p| p < parts) {
                 for u in p << shift..n.min((p + 1) << shift) {
-                    for &e in fwd.adj(u) {
-                        let q = (e as u32 >> shift) as usize;
+                    for (v, w) in fwd.row(u) {
+                        let q = (v >> shift) as usize;
                         if (first..last).contains(&q) {
-                            mine[q - first].push((e as u32, u as u32, (e >> 32) as u32));
+                            mine[q - first].push((v, u as u32, w as u32));
                         }
                     }
                 }
@@ -450,10 +466,6 @@ impl Scratch {
     }
 }
 
-/// Bidirectional Dijkstra: side 0 searches forward from s, side 1 backward from t on the reverse CSR.
-/// mu is the best s-t path seen so far, updated on every relaxation that labels a node the other side
-/// has labelled (zero-weight edges make "the frontiers met" too early a stop). Stop once the two heap
-/// tops sum to mu or more, or either side runs dry. Returns the distance and the number of settles.
 /// Pops ahead whose CSR rows are prefetched (a design constant). The CSRs (94 MB) are four times the
 /// box's L3, so a settle's edge row is a DRAM miss; the next pops of this side sit at the end of
 /// radix bucket 0, so their rows can load while u is relaxed. Measured locally (full seed 1,
@@ -462,6 +474,10 @@ impl Scratch {
 /// and prefetching each neighbour's label slot as well bought under 2 %, so neither is here.
 const PREFETCH_AHEAD: usize = 8;
 
+/// Bidirectional Dijkstra: side 0 searches forward from s, side 1 backward from t on the reverse CSR.
+/// mu is the best s-t path seen so far, updated on every relaxation that labels a node the other side
+/// has labelled (zero-weight edges make "the frontiers met" too early a stop). Stop once the two heap
+/// tops sum to mu or more, or either side runs dry. Returns the distance and the number of settles.
 fn bidirectional(g: [&Csr; 2], sc: &mut Scratch, s: u32, t: u32) -> (u64, u64) {
     sc.reset();
     for (side, root) in [(0, s), (1, t)] {
@@ -497,8 +513,8 @@ fn bidirectional(g: [&Csr; 2], sc: &mut Scratch, s: u32, t: u32) -> (u64, u64) {
             let row = g[side].edges.as_ptr().wrapping_add(g[side].start(e.node as usize));
             unsafe { _mm_prefetch(row as *const i8, _MM_HINT_T0) }; // a hint: never faults
         }
-        for &e in g[side].adj(u as usize) {
-            let (v, nd) = (e as u32, d + (e >> 32));
+        for (v, w) in g[side].row(u as usize) {
+            let nd = d + w;
             let iv = sc.slot(v);
             let l = sc.label(iv);
             let mut dist = l.dist;
