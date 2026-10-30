@@ -248,81 +248,145 @@ impl RadixHeap {
     }
 }
 
+/// Marks a free slot. Never a node id: ids are below n, and n is itself a u32 (spec section 2).
+const EMPTY: u32 = u32::MAX;
+
+/// Slots in each thread's small label table (a design constant, from the cache, not the input):
+/// 2^14 slots x 20 bytes = 320 KB, so the tables of the two hyperthreads sharing a P-core
+/// fit its 1.25 MB L2 with room for heap and CSR lines.
+const SMALL_SLOTS: usize = 1 << 14;
+
 /// One node's labels in the current search: tentative distance from s (side 0) and to t (side 1).
+/// 20 bytes packed, no generation: a table is cleared through its touched list instead.
 #[derive(Clone, Copy)]
+#[repr(C, packed)]
 struct Label {
     node: u32,
-    generation: u32,
     dist: [u64; 2],
 }
 
-/// Per-thread search scratch: an open-addressing map from node to Label, cleared in O(1) per query
-/// by bumping the generation, plus one heap per search direction. It grows with the largest search,
-/// never to n.
-struct Scratch {
-    labels: Vec<Label>,
-    used: usize,
-    generation: u32,
-    heaps: [RadixHeap; 2],
+const FREE: Label = Label { node: EMPTY, dist: [INF; 2] };
+
+/// An open-addressing map from node to Label, at most 7/10 full, that remembers which slots this
+/// query filled so clearing costs the labels used, not the table size.
+struct Table {
+    slots: Vec<Label>,
+    touched: Vec<u32>,
 }
 
-impl Scratch {
-    fn new() -> Self {
-        let empty = Label { node: 0, generation: 0, dist: [INF; 2] };
-        Scratch { labels: vec![empty; 1 << 12], used: 0, generation: 0, heaps: [RadixHeap::new(), RadixHeap::new()] }
-    }
-
-    fn reset(&mut self) {
-        self.generation = self.generation.wrapping_add(1);
-        if self.generation == 0 {
-            self.labels.iter_mut().for_each(|l| l.generation = 0);
-            self.generation = 1;
-        }
-        self.used = 0;
-        self.heaps[0].clear();
-        self.heaps[1].clear();
+impl Table {
+    fn with_slots(len: usize) -> Self {
+        Table { slots: vec![FREE; len], touched: Vec::new() }
     }
 
     #[inline(always)]
     fn home(&self, node: u32) -> usize {
-        (node.wrapping_mul(0x9E37_79B1) as usize) & (self.labels.len() - 1)
+        (node.wrapping_mul(0x9E37_79B1) as usize) & (self.slots.len() - 1)
     }
 
-    /// Index of node's label, created unlabelled on first sight. Indices last until the next insert.
+    /// Index of node's label, created unlabelled on first sight; None if that would pass 7/10 load.
     #[inline(always)]
-    fn slot(&mut self, node: u32) -> usize {
-        let mask = self.labels.len() - 1;
+    fn find_or_insert(&mut self, node: u32) -> Option<usize> {
+        let mask = self.slots.len() - 1;
         let mut i = self.home(node);
         loop {
-            let cap = self.labels.len();
-            let l = &mut self.labels[i];
-            if l.generation != self.generation {
-                if (self.used + 1) * 2 > cap {
-                    self.grow();
-                    return self.slot(node);
-                }
-                *l = Label { node, generation: self.generation, dist: [INF; 2] };
-                self.used += 1;
-                return i;
+            let here = self.slots[i].node;
+            if here == node {
+                return Some(i);
             }
-            if l.node == node {
-                return i;
+            if here == EMPTY {
+                if (self.touched.len() + 1) * 10 > self.slots.len() * 7 {
+                    return None;
+                }
+                self.slots[i] = Label { node, dist: [INF; 2] };
+                self.touched.push(i as u32);
+                return Some(i);
             }
             i = (i + 1) & mask;
         }
     }
 
-    fn grow(&mut self) {
-        let empty = Label { node: 0, generation: 0, dist: [INF; 2] };
-        let doubled = vec![empty; self.labels.len() * 2];
-        let old = std::mem::replace(&mut self.labels, doubled);
-        let mask = self.labels.len() - 1;
-        for l in old.into_iter().filter(|l| l.generation == self.generation) {
+    /// Moves every label of `from` (listed by its touched slots) into this table, which has room.
+    fn take_labels(&mut self, from: &[Label], touched: &[u32]) {
+        let mask = self.slots.len() - 1;
+        for &k in touched {
+            let l = from[k as usize];
             let mut i = self.home(l.node);
-            while self.labels[i].generation == self.generation {
+            while self.slots[i].node != EMPTY {
                 i = (i + 1) & mask;
             }
-            self.labels[i] = l;
+            self.slots[i] = l;
+            self.touched.push(i as u32);
+        }
+    }
+
+    fn clear(&mut self) {
+        for &i in &self.touched {
+            self.slots[i as usize].node = EMPTY;
+        }
+        self.touched.clear();
+    }
+}
+
+/// Per-thread search scratch. Every query starts in the small, L2-sized label table; most searches
+/// stay in it (local full seed 1: touched labels p50 199, p90 12,905, p99 52,100, max 78,485). A
+/// query that outgrows it moves its labels to the large table, which doubles as needed and keeps
+/// its size for later queries; it grows with the largest search, never to n. One heap per direction.
+/// Measured locally (4-core VM, full seed 1, interleaved with the single growing table): 10.6 % of
+/// queries outgrow the small table; queries phase 837-998 ms vs 865-1045 ms at 4 workers, 889-986 ms
+/// vs 803-861 ms at 12 (three threads share each core's L2 here); M 108.9 vs about 121 MiB.
+struct Scratch {
+    small: Table,
+    large: Table,
+    in_large: bool,
+    heaps: [RadixHeap; 2],
+}
+
+impl Scratch {
+    fn new() -> Self {
+        Scratch {
+            small: Table::with_slots(SMALL_SLOTS),
+            large: Table::with_slots(SMALL_SLOTS * 2),
+            in_large: false,
+            heaps: [RadixHeap::new(), RadixHeap::new()],
+        }
+    }
+
+    fn reset(&mut self) {
+        self.small.clear();
+        self.large.clear();
+        self.in_large = false;
+        self.heaps[0].clear();
+        self.heaps[1].clear();
+    }
+
+    #[inline(always)]
+    fn label(&mut self, i: usize) -> &mut Label {
+        if self.in_large { &mut self.large.slots[i] } else { &mut self.small.slots[i] }
+    }
+
+    /// Index of node's label in the current table. Indices last until the next insert.
+    #[inline(always)]
+    fn slot(&mut self, node: u32) -> usize {
+        loop {
+            let table = if self.in_large { &mut self.large } else { &mut self.small };
+            if let Some(i) = table.find_or_insert(node) {
+                return i;
+            }
+            self.make_room();
+        }
+    }
+
+    /// The small table is full: move to the large one. The large table is full: double it.
+    fn make_room(&mut self) {
+        if !self.in_large {
+            self.large.take_labels(&self.small.slots, &self.small.touched);
+            self.small.clear();
+            self.in_large = true;
+        } else {
+            let doubled = Table::with_slots(self.large.slots.len() * 2);
+            let old = std::mem::replace(&mut self.large, doubled);
+            self.large.take_labels(&old.slots, &old.touched);
         }
     }
 }
@@ -335,7 +399,9 @@ fn bidirectional(g: [&Csr; 2], sc: &mut Scratch, s: u32, t: u32) -> (u64, u64) {
     sc.reset();
     for (side, root) in [(0, s), (1, t)] {
         let i = sc.slot(root);
-        sc.labels[i].dist[side] = 0;
+        let mut dist = sc.label(i).dist;
+        dist[side] = 0;
+        sc.label(i).dist = dist;
         sc.heaps[side].push(0, root);
     }
     let mut mu = INF;
@@ -355,17 +421,19 @@ fn bidirectional(g: [&Csr; 2], sc: &mut Scratch, s: u32, t: u32) -> (u64, u64) {
         let side = if sc.heaps[0].len() <= sc.heaps[1].len() { 0 } else { 1 };
         let (d, u) = sc.heaps[side].pop().unwrap();
         let iu = sc.slot(u);
-        if d > sc.labels[iu].dist[side] {
+        if d > { sc.label(iu).dist }[side] {
             continue; // stale: u was relabelled lower after this entry was pushed
         }
         settles += 1;
         for &e in g[side].adj(u as usize) {
             let (v, nd) = (e as u32, d + (e >> 32));
             let iv = sc.slot(v);
-            let l = &mut sc.labels[iv];
-            if nd < l.dist[side] {
-                l.dist[side] = nd;
-                let other = l.dist[1 - side];
+            let l = sc.label(iv);
+            let mut dist = l.dist;
+            if nd < dist[side] {
+                dist[side] = nd;
+                l.dist = dist;
+                let other = dist[1 - side];
                 if other != INF {
                     mu = mu.min(nd + other);
                 }
@@ -376,15 +444,17 @@ fn bidirectional(g: [&Csr; 2], sc: &mut Scratch, s: u32, t: u32) -> (u64, u64) {
     (mu, settles)
 }
 
-/// The answer to one query and the settles it took; INF means unreachable.
-fn answer(fwd: &Csr, rev: &Csr, sc: &mut Scratch, s: u32, t: u32) -> (u64, u64) {
+/// The answer to one query (INF means unreachable), the settles it took, and whether its labels
+/// outgrew the small table.
+fn answer(fwd: &Csr, rev: &Csr, sc: &mut Scratch, s: u32, t: u32) -> (u64, u64, bool) {
     if s == t {
-        return (0, 0);
+        return (0, 0, false);
     }
     if rev.degree(t as usize) == 0 || fwd.degree(s as usize) == 0 {
-        return (INF, 0);
+        return (INF, 0, false);
     }
-    bidirectional([fwd, rev], sc, s, t)
+    let (d, settles) = bidirectional([fwd, rev], sc, s, t);
+    (d, settles, sc.in_large)
 }
 
 fn main() {
@@ -405,8 +475,8 @@ fn main() {
     }
 
     let next = AtomicUsize::new(0);
-    let mut answers = vec![(0u64, 0u64); pairs.len()];
-    let results: Vec<Vec<(usize, u64, u64)>> = std::thread::scope(|s| {
+    let mut answers = vec![(0u64, 0u64, false); pairs.len()];
+    let results: Vec<Vec<(usize, (u64, u64, bool))>> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..threads)
             .map(|_| {
                 let (fwd, rev, pairs, next) = (&fwd, &rev, &pairs, &next);
@@ -416,21 +486,20 @@ fn main() {
                     loop {
                         let q = next.fetch_add(1, Ordering::Relaxed);
                         let Some(&(src, dst)) = pairs.get(q) else { return done };
-                        let (d, settles) = answer(fwd, rev, &mut sc, src, dst);
-                        done.push((q, d, settles));
+                        done.push((q, answer(fwd, rev, &mut sc, src, dst)));
                     }
                 })
             })
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    for (q, d, settles) in results.into_iter().flatten() {
-        answers[q] = (d, settles);
+    for (q, a) in results.into_iter().flatten() {
+        answers[q] = a;
     }
     t.push(("queries", Instant::now()));
 
     let mut out = String::with_capacity(answers.len() * 12);
-    for &(d, _) in &answers {
+    for &(d, _, _) in &answers {
         if d == INF {
             out.push_str("-1\n");
         } else {
@@ -441,17 +510,20 @@ fn main() {
     std::fs::write("/out/distances.txt", out).expect("write /out/distances.txt");
     t.push(("write", Instant::now()));
 
+    // One stderr line of phase times (ms), worker count and search effort. sd-bench keeps each run's
+    // stderr tail, so this line is the box's phase split on the scoring CPU.
     let phases: Vec<String> =
         t.windows(2).map(|w| format!("{}={:.1}ms", w[1].0, (w[1].1 - w[0].1).as_secs_f64() * 1e3)).collect();
     let settles: u64 = answers.iter().map(|a| a.1).sum();
     let unreachable: Vec<_> = answers.iter().filter(|a| a.0 == INF).collect();
     eprintln!(
-        "phases: {} total={:.1}ms | threads={threads} n={n} m={} queries={} settles={settles} unreachable={} unreachable_settles={}",
+        "phases: {} total={:.1}ms | threads={threads} n={n} m={} queries={} settles={settles} unreachable={} unreachable_settles={} outgrew_small={:.1}%",
         phases.join(" "),
         (t.last().unwrap().1 - t[0].1).as_secs_f64() * 1e3,
         fwd.edges.len(),
         answers.len(),
         unreachable.len(),
-        unreachable.iter().map(|a| a.1).sum::<u64>()
+        unreachable.iter().map(|a| a.1).sum::<u64>(),
+        answers.iter().filter(|a| a.2).count() as f64 * 100.0 / answers.len().max(1) as f64
     );
 }

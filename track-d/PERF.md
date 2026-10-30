@@ -11,6 +11,13 @@ Every step from the reference to your final version, each with the live-board ru
 | 4 | push dea7a01343cf, scored ok | run-668a1c94f3a7 | 0.39 | 162 | 56.9 |
 | 5 | push 98a661eeaaa6, scored ok | run-d47d5f9e32b1 | 0.39 | 165 | 57.0 |
 | 6 | push 5ecc03f78566, scored ok | run-31d3f9618fa6 | 0.38 | 165 | 57.2 |
+| 7 | push dbc91d1aaa1a, scored ok | run-61e856ea6e28 | 0.39 | 161 | 57.1 |
+| 8 | push bdf05643a17c, scored ok | run-0462d899268d | 0.39 | 162 | 57.2 |
+| 9 | push 5263115c0f8b, scored ok | run-f1748b5f56b9 | 0.37 | 161 | 57.3 |
+
+## Kept experiments
+
+- Monotone radix heap for both search sides, replacing the binary heaps (commit 82a7e0e, branch exp/d-5-radix). Verdict: kept. Board run run-f1748b5f56b9 (row 9).
 
 ## Failed experiments
 
