@@ -18,6 +18,12 @@ Every step from the reference to your final version, each with the live-board ru
 | 11 | push b80b71eaed3a, scored ok | b80b71e · Track A (run-3749ce76278d) | 0.04 | 29 | 73.0 |
 | 12 | push 704a88eb6e9f, scored ok | 704a88e · Track A (run-8a546276765a) | 0.05 | 29 | 72.5 |
 | 13 | push cac9dd156516, scored ok | cac9dd1 · Track A (run-1d0d9fe3ae1a) | 0.04 | 29 | 73.0 |
+| 14 | push 442dbe7fbe59, scored ok | 442dbe7 · Track A (run-9860100dcf4e) | 0.04 | 29 | 72.9 |
+| 15 | push 948854aaefec, scored ok | 948854a · Track A (run-024d9e23cb50) | 0.04 | 25 | 73.1 |
+| 16 | push dc6ca650346c, scored ok | dc6ca65 · Track A (run-cdd0c0f2c6d5) | 0.04 | 25 | 73.3 |
+| 17 | push 22b6620692eb, scored ok | 22b6620 · Track A (run-ef28cacbc64d) | 0.04 | 25 | 74.6 |
+| 18 | push 90c864ad6d4e, scored ok | 90c864a · Track A (run-500a6311f2e5) | 0.04 | 25 | 74.7 |
+| 19 | push 2e2ee13a2258, scored ok | 2e2ee13 · Track A (run-77b664eb8d78) | 0.04 | 25 | 74.5 |
 
 ## What each push carried
 
@@ -34,8 +40,13 @@ The board re-runs the same code on every push, so several rows can carry one exp
 - Row 6 carries a-5: the scan. One 32-byte AVX2 load at byte 32 of each line finds the endpoint's `/` and, for most
   lines, the LF, in place of byte-by-byte searches.
 - Rows 7 and 8 carry a-6: the space before the latency found with one 16-byte compare before the LF.
-- Rows 9 to 13 carry a-10: a two-level key (each thread interns endpoints to a small id; each hour maps endpoint id
+- Rows 9 to 14 carry a-10: a two-level key (each thread interns endpoints to a small id; each hour maps endpoint id
   to its group with an array index) and one global endpoint rank, so the output order needs only integer sorts.
+- Rows 15 and 16 carry a-11 and a-12 together: latencies in 3-byte slots with an exact two-slot escape, 16-byte
+  groups, glibc's mmap threshold pinned, and each scan range's page-table entries dropped after its scan.
+- Rows 17 to 19 carry a-13: a branch-free parse. The latency's 1 to 10 digits converted with one 16-byte load
+  and SIMD multiply-adds, the 5xx flag read from the status's first digit, and the hour prefix compared as two
+  u64 words.
 
 Experiments measured on our bench box only, with no board run (their box status is the evidence):
 
@@ -46,6 +57,7 @@ Experiments measured on our bench box only, with no board run (their box status 
 - a-8, failed, no code kept: a cheaper hash, a 16-byte endpoint prefix in each slot, and a 32-byte vector compare.
   None beat a-6; cachegrind placed the lookup's cost in branch mispredictions of the linear probe.
 - a-9: a phase probe (stderr timing lines only), never lifted. It measured where a-6's time goes on the box.
+- a-11 and a-12 also have board rows (15 and 16); their box readings were:
 - a-11: memory. Latencies in 3-byte slots (larger values as an exact two-slot escape), 16-byte groups, and glibc's
   mmap threshold pinned so freed tail buffers return to the kernel. `K 28.81 | T 0.046s | M 24.1MB | S 610 | sha
   5/5+5/5 OK` against a-10's K 28.54 (M 27.9MB).
@@ -54,3 +66,20 @@ Experiments measured on our bench box only, with no board run (their box status 
 - a-13: a branch-free parse. The latency's 1 to 10 digits converted with one 16-byte load and SIMD multiply-adds,
   the 5xx flag read from the status's first digit, and the hour prefix compared as two u64 words. `K 30.17 (fresh;
   official 30.86) | T 0.041s | M 24.1MB | S 641 | sha 5/5+5/5 OK`.
+- a-14, failed: four ranges per worker, each thread's own range first and the rest claimed from a shared counter.
+  `K 28.24 (official; fresh 29.61) | T 0.043s | M 29.8MB | S 653 | sha 5/5+5/5 OK` against a-13's K 30.17-30.36
+  (M 24.1MB): each thread's tables spanned more hours, so memory and the merge grew, and the balance did not win
+  the time back.
+- a-15, NOISE, not lifted: the per-hour exact latency layout. A thread keeps at most three hours as chunk chains and copies older
+  hours back to back into exact arrays; groups live in their hour's arena and are freed with it.
+  `K 30.47 (official; fresh 30.66) | T 0.040s | M 22.7MB | S 696 | sha 5/5+5/5 OK`, and 30.45 on a second reading,
+  against a-13's 30.17-30.36: inside the spread. It saved 1.4 MB for 55 more lines and ran twice as slow on a
+  shuffled file, so a-13 stayed the base.
+- a-16, failed, no code kept: one 64-byte block load for both the LF and '/' masks, and a 16-wide tag-group probe
+  (SwissTable style) for the endpoint table. On our test machine both raised instructions per line (651 -> 685 and
+  671) and neither lowered the scan time.
+  The box re-measured a-13's code on that branch's report commit: `K 30.50 (official; fresh 30.92) | M 24.1MB`.
+- a-17: the gap between the scan and the tail. Endpoint bytes copied into a small pool per thread, so nothing after
+  the scan refaults the released input mapping, and the global endpoint merge takes one step per distinct endpoint
+  instead of one per (thread, endpoint). `K 32.08 (official; fresh 32.24) | T 0.035s | M 25.3MB | S 651 | sha
+  5/5+5/5 OK` against a-13's K 30.17-30.50 (T 0.039-0.041s).

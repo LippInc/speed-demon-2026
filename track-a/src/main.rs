@@ -269,7 +269,12 @@ const EMPTY: Slot = Slot { tag: 0, id: u32::MAX };
 /// 1 worker, 94 -> 72 at 4; peak RssAnon -1.4 MB (1 worker) to -3 MB (12 workers).
 struct Table {
     slots: Vec<Slot>,
-    eps: Vec<(u32, u8)>, // endpoint id -> (offset in the mapping, length); spec 2: at most 125 bytes
+    eps: Vec<(u32, u8)>, // endpoint id -> (offset in `pool`, length); spec 2: at most 125 bytes
+    // Each distinct endpoint's bytes, copied here when first seen. Everything after the scan reads endpoints from
+    // this pool, never from the mapping, whose page-table entries are released once its range is scanned: read
+    // from the mapping, the global merge and the output refault those pages. Measured on this VM with the
+    // per-endpoint merge below: merge 0.69 -> 0.27 ms at 4 workers, 2.27 -> 1.62 ms at 12.
+    pool: Vec<u8>,
     maps: Vec<Vec<u32>>, // per arena: endpoint id -> group, u32::MAX for none yet
     groups: Vec<Group>,
     arenas: Vec<Arena>,
@@ -277,7 +282,7 @@ struct Table {
 
 impl Table {
     fn new() -> Self {
-        Table { slots: vec![EMPTY; 1024], eps: Vec::new(), maps: Vec::new(), groups: Vec::new(), arenas: Vec::new() }
+        Table { slots: vec![EMPTY; 1024], eps: Vec::new(), pool: Vec::new(), maps: Vec::new(), groups: Vec::new(), arenas: Vec::new() }
     }
 
     fn arena(&mut self, hour: u32) -> usize {
@@ -291,13 +296,13 @@ impl Table {
         }
     }
 
-    fn ep_bytes(&self, data: &'static [u8], id: usize) -> &'static [u8] {
+    fn ep_bytes(&self, id: usize) -> &[u8] {
         let (off, len) = self.eps[id];
-        &data[off as usize..off as usize + len as usize]
+        &self.pool[off as usize..off as usize + len as usize]
     }
 
     /// The local id of an endpoint, interning it on first sight.
-    fn endpoint(&mut self, data: &'static [u8], ep: &'static [u8]) -> usize {
+    fn endpoint(&mut self, ep: &[u8]) -> usize {
         let h = key_hash(0, ep);
         let mask = self.slots.len() - 1;
         let mut i = h as usize & mask;
@@ -306,22 +311,22 @@ impl Table {
             if s.id == u32::MAX {
                 let id = self.eps.len();
                 self.slots[i] = Slot { tag: (h >> 32) as u32, id: id as u32 };
-                let off = ep.as_ptr() as usize - data.as_ptr() as usize;
-                self.eps.push((off as u32, u8::try_from(ep.len()).expect("endpoint longer than spec 2 allows")));
+                self.eps.push((self.pool.len() as u32, u8::try_from(ep.len()).expect("endpoint longer than spec 2 allows")));
+                self.pool.extend_from_slice(ep);
                 if self.eps.len() * 2 > self.slots.len() {
-                    self.grow(data);
+                    self.grow();
                 }
                 return id;
             }
-            if s.tag == (h >> 32) as u32 && self.ep_bytes(data, s.id as usize) == ep {
+            if s.tag == (h >> 32) as u32 && self.ep_bytes(s.id as usize) == ep {
                 return s.id as usize;
             }
             i = (i + 1) & mask;
         }
     }
 
-    fn add(&mut self, data: &'static [u8], arena: usize, ep: &'static [u8], error: bool, latency: u32) {
-        let e = self.endpoint(data, ep);
+    fn add(&mut self, arena: usize, ep: &[u8], error: bool, latency: u32) {
+        let e = self.endpoint(ep);
         let map = &mut self.maps[arena];
         if e >= map.len() {
             map.resize(self.eps.len(), u32::MAX);
@@ -347,11 +352,11 @@ impl Table {
         g.errors += error as u32;
     }
 
-    fn grow(&mut self, data: &'static [u8]) {
+    fn grow(&mut self) {
         let mut slots = vec![EMPTY; self.slots.len() * 2];
         let mask = slots.len() - 1;
         for s in self.slots.iter().filter(|s| s.id != u32::MAX) {
-            let mut i = key_hash(0, self.ep_bytes(data, s.id as usize)) as usize & mask;
+            let mut i = key_hash(0, self.ep_bytes(s.id as usize)) as usize & mask;
             while slots[i].id != u32::MAX {
                 i = (i + 1) & mask;
             }
@@ -381,7 +386,7 @@ fn scan(data: &'static [u8], start: usize, end: usize) -> Table {
         // Spec 2 grammar: status is three digits, 100 to 599, followed by SP; it is a 5xx error exactly when its
         // first digit is '5', so only that byte is read.
         let error = data[sp - 3] == b'5';
-        table.add(data, arena, &data[ep_start..sp - 4], error, latency);
+        table.add(arena, &data[ep_start..sp - 4], error, latency);
         p = lf + 1;
     }
     table
@@ -429,10 +434,11 @@ fn percentiles(lat: &mut [u32]) -> [u32; 3] {
     [v50, v95, v99]
 }
 
-/// What a scan thread hands to the tail: its groups, and its endpoints as (offset, length) in the mapping.
+/// What a scan thread hands to the tail: its groups, and its endpoints as (offset, length) in its pool.
 struct Scanned {
     groups: Vec<Group>,
     eps: Vec<(u32, u8)>,
+    pool: Vec<u8>,
 }
 
 /// An endpoint's first 16 bytes as a big-endian integer, zero-padded: integer order equals byte order on
@@ -446,33 +452,47 @@ fn prefix_key(ep: &[u8]) -> u128 {
 
 /// One global endpoint order: every thread's distinct endpoints merged by bytes (spec 4), giving the
 /// sorted list of all endpoints and, per thread, local id -> global rank. Each thread's list is sorted in
-/// parallel first; the merge compares 16-byte integer prefixes and falls back to bytes only on a tie.
+/// parallel first. Each merge step takes the smallest 16-byte integer prefix among the threads' heads, the
+/// smallest endpoint among the heads with that prefix (bytes compared only there), and advances every head
+/// holding that endpoint at once: one step per distinct endpoint, not per (thread, endpoint).
 /// It replaces the per-thread sort of every group by (hour, endpoint bytes) and the tail's byte sort.
-/// Measured on this VM against the two-level key alone: under 0.1 ms for the merge; total 0.121 -> 0.115 s at
-/// 4 workers, 0.123 -> 0.120 s at 12.
-fn global_ranks(data: &'static [u8], scanned: &[Scanned], sorted: &[Vec<(u128, u32)>]) -> (Vec<&'static [u8]>, Vec<Vec<u32>>) {
+/// Measured on this VM (seed 1 full, with the endpoint pool), the merge against one that picked one head per step
+/// by comparing (prefix, bytes) across all heads: 1.38 -> 0.27 ms at 4 workers, 8.19 -> 1.62 ms at 12; the serial
+/// window from the last scan end to the first tail job 2.56 -> 1.32 ms and 9.06 -> 2.31 ms.
+fn global_ranks<'a>(scanned: &'a [Scanned], sorted: &[Vec<(u128, u32)>]) -> (Vec<&'a [u8]>, Vec<Vec<u32>>) {
     let ep = |t: usize, e: u32| {
         let (off, len) = scanned[t].eps[e as usize];
-        &data[off as usize..off as usize + len as usize]
+        &scanned[t].pool[off as usize..off as usize + len as usize]
     };
-    let key = |t: usize, (k, e): (u128, u32)| (k, ep(t, e));
     let mut ranks: Vec<Vec<u32>> = scanned.iter().map(|s| vec![0; s.eps.len()]).collect();
-    let mut all: Vec<&'static [u8]> = Vec::new();
+    let mut all: Vec<&[u8]> = Vec::new();
     let mut pos = vec![0usize; scanned.len()];
+    let mut least_at: Vec<usize> = Vec::new(); // the threads whose head is the current least endpoint
     loop {
-        let mut best: Option<usize> = None;
-        for t in 0..scanned.len() {
-            if pos[t] < sorted[t].len() && best.is_none_or(|b| key(t, sorted[t][pos[t]]) < key(b, sorted[b][pos[b]])) {
-                best = Some(t);
+        let heads = (0..scanned.len()).filter_map(|t| sorted[t].get(pos[t]).map(|&(k, e)| (t, k, e)));
+        let Some(prefix) = heads.clone().map(|(_, k, _)| k).min() else {
+            return (all, ranks);
+        };
+        let mut least: &[u8] = &[];
+        least_at.clear();
+        for (t, _, e) in heads.filter(|&(_, k, _)| k == prefix) {
+            let b = ep(t, e);
+            use std::cmp::Ordering::*;
+            match if least_at.is_empty() { Less } else { b.cmp(least) } {
+                Less => {
+                    least = b;
+                    least_at.clear();
+                }
+                Equal => {}
+                Greater => continue,
             }
+            least_at.push(t);
         }
-        let Some(b) = best else { return (all, ranks) };
-        let e = ep(b, sorted[b][pos[b]].1);
-        if all.last() != Some(&e) {
-            all.push(e);
+        all.push(least);
+        for &t in &least_at {
+            ranks[t][sorted[t][pos[t]].1 as usize] = all.len() as u32 - 1;
+            pos[t] += 1;
         }
-        ranks[b][sorted[b][pos[b]].1 as usize] = all.len() as u32 - 1;
-        pos[b] += 1;
     }
 }
 
@@ -565,13 +585,13 @@ fn main() {
             .iter()
             .map(|&(a, b)| {
                 s.spawn(move || {
-                    let Table { groups, eps, maps, arenas, .. } = scan(data, a, b);
+                    let Table { groups, eps, pool, maps, arenas, .. } = scan(data, a, b);
                     release_range(data, a, b);
                     // This thread's endpoint ids in byte order, sorted here in parallel for the global merge.
-                    let bytes = |&(off, len): &(u32, u8)| &data[off as usize..off as usize + len as usize];
+                    let bytes = |&(off, len): &(u32, u8)| &pool[off as usize..off as usize + len as usize];
                     let mut sorted: Vec<(u128, u32)> = (0..eps.len() as u32).map(|e| (prefix_key(bytes(&eps[e as usize])), e)).collect();
                     sorted.sort_unstable_by_key(|&(k, e)| (k, bytes(&eps[e as usize])));
-                    (Scanned { groups, eps }, sorted, arenas, maps)
+                    (Scanned { groups, eps, pool }, sorted, arenas, maps)
                 })
             })
             .collect();
@@ -581,7 +601,7 @@ fn main() {
     let mut arenas: Vec<(Vec<Arena>, Vec<Vec<u32>>)> =
         per_thread.iter_mut().map(|p| (std::mem::take(&mut p.2), std::mem::take(&mut p.3))).collect();
     let scanned: Vec<Scanned> = per_thread.into_iter().map(|p| p.0).collect();
-    let (all, ranks) = global_ranks(data, &scanned, &sorted);
+    let (all, ranks) = global_ranks(&scanned, &sorted);
     drop(sorted);
 
     // The tail is split by hour: hours are disjoint parts of the key space that are also contiguous in the

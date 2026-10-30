@@ -1,6 +1,6 @@
 # Track A: Ingest
 
-K 30.17 (box `sd-bench/A`, fresh, the lower reading; official 30.86): T 0.041 s, M 24.1 MB, S 641, D 1,
+K 32.08 (box `sd-bench/A`, official, the lower reading; fresh 32.24): T 0.035 s, M 25.3 MB, S 651, D 1,
 sha 5/5+5/5.
 Reproduce with `sdrig run --track-dir track-a --track A --data <seed-1 full dir> --expected-sha <hash> --runs 5`.
 
@@ -23,9 +23,10 @@ Memory is kept small: a group is 16 bytes (u32 counts and chunk pointers; its ke
 array), and its latencies go into chains of small chunks inside large per-(thread, hour) blocks (`Arena`), so
 there is no per-group allocation and no vector growth slack. A latency takes 3 bytes; the rare value of
 0xFF0000 or more takes two 3-byte slots, so every u32 stays exact. glibc's mmap threshold is pinned so the
-tail's freed output buffers go back to the kernel instead of staying charged. After the scan each thread sorts its few distinct
-endpoints, and one merge gives every endpoint a global rank (`global_ranks`), so the output order needs only
-integer sorts.
+tail's freed output buffers go back to the kernel instead of staying charged. Each thread copies its few distinct endpoints into a small pool when
+first seen, so nothing after the scan touches the released mapping. After the scan each thread sorts them, and
+one merge, one step per distinct endpoint, gives every endpoint a global rank (`global_ranks`), so the output
+order needs only integer sorts.
 
 The tail runs in parallel, split by hour (`format_hour`): hours are disjoint and contiguous in the output, so
 each hour is merged across threads, its percentiles found by selection (`percentiles`) and its lines formatted
