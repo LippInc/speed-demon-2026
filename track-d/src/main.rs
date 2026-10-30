@@ -10,11 +10,12 @@ use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
 use std::ffi::c_void;
 use std::fs::File;
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
 unsafe extern "C" {
     fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
+    fn mallopt(param: i32, value: i32) -> i32;
 }
 const PROT_READ: i32 = 1;
 const MAP_PRIVATE: i32 = 2;
@@ -91,6 +92,10 @@ impl<T> Slots<T> {
 type Edge = [u16; 3];
 const HEAVY: u16 = u16::MAX;
 
+fn edge(head: u32, w: u32) -> Edge {
+    [head as u16, (head >> 16) as u16, w.min(HEAVY as u32) as u16]
+}
+
 /// Compressed adjacency: the edges of node u are edges[start(u)..end[u]].
 struct Csr {
     end: Vec<u32>,
@@ -99,6 +104,10 @@ struct Csr {
 }
 
 impl Csr {
+    fn new(n: usize, m: usize) -> Self {
+        Csr { end: vec![0; n], edges: vec![[0; 3]; m], heavy: Vec::new() }
+    }
+
     #[inline(always)]
     fn start(&self, u: usize) -> usize {
         if u == 0 { 0 } else { self.end[u - 1] as usize }
@@ -107,6 +116,13 @@ impl Csr {
     fn degree(&self, u: usize) -> u32 {
         self.end[u] - self.start(u) as u32
     }
+    /// Starts loading u's edge row into cache; a hint that never faults.
+    #[inline(always)]
+    fn prefetch(&self, u: usize) {
+        let row = self.edges.as_ptr().wrapping_add(self.start(u)) as *const i8;
+        unsafe { _mm_prefetch(row, _MM_HINT_T0) }
+    }
+
     /// (head, weight) of each edge of u.
     #[inline(always)]
     fn row(&self, u: usize) -> impl Iterator<Item = (u32, u64)> + '_ {
@@ -133,6 +149,9 @@ fn on_threads<T: Send>(threads: usize, job: impl Fn(usize) -> T + Sync) -> Vec<T
         running.into_iter().map(|h| h.join().unwrap()).collect()
     })
 }
+
+/// The forward CSR, the reverse CSR and new_id[input id], all in the relabelled ids.
+type Graph = (Csr, Csr, Vec<u32>);
 
 /// Phase names and the time each ended, for the stderr phase line.
 type Phases = Vec<(&'static str, Instant)>;
@@ -177,8 +196,7 @@ fn place(buckets: &[Vec<Vec<Record>>], first: usize, shift: u32, g: &mut Csr, th
             for r in records() {
                 let c = &mut cursor[r.0 as usize - lo];
                 // SAFETY: c walks this row's own slots inside partition p's slice of edges.
-                let e = [r.1 as u16, (r.1 >> 16) as u16, r.2.min(HEAVY as u32) as u16];
-                unsafe { edges.put(*c as usize, e) };
+                unsafe { edges.put(*c as usize, edge(r.1, r.2)) };
                 heavy.extend((r.2 >= HEAVY as u32).then_some((*c, r.2)));
                 *c += 1;
             }
@@ -186,6 +204,72 @@ fn place(buckets: &[Vec<Vec<Record>>], first: usize, shift: u32, g: &mut Csr, th
     });
     g.heavy.extend(heavy.into_iter().flatten());
     g.heavy.sort_unstable();
+}
+
+/// Root ids a relabel worker takes from the shared counter at a time (a design constant). One
+/// contended fetch_add per root candidate (about n of them once the regions close in) made the
+/// claim BFS 225-230 ms locally; in chunks it is 58-83 ms.
+const ROOT_CHUNK: usize = 4096;
+
+/// Renumbers the nodes so that nodes close in the graph get close ids: worker k runs a BFS over
+/// out-edges from node k * n / workers (node ids are a random relabelling, spec section 2, so these
+/// are random seeds: a fixed rule, not a chosen node), claiming each node once through an atomic
+/// flag; a worker whose frontier is blocked takes new roots from a shared counter. New ids are the
+/// workers' BFS orders one after the other. The forward CSR is then copied row by row into the new
+/// ids (heads mapped, rows prefetched ahead); the old one comes back for the rev build to reuse.
+/// Which worker claims a node depends on thread timing, so the ids differ from run to run; no answer
+/// depends on them (a distance is a property of the graph, not of how it is numbered).
+/// Why: the generator shuffles ids, so a settle's neighbours sit in random CSR rows, each a DRAM miss;
+/// in BFS order they share cache lines and pages. Measured (exp/d-13-probe-claimch, box): T
+/// 0.271 / 0.285 -> 0.248 / 0.258 s; locally queries -35-38 % and the rev build 63-92 -> 34-45 ms.
+/// Returns the new CSR, the old one and new_id[old id].
+fn relabel(old: Csr, threads: usize) -> (Csr, Csr, Vec<u32>) {
+    let n = old.end.len();
+    let claimed: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(false)).collect();
+    let claim = |v: usize| !claimed[v].load(Ordering::Relaxed) && !claimed[v].swap(true, Ordering::Relaxed);
+    let next_root = AtomicUsize::new(0);
+    let old_of: Vec<u32> = on_threads(threads, |k| {
+        let (mut order, mut head, mut roots) = (Vec::new(), 0, k * n / threads..k * n / threads + 1);
+        while !roots.is_empty() {
+            for root in roots {
+                order.extend(claim(root).then_some(root as u32));
+                while let Some(&u) = order.get(head) {
+                    if let Some(&ahead) = order.get(head + PREFETCH_AHEAD) {
+                        old.prefetch(ahead as usize);
+                    }
+                    head += 1;
+                    order.extend(old.row(u as usize).filter_map(|(v, _)| claim(v as usize).then_some(v)));
+                }
+            }
+            let lo = next_root.fetch_add(ROOT_CHUNK, Ordering::Relaxed).min(n);
+            roots = lo..n.min(lo + ROOT_CHUNK);
+        }
+        order
+    })
+    .concat();
+    let (mut new_id, mut g, mut at) = (vec![0u32; n], Csr::new(n, old.edges.len()), 0);
+    for (x, &o) in old_of.iter().enumerate() {
+        new_id[o as usize] = x as u32;
+        at += old.degree(o as usize);
+        g.end[x] = at;
+    }
+    let edges = Slots(g.edges.as_mut_ptr());
+    let heavy = on_threads(threads, |k| {
+        let mut heavy = Vec::new();
+        for u in n * k / threads..n * (k + 1) / threads {
+            let x = new_id[u] as usize;
+            for (j, (v, w)) in old.row(u).enumerate() {
+                let at = g.start(x) + j;
+                // SAFETY: row x of g lies in this worker's range of new ids; no other worker writes it.
+                unsafe { edges.put(at, edge(new_id[v as usize], w as u32)) };
+                heavy.extend((w >= HEAVY as u64).then_some((at as u32, w as u32)));
+            }
+        }
+        heavy
+    });
+    g.heavy = heavy.concat();
+    g.heavy.sort_unstable();
+    (g, old, new_id)
 }
 
 /// Builds both CSRs without atomics. Parse: each thread parses its byte range once and files every
@@ -198,7 +282,7 @@ fn place(buckets: &[Vec<Vec<Record>>], first: usize, shift: u32, g: &mut Csr, th
 /// build) 590-640 ms -> 185-200 ms at 12 workers.
 /// Partitions are the smallest power-of-two node range that splits this input's n nodes into at
 /// most PARTS_PER_WORKER * threads ranges.
-fn build_graph(graph: &[u8], body: usize, n: usize, threads: usize, t: &mut Phases) -> (Csr, Csr) {
+fn build_graph(graph: &[u8], body: usize, n: usize, threads: usize, t: &mut Phases) -> Graph {
     let shift = (0..).find(|&s| (n.max(1) - 1) >> s < PARTS_PER_WORKER * threads).unwrap();
     let parts = ((n.max(1) - 1) >> shift) + 1;
     let cuts = cut_at_lf(graph, body, threads);
@@ -215,11 +299,17 @@ fn build_graph(graph: &[u8], body: usize, n: usize, threads: usize, t: &mut Phas
     t.push(("parse", Instant::now()));
     let m = by_tail.iter().flatten().map(Vec::len).sum();
     assert!(m <= u32::MAX as usize, "CSR offsets are u32");
-    let mut fwd = Csr { end: vec![0; n], edges: vec![[0; 3]; m], heavy: Vec::new() };
+    let mut fwd = Csr::new(n, m);
     place(&by_tail, 0, shift, &mut fwd, threads);
     drop(by_tail);
     t.push(("fwd", Instant::now()));
-    let mut rev = Csr { end: vec![0; n], edges: vec![[0; 3]; m], heavy: Vec::new() };
+    let (fwd, old, new_id) = relabel(fwd, threads);
+    t.push(("relabel", Instant::now()));
+    // The rev CSR reuses the old forward CSR's buffers (same n and m; place() overwrites every end
+    // and edge slot): no 37 MB free and fresh allocation in the middle of the build, and the rev build
+    // writes into pages already faulted in.
+    let mut rev = old;
+    rev.heavy.clear();
     for slab in 0..REV_SLABS {
         let (first, last) = (parts * slab / REV_SLABS, parts * (slab + 1) / REV_SLABS);
         let next = AtomicUsize::new(0);
@@ -240,7 +330,7 @@ fn build_graph(graph: &[u8], body: usize, n: usize, threads: usize, t: &mut Phas
         place(&by_head, first, shift, &mut rev, threads);
     }
     t.push(("rev", Instant::now()));
-    (fwd, rev)
+    (fwd, rev, new_id)
 }
 
 /// A heap entry: 12 bytes packed instead of the 16 a (u64, u32) tuple takes.
@@ -466,10 +556,11 @@ impl Scratch {
     }
 }
 
-/// Pops ahead whose CSR rows are prefetched (a design constant). The CSRs (94 MB) are four times the
-/// box's L3, so a settle's edge row is a DRAM miss; the next pops of this side sit at the end of
-/// radix bucket 0, so their rows can load while u is relaxed. Measured locally (full seed 1,
-/// interleaved with d-8, query phase medians): 875 -> 564 ms at 12 workers, 795 -> 490 ms at 4.
+/// Pops ahead whose CSR rows are prefetched (a design constant). Each CSR is about 37 MB at full size
+/// (5,000,000 x 6 B edges + 1,740,512 x 4 B ends), both about 74 MB, three times the box's 24 MB L3,
+/// so a settle's edge row is a DRAM miss; the next pops of this side sit at the end of radix bucket 0,
+/// so their rows can load while u is relaxed. Measured locally (full seed 1, interleaved with d-8,
+/// query phase medians): 875 -> 564 ms at 12 workers, 795 -> 490 ms at 4.
 /// Distances 4 / 8 / 16 gave 569 / 564 / 565 ms at 12; prefetching only end[next] gave 725-739 ms,
 /// and prefetching each neighbour's label slot as well bought under 2 %, so neither is here.
 const PREFETCH_AHEAD: usize = 8;
@@ -510,8 +601,7 @@ fn bidirectional(g: [&Csr; 2], sc: &mut Scratch, s: u32, t: u32) -> (u64, u64) {
         settles += 1;
         // The next pops of this side are the last entries of bucket 0 (it pops from its end).
         for e in sc.heaps[side].buckets[0].iter().rev().take(PREFETCH_AHEAD) {
-            let row = g[side].edges.as_ptr().wrapping_add(g[side].start(e.node as usize));
-            unsafe { _mm_prefetch(row as *const i8, _MM_HINT_T0) }; // a hint: never faults
+            g[side].prefetch(e.node as usize);
         }
         for (v, w) in g[side].row(u as usize) {
             let nd = d + w;
@@ -547,6 +637,11 @@ fn answer(fwd: &Csr, rev: &Csr, sc: &mut Scratch, s: u32, t: u32) -> (u64, u64, 
 
 fn main() {
     let mut t = vec![("start", Instant::now())];
+    // Left dynamic, glibc raises its mmap threshold to the size of each freed mmapped buffer (up to
+    // 32 MiB); the relabel frees several (old_of 7 MB, the claim flags), and every later buffer below
+    // that stays resident in the arena (cgroup M at 12 workers 157 MiB). Pinned: 1 MiB gave 129 MiB,
+    // 256 KiB 124-126 MiB, level with the build without the relabel (124 MiB), at the same T.
+    unsafe { mallopt(-3, 1 << 18) }; // -3: M_MMAP_THRESHOLD
     let graph = map_file("/data/graph.txt");
     let queries = map_file("/data/queries.txt");
     let threads = workers();
@@ -554,12 +649,12 @@ fn main() {
     let mut i = 0;
     let n = read_num(graph, &mut i) as usize; // header "n m" (spec section 2); m is recounted in pass 1
     read_num(graph, &mut i);
-    let (fwd, rev) = build_graph(graph, i, n, threads, &mut t);
+    let (fwd, rev, new_id) = build_graph(graph, i, n, threads, &mut t);
 
     let mut pairs = Vec::new();
     let mut i = 0;
     while i < queries.len() {
-        pairs.push((read_num(queries, &mut i) as u32, read_num(queries, &mut i) as u32));
+        pairs.push((new_id[read_num(queries, &mut i) as usize], new_id[read_num(queries, &mut i) as usize]));
     }
 
     let next = AtomicUsize::new(0);

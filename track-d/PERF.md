@@ -27,6 +27,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 20 | push 2e2ee13a2258, scored ok | 2e2ee13 · Track D (run-781f369e13b0) | 0.34 | 148 | 58.1 |
 | 21 | push 1e9607b023c2, scored ok | 1e9607b · Track D (run-954dfa85b25d) | 0.27 | 147 | 60.4 |
 | 22 | push 48c9f564734d, scored ok | 48c9f56 · Track D (run-26fbc9f81cb2) | 0.28 | 148 | 60.1 |
+| 23 | push e71baea09250, scored ok | e71baea · Track D (run-e000fdfd8967) | 0.28 | 129 | 60.6 |
+| 24 | push c32fd6a3502d, scored ok (lead-AB's A+B push; track D unchanged) | c32fd6a · Track D (run-6a95885c9fae) | 0.28 | 130 | 60.5 |
 
 ## Kept experiments
 
@@ -37,10 +39,17 @@ Every step from the reference to your final version, each with the live-board ru
 
 - Prefetch of the CSR rows of the next pops in the query loop (commit 40418c5, branch exp/d-10-relax): on each settle, the edge rows of the next eight entries this side will pop start loading before the current node is relaxed. Verdict: kept; bench K 15.84. Board run 1e9607b · Track D (run-954dfa85b25d), row 21.
 
-- Six-byte CSR entries (commit a17e502, branch exp/d-12-mem): the head as two 16-bit halves and a 16-bit weight, with the few weights that do not fit in a sorted side table. Verdict: kept; bench K 16.14, with lower memory and the same time. Its board row comes later, so no number here.
+- Six-byte CSR entries (commit a17e502, branch exp/d-12-mem): the head as two 16-bit halves and a 16-bit weight, with the few weights that do not fit in a sorted side table. Verdict: kept; bench K 16.14, with lower memory and the same time. Board run e71baea · Track D (run-e000fdfd8967), row 23.
+
+- Static C runtime (commit aaf31e4, branch exp/d-14-static): the binary links libc statically, so the process starts without the dynamic loader. Verdict: kept; bench K 16.10 fresh and 16.54 official, the same time as before.
+
+## Open experiments
+
+- Node relabel for locality (commits c970cca, 097a871, 42cd7dd, fe87585, branch exp/d-13-t): one breadth-first search per worker from a spread of seed nodes claims nodes in parallel, the new ids follow those search orders, the forward rows are copied into the new numbering in old-id order, the old forward rows' memory is reused for the reverse rows, and glibc's mmap threshold is pinned low so freed buffers return their memory. As first committed (c970cca) it was level with its base (bench K 16.06 against 16.10); with the memory fix (097a871, bench K 16.28) and the streaming copy (42cd7dd, bench K 16.35) it is ahead; the line fold (fe87585, bench K 16.33) changed no behaviour. Verdict: held by the lead as the base for the time work; not on the board yet.
 
 ## Failed experiments
 
+- Relabel probes for d-13 (branches exp/d-13-probe-relabel, -relabel2, -claim, -claimch, -nomallopt, never merged): a sequential breadth-first relabel with a full rebuild (bench K 11.47), the same twice (bench K 9.94), the first parallel claim version (bench K 13.72), claim with chunked root ids (bench K 15.36, faster but it kept the old rows alive), and d-13 without the pinned mmap threshold (bench K 15.75, same time, more memory). Probe exp/d-13-probe-q2 ran the query phase twice to measure it (bench K 12.01). Full bench lines in REPORT-d-13a.md and REPORT-d-13.md; no board runs, so no time or memory numbers here.
 - Prefetch of the other side's next edge rows as well (not committed, branch exp/d-11-prefetch). Verdict: dropped; slower locally at both thread counts.
 - Two-stage prefetch: end entries of pops nine to sixteen ahead, edge rows of the nearest eight (commit 7e76e2f, branch exp/d-11-prefetch). Verdict: dropped; no gain on the bench box, bench K 15.82 against 15.84.
 - Push pruning in the query loop (not committed, branch exp/d-10-relax): skip a heap push when the new distance plus the other side's minimum already reaches the best path found. Exact, and it cut pushes on full seed 1 by about a twentieth, but the local query time did not move, so it stayed off the branch.
