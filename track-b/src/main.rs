@@ -4,6 +4,7 @@
 //! tokenizes every document and decides every BOOL query (per document, or 64 documents at a time) and every
 //! PHRASE pattern (by anchor checks) for it; nothing is indexed.
 
+use std::arch::x86_64::*;
 use std::collections::HashMap;
 use std::fs::File;
 use std::os::fd::AsRawFd;
@@ -14,17 +15,61 @@ const NIL: u32 = u32::MAX;
 const MAX_TERM: usize = 32; // spec 2.3: a query term is 1 to 32 bytes, so a longer token is never a query term
 const FIRST_IDS: usize = 10; // spec 4: the ten smallest ids
 
-/// spec 2.2: ASCII-lowercase, and a token is a run of a-z / 0-9; this maps a byte to its lower-case token byte, 0 if separator.
-const FOLD: [u8; 256] = {
-    let mut t = [0u8; 256];
-    let mut c = 0;
-    while c < 256 {
-        let b = (c as u8).to_ascii_lowercase();
-        t[c] = b * b.is_ascii_alphanumeric() as u8;
-        c += 1;
+/// 32 bytes of the corpus in an AVX2 register (x86-64-v3, the build target), zero past the end of `data`.
+struct Chunk(__m256i);
+
+impl Chunk {
+    #[inline(always)]
+    fn load(data: &[u8], i: usize) -> Chunk {
+        if i + 32 <= data.len() {
+            return Chunk(unsafe { _mm256_loadu_si256(data.as_ptr().add(i) as *const __m256i) });
+        }
+        let mut tail = [0u8; 32];
+        let rest = &data[i.min(data.len())..];
+        tail[..rest.len()].copy_from_slice(rest);
+        Chunk(unsafe { _mm256_loadu_si256(tail.as_ptr() as *const __m256i) })
     }
-    t
-};
+
+    /// Bit k: byte k is a token byte, a-z, A-Z or 0-9 (spec 2.2). Signed compares, so bytes from 0x80 never match.
+    #[inline(always)]
+    fn token_mask(&self) -> u32 {
+        unsafe {
+            let lower = _mm256_or_si256(self.0, _mm256_set1_epi8(0x20));
+            let between = |v, lo: u8, hi: u8| {
+                let above = _mm256_cmpgt_epi8(v, _mm256_set1_epi8(lo as i8 - 1));
+                _mm256_andnot_si256(_mm256_cmpgt_epi8(v, _mm256_set1_epi8(hi as i8)), above)
+            };
+            let tok = _mm256_or_si256(between(lower, b'a', b'z'), between(self.0, b'0', b'9'));
+            _mm256_movemask_epi8(tok) as u32
+        }
+    }
+
+    /// Bit k: byte k ends the doc, an LF or the end of `data` (a last line without LF ends there).
+    #[inline(always)]
+    fn lf(&self, data: &[u8], i: usize) -> u32 {
+        let lf = unsafe { _mm256_movemask_epi8(_mm256_cmpeq_epi8(self.0, _mm256_set1_epi8(b'\n' as i8))) as u32 };
+        let past_end = data.len().saturating_sub(i);
+        if past_end < 32 {
+            return lf | 1 << past_end;
+        }
+        lf
+    }
+
+    /// The first n bytes lower-cased (bit 5 set), the rest zero.
+    #[inline(always)]
+    fn folded(&self, n: usize) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        unsafe {
+            let keep = _mm256_cmpgt_epi8(_mm256_set1_epi8(n as i8), _mm256_setr_epi8(
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
+                29, 30, 31,
+            ));
+            let v = _mm256_and_si256(_mm256_or_si256(self.0, _mm256_set1_epi8(0x20)), keep);
+            _mm256_storeu_si256(out.as_mut_ptr() as *mut __m256i, v);
+        }
+        out
+    }
+}
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
@@ -50,12 +95,15 @@ fn parallel<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
     })
 }
 
-/// FNV-1a, computed byte by byte while a token is scanned, so the lookup needs no second pass over the token.
-#[inline]
-fn fnv_step(h: u32, c: u8) -> u32 {
-    (h ^ c as u32).wrapping_mul(0x0100_0193)
+/// The hash of a term zero-padded to 32 bytes: its four words multiplied by odd constants and xor-ed, high and low
+/// halves folded. A fixed amount of work per token, with no loop whose exit depends on the token's length.
+#[inline(always)]
+fn hash32(t: &[u8; MAX_TERM]) -> u32 {
+    const K: [u64; 4] = [0x9e37_79b9_7f4a_7c15, 0xc2b2_ae3d_27d4_eb4f, 0x1656_67b1_9e37_79f9, 0x27d4_eb2f_1656_67c5];
+    let w = |k: usize| u64::from_le_bytes(t[8 * k..8 * k + 8].try_into().unwrap()).wrapping_mul(K[k]);
+    let h = w(0) ^ w(1) ^ w(2) ^ w(3);
+    (h >> 32) as u32 ^ h as u32
 }
-const FNV_OFFSET: u32 = 0x811c_9dc5;
 
 /// The query terms: interned into it while queries.txt is parsed, then probed for every token of the pass. A slot
 /// holds the term's hash and id + 1 in one u64, so a miss reads one cache line; a hash match is then confirmed
@@ -76,8 +124,10 @@ impl TermTable {
     /// rehashed from the hash each slot keeps: 1 MB of slots on seed 1. Measured against load 1/2 (2 MB) and 1/4
     /// (4 MB): the smallest table was fastest, since misses cost more than probe steps.
     fn intern(&mut self, term: &[u8]) -> u32 {
-        let h = term.iter().fold(FNV_OFFSET, |h, &c| fnv_step(h, c));
-        if let Some(t) = self.find(term, h) {
+        let mut padded = [0u8; MAX_TERM];
+        padded[..term.len()].copy_from_slice(term);
+        let h = hash32(&padded);
+        if let Some(t) = self.find(&padded, h) {
             return t;
         }
         if 3 * (self.bytes.len() + 1) > 2 * self.slots.len() {
@@ -86,9 +136,7 @@ impl TermTable {
             self.shift -= 1;
             old.into_iter().for_each(|s| self.place(s)); // an empty slot placed again stays empty
         }
-        let mut entry = TermBytes([0; MAX_TERM]);
-        entry.0[..term.len()].copy_from_slice(term);
-        self.bytes.push(entry);
+        self.bytes.push(TermBytes(padded));
         self.place((h as u64) << 32 | self.bytes.len() as u64);
         self.bytes.len() as u32 - 1
     }
@@ -122,9 +170,10 @@ impl TermTable {
         (h.wrapping_mul(0x9e37_79b1) >> self.shift) as usize
     }
 
-    /// The hash only filters; the bytes decide. Terms hold no zero byte, so `e[n] == 0` means the term is n long.
+    /// The hash only filters; the bytes decide. Token and entry are both zero-padded to 32 bytes, so one 32-byte
+    /// compare settles the bytes and the length (it replaced a memcmp call and a length test per hash match).
     #[inline]
-    fn find(&self, token: &[u8], h: u32) -> Option<u32> {
+    fn find(&self, token: &[u8; MAX_TERM], h: u32) -> Option<u32> {
         let mut i = self.slot(h);
         loop {
             let s = self.slots[i];
@@ -132,10 +181,9 @@ impl TermTable {
                 return None;
             }
             if (s >> 32) as u32 == h {
-                let t = (s as u32 - 1) as usize;
-                let (e, n) = (&self.bytes[t].0, token.len());
-                if e[..n] == *token && (n == MAX_TERM || e[n] == 0) {
-                    return Some(t as u32);
+                let t = s as u32 - 1;
+                if self.bytes[t as usize].0 == *token {
+                    return Some(t);
                 }
             }
             i = (i + 1) & (self.slots.len() - 1);
@@ -143,31 +191,50 @@ impl TermTable {
     }
 
     /// Tokenizes the doc text from `i` to its LF (spec 2.2), calling `on_token` with the term id of each token that is
-    /// a query term and None for any other token; returns the index just past the LF.
+    /// a query term and None for any other token; returns the index just past the LF. The text is classified 32 bytes
+    /// at a time (`Chunk`), and tokens are cut where the token-byte mask changes, so no branch is taken per byte: the
+    /// byte loop's two branches (separator skip, token end) were 71 M of the run's 161 M mispredicts (cachegrind,
+    /// 1 worker, seed 1).
     #[inline(always)]
     fn tokenize(&self, data: &[u8], mut i: usize, mut on_token: impl FnMut(Option<u32>)) -> usize {
-        let end = data.len();
-        let mut token = [0u8; MAX_TERM];
-        while i < end && data[i] != b'\n' {
-            let mut c = FOLD[data[i] as usize];
-            if c == 0 {
-                i += 1;
-                continue;
-            }
-            let mut h = FNV_OFFSET;
-            let mut n = 0;
-            while c != 0 {
-                if n < MAX_TERM {
-                    token[n] = c;
+        let mut start = NIL as usize; // the token in progress, if any
+        loop {
+            let chunk = Chunk::load(data, i);
+            let (lf, tok) = (chunk.lf(data, i), chunk.token_mask());
+            let tok = tok & lf.wrapping_sub(1) & !lf; // only the bytes before the doc's LF
+            let in_token = (start != NIL as usize) as u32;
+            let mut edges = tok ^ (tok << 1 | in_token); // bit k: a token starts or ends at byte i + k
+            while edges != 0 {
+                let k = i + edges.trailing_zeros() as usize;
+                if start == NIL as usize {
+                    start = k;
+                } else {
+                    on_token(self.lookup(data, start, k));
+                    start = NIL as usize;
                 }
-                n += 1;
-                h = fnv_step(h, c);
-                i += 1;
-                c = if i < end { FOLD[data[i] as usize] } else { 0 };
+                edges &= edges - 1;
             }
-            on_token(if n <= MAX_TERM { self.find(&token[..n], h) } else { None });
+            if lf != 0 {
+                let end = i + lf.trailing_zeros() as usize;
+                if start != NIL as usize {
+                    on_token(self.lookup(data, start, end));
+                }
+                return end + 1;
+            }
+            i += 32;
         }
-        i + 1
+    }
+
+    /// The term id of the token data[from..to], if it is a query term. Its bytes are loaded once, lower-cased by
+    /// setting bit 5 (spec 2.2: it maps A-Z to a-z and leaves a-z and 0-9 alone) and zero-padded to 32.
+    #[inline(always)]
+    fn lookup(&self, data: &[u8], from: usize, to: usize) -> Option<u32> {
+        let n = to - from;
+        if n > MAX_TERM {
+            return None;
+        }
+        let token = Chunk::load(data, from).folded(n);
+        self.find(&token, hash32(&token))
     }
 }
 

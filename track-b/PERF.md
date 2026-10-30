@@ -78,6 +78,13 @@ Experiments measured only on the bench box (sd-bench/B), with no board run:
   - b-30b, the trigger range read at the hit that first sets a term's word and carried in the touched list. Kept: `K 20.55 (lower: official) | official K 20.55 T 0.368s | fresh K 20.59 T 0.366s | M 33.1MB S 572 L | sha 5/5+5/5 OK`. The 8.5 M trigger_start misses moved from the flush into the pass, where they overlap the tokenizer.
   - The third part (AND operands tested against the filter) was not built. Only 1.17 M of 18.3 M folds have an untouched AND operand that forces zero, and it needs b-30a's filter.
   - Second reading on the docs commit: `K 20.55 (lower: official) | official K 20.55 T 0.368s | fresh K 20.58 T 0.367s | M 33.3MB S 572 L | sha 5/5+5/5 OK` (11dd874).
+- **b-31**, the tokenizer and the probe, on b-30b.
+  - The docs fix 232155c (four review findings, comment-only code change) read `K 20.57 (lower: official) | official K 20.57 T 0.367s | fresh K 20.57 T 0.367s | M 33.1MB S 572 L | sha 5/5+5/5 OK`.
+  - b-31a, 32 bytes classified at a time with AVX2, tokens cut where the token-byte mask changes, FNV kept: `K 20.04 (lower: official) | official K 20.04 T 0.377s | fresh K 20.06 T 0.376s | M 33.2MB S 625 L | sha 5/5+5/5 OK`. Worse on its own. Kept only as the base of b-31b, which needs its zero-padded token.
+  - b-31b, the token hashed as four 64-bit words of the zero-padded 32 bytes: `K 21.35 (lower: fresh) | official K 21.37 T 0.330s (0.329-0.332) | fresh K 21.35 T 0.330s (0.329-0.332) | M 33.1MB S 634 L | sha 5/5+5/5 OK`. The byte loop's mispredicts fell from 71.1 M to 13.4 M (cachegrind, 1 worker, seed 1).
+  - b-31c, one 32-byte compare in `find` in place of memcmp and a length test: `K 21.75 (lower: fresh) | official K 21.76 T 0.318s (0.318-0.319) | fresh K 21.75 T 0.319s (0.317-0.320) | M 33.1MB S 631 L | sha 5/5+5/5 OK`. Kept, final code.
+  - b-31d, failed (reverted): the 512 highest-df terms in an 8 KB slot table probed first: `K 20.52 (lower: fresh) | official K 20.53 T 0.354s (0.353-0.354) | fresh K 20.52 T 0.354s (0.353-0.356) | M 33.0MB S 654 L | sha 5/5+5/5 OK`. It saved 2.0 M D1 misses and added 37.4 M mispredicts.
+  - Second reading on the docs commit: `K 21.70 (lower: official) | official K 21.70 T 0.320s | fresh K 21.72 T 0.319s | M 33.1MB S 631 L | sha 5/5+5/5 OK` (e6d5eb3).
 
 Experiments measured only on the build VM and not kept:
 
