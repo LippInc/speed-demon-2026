@@ -1,13 +1,13 @@
 # Track B: Index
 
-Track B (index), Rust, standard library only. K 19.14 = T 0.379 s, M 32.9 MB, S 827, D 1 (box sd-bench/B on commit d165e91d).
+Track B (index), Rust, standard library only. K 19.95 = T 0.385 s, M 27.0 MB, S 595, D 1 (box sd-bench/B on commit 2a2b859c).
 Reproduce: `docker build -t b track-b && docker run --rm -v <data>:/data:ro -v <out>:/out b`.
 
-- One pass over the memory-mapped corpus ([`map_file`](src/main.rs#L48)), one doc range per thread ([`scan`](src/main.rs#L590)), looking up only the query terms in a compact table ([`TermTable`](src/main.rs#L73)).
-- Phrases are matched by anchor checks in the same pass: each phrase is checked only where its rarest term occurs, by comparing term ids ([`PhrasePlan`](src/main.rs#L178)).
-- BOOL queries are decided per document inside the pass, with no posting list stored. Each query is evaluated only on the docs that contain one of its trigger terms ([`cover`](src/main.rs#L365)); the strict left fold is applied to the doc's term set ([`holds`](src/main.rs#L512)), and the smallest ids are shared across workers ([`FirstIds`](src/main.rs#L541)).
-- Queries whose cover is estimated to hold at least 1 doc in 64 are folded 64 docs at a time with word operations ([`fold_window`](src/main.rs#L460)); counts come from popcount and id sums from bit-sliced popcounts ([`flush_window`](src/main.rs#L488)).
-- Trigger terms and window queries are picked with document frequencies estimated on 1/128 of the corpus ([`estimate_df`](src/main.rs#L278)). The estimate only chooses an evaluation order; answers never depend on it.
+- One pass over the memory-mapped corpus ([`map_file`](src/main.rs#L34)), one doc range per thread ([`scan`](src/main.rs#L512)), looking up only the query terms in a compact table ([`TermTable`](src/main.rs#L64)).
+- Phrases are matched by anchor checks in the same pass: each phrase is checked only where its rarest term occurs, by comparing term ids ([`PhrasePlan`](src/main.rs#L200)).
+- BOOL queries are decided per document inside the pass, with no posting list stored. Each query is evaluated only on the docs that contain one of its trigger terms ([`cover`](src/main.rs#L350)); the strict left fold is applied to the doc's term set ([`holds`](src/main.rs#L453)), and the smallest ids are shared across workers ([`FirstIds`](src/main.rs#L482)).
+- Queries whose cover is estimated to hold at least 1 doc in 64 are folded 64 docs at a time with word operations ([`fold_window`](src/main.rs#L401)); counts come from popcount and id sums from bit-sliced popcounts ([`flush_window`](src/main.rs#L429)).
+- Trigger terms and window queries are picked with document frequencies estimated on 1/128 of the corpus ([`estimate_df`](src/main.rs#L271)). The estimate only chooses an evaluation order; answers never depend on it.
 - PERF.md: board steps 1-19 cover b-1 to b-11; box-only experiments are listed under the table.
 - Honest limit: tokenizing and the term-table probe are now about half of the pass, and both still run one byte or one token at a time.
 
