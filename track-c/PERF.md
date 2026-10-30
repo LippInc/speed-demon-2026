@@ -17,6 +17,9 @@ Every step from the reference to your final version, each with the live-board ru
 | 10 | push b80b71eaed3a, scored ok | b80b71e · Track C (run-6b0aeec09c5b) | 0.13 | 22 | 57.0 |
 | 11 | push 704a88eb6e9f, scored ok | 704a88e · Track C (run-96e1148bb559) | 0.14 | 16 | 57.5 |
 | 12 | push 442dbe7fbe59, scored ok | 442dbe7 · Track C (run-75fe344f3f7e) | 0.10 | 16 | 61.0 |
+| 13 | push dc6ca650346c, scored ok | dc6ca65 · Track C (run-f7359dc6db71) | 0.10 | 16 | 60.8 |
+| 14 | push 90c864ad6d4e, scored ok | 90c864a · Track C (run-63963655e56f) | 0.09 | 16 | 62.3 |
+| 15 | push 2e2ee13a2258, scored ok | 2e2ee13 · Track C (run-4ff8954aecb6) | 0.13 | 16 | 58.1 |
 
 ## Experiment log
 
@@ -50,3 +53,7 @@ Each experiment's numbers are added here once the live board has measured it and
 - c-9.1 fix, commit 7fa72a4 (correctness fix): the shared name arena allocated a block again after a reservation skipped
   several blocks (a very long name), losing the names already in it; the block is now allocated by its own directory
   pointer. Found by the correctness kit's long-name cases.
+- c-10 scan, commit 5c161a3: text fields' commas and quotes found with a 32-byte AVX2 compare instead of a byte loop,
+  and the CR-or-LF terminator skipped without a branch. Verdict KEEP, box K 17.97. SWAR parsing of the digit runs was
+  tried and dropped: exact, but no gain in two local A/Bs (plus seven and minus three percent of pass 2) for about
+  fourteen lines, as the numbers here are at most eight digits.
