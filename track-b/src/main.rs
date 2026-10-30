@@ -121,6 +121,82 @@ impl<'q> Dict<'q> {
     }
 }
 
+/// The table the pass probes for every token, built once the distinct term count is known. A slot holds the term's
+/// hash and id + 1 in one u64, so a miss reads one cache line; a hash match is then confirmed against the term's
+/// bytes, stored inline and zero-padded to 32 B (one more line). b-4 probed slots sized from every term occurrence
+/// (4 MB), a separate hash array, and a slice into queries.txt per term.
+struct TermTable {
+    slots: Vec<u64>, // hash << 32 | (term id + 1), 0 = empty
+    shift: u32,
+    bytes: Vec<TermBytes>, // by term id
+    roles: Vec<TermRoles>, // by term id, read once per doc and term (`TermTable::set_roles`)
+}
+
+/// A term's BOOL roles, read when the term first appears in a doc: a term that triggers no query skips the
+/// per-doc trigger loop, and the doc's trigger ranges are collected without a lookup in BoolPlan::trigger_start.
+/// Measured: the per-doc BOOL layer of the pass fell from 0.57-1.33 s to 0.47-0.59 s (1 worker, seed 1).
+/// (A 64 B entry holding these, the bytes and the automaton's root goto was slower than b-6: bigger entries cost
+/// more than the lines they saved; a packed root-goto array changed nothing measurable.)
+#[derive(Clone, Copy)]
+struct TermRoles {
+    window_term: u32,     // index among the window path's terms, NIL if none
+    triggers: (u32, u32), // range in BoolPlan::triggers of the queries this term triggers
+}
+
+#[repr(align(32))] // one entry never straddles two cache lines
+#[derive(Clone, Copy)]
+struct TermBytes([u8; MAX_TERM]);
+
+impl TermTable {
+    fn new(dict: &Dict) -> Self {
+        assert!(dict.terms.len() < u32::MAX as usize);
+        // Load factor at most 2/3 of the distinct terms: 1 MB of slots on seed 1. Measured here against 1/2 (2 MB)
+        // and 1/4 (4 MB): the smallest table was fastest, since misses now cost more than probe steps.
+        let size = (dict.terms.len() + dict.terms.len() / 2).next_power_of_two().max(2);
+        let mut table = TermTable { slots: vec![0; size], shift: 32 - size.trailing_zeros(), bytes: vec![TermBytes([0; MAX_TERM]); dict.terms.len()], roles: Vec::new() };
+        for (t, (&term, &h)) in dict.terms.iter().zip(&dict.hashes).enumerate() {
+            let mut i = table.slot(h);
+            while table.slots[i] != 0 {
+                i = (i + 1) & (size - 1);
+            }
+            table.slots[i] = (h as u64) << 32 | (t as u64 + 1);
+            table.bytes[t].0[..term.len()].copy_from_slice(term);
+        }
+        table
+    }
+
+    fn set_roles(&mut self, plan: &BoolPlan) {
+        self.roles = (0..self.bytes.len())
+            .map(|t| TermRoles { window_term: plan.window_term[t], triggers: (plan.trigger_start[t], plan.trigger_start[t + 1]) })
+            .collect();
+    }
+
+    #[inline]
+    fn slot(&self, h: u32) -> usize {
+        (h.wrapping_mul(0x9e37_79b1) >> self.shift) as usize
+    }
+
+    /// The hash only filters; the bytes decide. Terms hold no zero byte, so `e[n] == 0` means the term is n long.
+    #[inline]
+    fn find(&self, token: &[u8], h: u32) -> Option<u32> {
+        let mut i = self.slot(h);
+        loop {
+            let s = self.slots[i];
+            if s == 0 {
+                return None;
+            }
+            if (s >> 32) as u32 == h {
+                let t = (s as u32 - 1) as usize;
+                let (e, n) = (&self.bytes[t].0, token.len());
+                if e[..n] == *token && (n == MAX_TERM || e[n] == 0) {
+                    return Some(t as u32);
+                }
+            }
+            i = (i + 1) & (self.slots.len() - 1);
+        }
+    }
+}
+
 /// Aho-Corasick automaton over query-term ids. Each distinct phrase is one pattern; a state's dictionary-suffix
 /// link points to the longest proper suffix state that ends a pattern, so a pattern nested inside another
 /// (`w w` inside `w w w`, or one ending inside a longer match) is still reported.
@@ -255,7 +331,7 @@ fn parse_id(data: &[u8], mut i: usize) -> (u32, usize) {
 /// Tokenizes the doc text from `i` to its LF (spec 2.2), calling `on_token` with the term id of each token that is
 /// a query term and None for any other token; returns the index just past the LF.
 #[inline(always)]
-fn tokenize_doc(data: &[u8], mut i: usize, dict: &Dict, mut on_token: impl FnMut(Option<u32>)) -> usize {
+fn tokenize_doc(data: &[u8], mut i: usize, dict: &TermTable, mut on_token: impl FnMut(Option<u32>)) -> usize {
     let end = data.len();
     let mut token = [0u8; MAX_TERM];
     while i < end && data[i] != b'\n' {
@@ -287,8 +363,8 @@ fn tokenize_doc(data: &[u8], mut i: usize, dict: &Dict, mut on_token: impl FnMut
 const SAMPLE_WINDOWS: usize = 64;
 const SAMPLE_SHARE: usize = 128;
 
-fn estimate_df(docs: &[u8], dict: &Dict) -> (Vec<u32>, u32) {
-    let n_terms = dict.terms.len();
+fn estimate_df(docs: &[u8], dict: &TermTable) -> (Vec<u32>, u32) {
+    let n_terms = dict.bytes.len();
     let mut df = vec![0u32; n_terms];
     let mut seen = vec![0u32; n_terms];
     let mut stamp = 0u32;
@@ -436,11 +512,6 @@ impl BoolPlan {
             })
             .collect();
         BoolPlan { query_of_slot, trigger_start, triggers, window_term, n_window_terms, window_code, window_slot }
-    }
-
-    #[inline]
-    fn triggered_by(&self, t: u32) -> &[Trigger] {
-        &self.triggers[self.trigger_start[t as usize] as usize..self.trigger_start[t as usize + 1] as usize]
     }
 }
 
@@ -593,7 +664,7 @@ fn split_lines(data: &[u8], n: usize) -> Vec<&[u8]> {
     cuts.windows(2).map(|w| &data[w[0]..w[1]]).collect()
 }
 
-fn scan(data: &[u8], dict: &Dict, ac: &Automaton, n_patterns: usize, plan: &BoolPlan, first_ids: &FirstIds) -> Shard {
+fn scan(data: &[u8], dict: &TermTable, ac: &Automaton, n_patterns: usize, plan: &BoolPlan, first_ids: &FirstIds) -> Shard {
     let mut shard = Shard {
         bool_acc: vec![BoolAcc::default(); plan.query_of_slot.len()],
         matches: Vec::new(),
@@ -603,8 +674,9 @@ fn scan(data: &[u8], dict: &Dict, ac: &Automaton, n_patterns: usize, plan: &Bool
     let mut window_words = vec![0u64; plan.n_window_terms];
     let mut window = NIL;
     // The doc's query terms as a bitset (a few KB, so evaluations test it in L1), cleared after each doc from `hits`.
-    let mut present = vec![0u64; dict.terms.len().div_ceil(64)];
+    let mut present = vec![0u64; dict.bytes.len().div_ceil(64)];
     let mut hits: Vec<u32> = Vec::new(); // this doc's distinct query terms
+    let mut triggered: Vec<(u32, u32)> = Vec::new(); // their non-empty trigger ranges
     let mut pattern_last = vec![0u32; n_patterns]; // last doc id + 1 a pattern was reported for
     let mut i = 0;
     while i < data.len() {
@@ -626,9 +698,12 @@ fn scan(data: &[u8], dict: &Dict, ac: &Automaton, n_patterns: usize, plan: &Bool
             if present[w] & bit == 0 {
                 present[w] |= bit;
                 hits.push(t);
-                let wt = plan.window_term[t as usize];
-                if wt != NIL {
-                    window_words[wt as usize] |= 1 << (id % 64);
+                let roles = &dict.roles[t as usize];
+                if roles.triggers.1 > roles.triggers.0 {
+                    triggered.push(roles.triggers);
+                }
+                if roles.window_term != NIL {
+                    window_words[roles.window_term as usize] |= 1 << (id % 64);
                 }
             }
             state = ac.step(state, t);
@@ -643,8 +718,8 @@ fn scan(data: &[u8], dict: &Dict, ac: &Automaton, n_patterns: usize, plan: &Bool
             }
         });
         // The doc's term set is complete: evaluate each query one of its terms triggers, MULTI ones once.
-        for &t in &hits {
-            for trig in plan.triggered_by(t) {
+        for &(from, to) in &triggered {
+            for trig in &plan.triggers[from as usize..to as usize] {
                 let q = (trig.query & !FLAGS) as usize;
                 if trig.query & MULTI != 0 {
                     if shard.bool_acc[q].done == stamp {
@@ -665,6 +740,7 @@ fn scan(data: &[u8], dict: &Dict, ac: &Automaton, n_patterns: usize, plan: &Bool
             present[t as usize / 64] &= !(1 << (t % 64));
         }
         hits.clear();
+        triggered.clear();
     }
     if window != NIL {
         flush_window(plan, &mut window_words, window * 64, &mut shard.bool_acc, first_ids);
@@ -761,11 +837,15 @@ fn main() {
         }
     }
     let ac = Automaton::new(&patterns, dict.terms.len());
+    let n_terms = dict.terms.len();
+    let mut terms = TermTable::new(&dict);
+    drop(dict);
     lap("queries");
 
     let docs = map_file(&format!("{data_dir}/docs.txt"));
-    let (df, sampled_docs) = estimate_df(docs, &dict);
-    let plan = BoolPlan::new(&bools, dict.terms.len(), &df, sampled_docs);
+    let (df, sampled_docs) = estimate_df(docs, &terms);
+    let plan = BoolPlan::new(&bools, n_terms, &df, sampled_docs);
+    terms.set_roles(&plan);
     lap("sample");
 
     // The pass: one doc range per worker, cut at line starts.
@@ -773,7 +853,7 @@ fn main() {
     let shards: Vec<Shard> = std::thread::scope(|s| {
         let handles: Vec<_> = split_lines(docs, workers)
             .into_iter()
-            .map(|part| s.spawn(|| scan(part, &dict, &ac, patterns.len(), &plan, &first_ids)))
+            .map(|part| s.spawn(|| scan(part, &terms, &ac, patterns.len(), &plan, &first_ids)))
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
