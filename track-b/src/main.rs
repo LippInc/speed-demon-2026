@@ -240,54 +240,77 @@ impl Automaton {
     }
 }
 
-/// Posting storage of one worker: fixed-size slabs cut into blocks whose size grows by 4x per class, so a list
-/// is a chain of blocks and nothing is ever copied to grow it. Blocks hold LEB128 varints of doc-id gaps.
-const SLAB_BITS: u32 = 20;
-const SLAB: usize = 1 << SLAB_BITS;
-const BLOCK_HEADER: usize = 8; // next block (u32), bytes used (u16), size class (u8), pad
-const CLASS_SIZE: [usize; 5] = [16, 64, 256, 1024, 4096];
+/// Posting storage of one worker. A list is a chain of blocks that doubles from 8 B up to 256 B, so slack is
+/// bounded by the last block and nothing is copied to grow it (b-1's 16 B..4 KB in 4x steps with an 8 B header
+/// allocated 54-79 MB for 29.4 MB of varints). Each size class bumps through its own slabs, so a block is aligned
+/// to its size and its start and end follow from any position inside it plus the slab's class: the only header is
+/// the 4 B link to the previous block. Blocks hold LEB128 varints of doc-id gaps; a gap is at least 1, so no
+/// varint byte is 0, and the zero bytes left at the end of a block (fresh slabs are zeroed) mark where it stops.
+const SLAB_BITS: u32 = 14;
+const SLAB: usize = 1 << SLAB_BITS; // small, so the half-used slab each of the six classes keeps open stays cheap
+const LINK: usize = 4; // previous block's start, NIL for the first block
+const CLASS_SIZE: [usize; 6] = [8, 16, 32, 64, 128, 256];
 
 struct Arena {
     slabs: Vec<Box<[u8]>>,
-    used: usize,
+    slab_class: Vec<u8>,
+    open: [(u32, usize); CLASS_SIZE.len()], // per class: slab being filled (NIL = none) and bytes used in it
 }
 
 impl Arena {
-    fn block(&self, pos: u32) -> &[u8] {
-        &self.slabs[(pos >> SLAB_BITS) as usize][(pos as usize) & (SLAB - 1)..]
+    fn new() -> Self {
+        Arena { slabs: Vec::new(), slab_class: Vec::new(), open: [(NIL, 0); CLASS_SIZE.len()] }
     }
 
-    fn block_mut(&mut self, pos: u32) -> &mut [u8] {
-        &mut self.slabs[(pos >> SLAB_BITS) as usize][(pos as usize) & (SLAB - 1)..]
+    #[inline]
+    fn class_of(&self, pos: u32) -> usize {
+        self.slab_class[(pos >> SLAB_BITS) as usize] as usize
     }
 
-    fn new_block(&mut self, class: usize) -> u32 {
+    #[inline]
+    fn bytes(&self, pos: u32, len: usize) -> &[u8] {
+        let off = (pos as usize) & (SLAB - 1);
+        &self.slabs[(pos >> SLAB_BITS) as usize][off..off + len]
+    }
+
+    #[inline]
+    fn bytes_mut(&mut self, pos: u32, len: usize) -> &mut [u8] {
+        let off = (pos as usize) & (SLAB - 1);
+        &mut self.slabs[(pos >> SLAB_BITS) as usize][off..off + len]
+    }
+
+    /// Start of the block that holds `pos`: blocks are aligned to their size.
+    #[inline]
+    fn block_start(&self, pos: u32) -> (u32, usize) {
+        let size = CLASS_SIZE[self.class_of(pos)];
+        (pos & !(size as u32 - 1), size)
+    }
+
+    /// Opens a block of `class` linked back to `prev`; returns the write cursor just after the link.
+    fn new_block(&mut self, class: usize, prev: u32) -> u32 {
         let size = CLASS_SIZE[class];
-        if self.slabs.is_empty() || self.used + size > SLAB {
+        let (mut slab, mut used) = self.open[class];
+        if slab == NIL || used + size > SLAB {
+            slab = self.slabs.len() as u32;
+            used = 0;
             self.slabs.push(vec![0u8; SLAB].into_boxed_slice());
-            self.used = 0;
+            self.slab_class.push(class as u8);
         }
-        let pos = ((self.slabs.len() - 1) << SLAB_BITS | self.used) as u32;
-        self.used += size;
-        let b = self.block_mut(pos);
-        b[0..4].copy_from_slice(&NIL.to_le_bytes());
-        b[4..6].copy_from_slice(&0u16.to_le_bytes());
-        b[6] = class as u8;
-        pos
+        self.open[class] = (slab, used + size);
+        let pos = slab << SLAB_BITS | used as u32;
+        self.bytes_mut(pos, LINK).copy_from_slice(&prev.to_le_bytes());
+        pos + LINK as u32
     }
-}
-
-#[derive(Clone, Copy)]
-struct List {
-    head: u32,
-    tail: u32,
-    last: u32, // last doc id + 1, 0 = none yet
 }
 
 /// One worker's pass over its doc range: postings of every query term and the phrase matches.
+/// The per-term state is two dense u32 (8 B per term and worker, b-1 had 12 B): a sparse table would save
+/// little, since 728,779 of the 12 x 75,747 (term, worker) pairs are non-empty on seed 1 full (80 %).
 struct Shard {
     arena: Arena,
-    lists: Vec<List>,
+    cursor: Vec<u32>, // per term: write position in its tail block, 0 = no list (a cursor is never a block start)
+    last: Vec<u32>,   // per term: last doc id + 1, initially `base`, so the first gap is small too
+    base: u32,        // first doc id of this range
     matches: Vec<(u32, u32)>, // (pattern, doc), docs ascending
     docs_end: u32,            // one past the largest doc id seen
 }
@@ -295,12 +318,12 @@ struct Shard {
 impl Shard {
     #[inline]
     fn push(&mut self, t: u32, doc: u32) {
-        let l = &mut self.lists[t as usize];
-        if l.last == doc + 1 {
+        let t = t as usize;
+        if self.last[t] == doc + 1 {
             return; // documents are counted, not occurrences
         }
-        let mut gap = doc + 1 - l.last;
-        l.last = doc + 1;
+        let mut gap = doc + 1 - self.last[t];
+        self.last[t] = doc + 1;
         let mut buf = [0u8; 5];
         let mut n = 0;
         while gap >= 0x80 {
@@ -311,42 +334,52 @@ impl Shard {
         buf[n] = gap as u8;
         n += 1;
 
-        if l.tail == NIL {
-            let b = self.arena.new_block(0);
-            l.head = b;
-            l.tail = b;
+        let mut c = self.cursor[t];
+        if c == 0 {
+            c = self.arena.new_block(0, NIL);
         } else {
-            let tail = self.arena.block(l.tail);
-            let used = u16::from_le_bytes([tail[4], tail[5]]) as usize;
-            let class = tail[6] as usize;
-            if BLOCK_HEADER + used + n > CLASS_SIZE[class] {
+            // c - 1 is the last byte written, inside the tail block even when that block is full.
+            let (start, size) = self.arena.block_start(c - 1);
+            if c as usize + n > start as usize + size {
                 // A varint never straddles two blocks, so a block decodes on its own.
-                let b = self.arena.new_block((class + 1).min(CLASS_SIZE.len() - 1));
-                self.arena.block_mut(l.tail)[0..4].copy_from_slice(&b.to_le_bytes());
-                l.tail = b;
+                let class = (self.arena.class_of(start) + 1).min(CLASS_SIZE.len() - 1);
+                c = self.arena.new_block(class, start);
             }
         }
-        let tail = self.arena.block_mut(l.tail);
-        let used = u16::from_le_bytes([tail[4], tail[5]]) as usize;
-        tail[BLOCK_HEADER + used..BLOCK_HEADER + used + n].copy_from_slice(&buf[..n]);
-        tail[4..6].copy_from_slice(&((used + n) as u16).to_le_bytes());
+        self.arena.bytes_mut(c, n).copy_from_slice(&buf[..n]);
+        self.cursor[t] = c + n as u32;
     }
 
     fn for_each_doc(&self, t: u32, mut f: impl FnMut(u32)) {
-        let mut pos = self.lists[t as usize].head;
-        let mut last = 0u32;
-        while pos != NIL {
-            let b = self.arena.block(pos);
-            let used = u16::from_le_bytes([b[4], b[5]]) as usize;
-            let mut i = BLOCK_HEADER;
-            while i < BLOCK_HEADER + used {
+        let c = self.cursor[t as usize];
+        if c == 0 {
+            return;
+        }
+        // Links run tail to head, so collect the chain first and decode it head first.
+        let mut chain = Vec::new();
+        let mut start = self.arena.block_start(c - 1).0;
+        loop {
+            chain.push(start);
+            let link = self.arena.bytes(start, LINK);
+            let prev = u32::from_le_bytes([link[0], link[1], link[2], link[3]]);
+            if prev == NIL {
+                break;
+            }
+            start = prev;
+        }
+        let mut last = self.base;
+        for &start in chain.iter().rev() {
+            let size = CLASS_SIZE[self.arena.class_of(start)];
+            let b = &self.arena.bytes(start, size)[LINK..];
+            let mut i = 0;
+            while i < b.len() && b[i] != 0 {
                 let mut v = 0u32;
                 let mut shift = 0;
                 loop {
-                    let c = b[i];
+                    let byte = b[i];
                     i += 1;
-                    v |= ((c & 0x7f) as u32) << shift;
-                    if c < 0x80 {
+                    v |= ((byte & 0x7f) as u32) << shift;
+                    if byte < 0x80 {
                         break;
                     }
                     shift += 7;
@@ -354,7 +387,6 @@ impl Shard {
                 last += v;
                 f(last - 1);
             }
-            pos = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
         }
     }
 }
@@ -376,9 +408,13 @@ fn split_lines(data: &[u8], n: usize) -> Vec<&[u8]> {
 }
 
 fn scan(data: &[u8], dict: &Dict, ac: &Automaton, n_patterns: usize) -> Shard {
+    // spec 2.1: every line starts with its decimal doc id, so the range's first id is read off its first line.
+    let base = data.iter().take_while(|&&b| b != b'\t').fold(0u32, |id, &b| id * 10 + (b - b'0') as u32);
     let mut shard = Shard {
-        arena: Arena { slabs: Vec::new(), used: 0 },
-        lists: vec![List { head: NIL, tail: NIL, last: 0 }; dict.terms.len()],
+        arena: Arena::new(),
+        cursor: vec![0; dict.terms.len()],
+        last: vec![base; dict.terms.len()],
+        base,
         matches: Vec::new(),
         docs_end: 0,
     };
