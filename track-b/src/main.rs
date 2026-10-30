@@ -1,9 +1,8 @@
 //! Track B: answer the BOOL and PHRASE queries of /data/queries.txt over /data/docs.txt (spec: specs/b-index.md).
 //!
-//! Queries are read first, so only their terms are indexed. One parallel pass over the memory-mapped corpus
-//! tokenizes every document, appends the doc to the postings of each query term it contains, and runs an
-//! Aho-Corasick automaton over the query-term ids that reports every PHRASE pattern ending at each token.
-//! BOOL queries are then folded left to right over bitmaps; PHRASE answers are the automaton's per-doc matches.
+//! Queries are read first, so only their terms are looked up. One parallel pass over the memory-mapped corpus
+//! tokenizes every document and decides every BOOL query (per document, or 64 documents at a time) and every
+//! PHRASE pattern (by anchor checks) for it; nothing is indexed.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -135,8 +134,8 @@ struct TermTable {
 /// A term's BOOL roles, read when the term first appears in a doc: a term that triggers no query skips the
 /// per-doc trigger loop, and the doc's trigger ranges are collected without a lookup in BoolPlan::trigger_start.
 /// Measured: the per-doc BOOL layer of the pass fell from 0.57-1.33 s to 0.47-0.59 s (1 worker, seed 1).
-/// (A 64 B entry holding these, the bytes and the automaton's root goto was slower than b-6: bigger entries cost
-/// more than the lines they saved; a packed root-goto array changed nothing measurable.)
+/// (A 64 B entry holding these with the bytes was slower than b-6: bigger entries cost more than the lines they
+/// saved.)
 #[derive(Clone, Copy)]
 struct TermRoles {
     window_term: u32,     // index among the window path's terms, NIL if none
@@ -197,123 +196,64 @@ impl TermTable {
     }
 }
 
-/// Aho-Corasick automaton over query-term ids. Each distinct phrase is one pattern; a state's dictionary-suffix
-/// link points to the longest proper suffix state that ends a pattern, so a pattern nested inside another
-/// (`w w` inside `w w w`, or one ending inside a longer match) is still reported.
-struct Automaton {
-    root_next: Vec<u32>,  // dense goto from the root, by term id (0 = stay at root)
-    in_phrase: Vec<bool>, // a term in no phrase always sends the automaton back to the root
-    edge_keys: Vec<u64>,  // open addressing over (state << 32 | term) for the non-root edges
-    edge_vals: Vec<u32>,
-    edge_shift: u32,
-    fail: Vec<u32>,
-    out: Vec<u32>,       // pattern ending at this state, or NIL
-    dict_link: Vec<u32>, // nearest proper suffix state with an output, or NIL
+/// PHRASE matching by anchor checks. Each distinct phrase is one pattern and gets one anchor: its term with the
+/// lowest estimated df (the df sample only picks the anchor; a term in no doc has df 0, so a phrase with an absent
+/// term is never even checked). Each doc records its token sequence as term ids (NIL for a token that is no query
+/// term, which no phrase can match across); every occurrence of an anchor term at position i is a candidate start
+/// i - j for each pattern anchored there at offset j, confirmed by comparing the pattern's ids with the doc's.
+/// It replaces an Aho-Corasick automaton whose edge probes, fail walks and output checks were the pass's largest
+/// part (about 0.9-1.1 s of 4.0-4.3 s at 1 worker on seed 1).
+struct PhrasePlan {
+    pattern_start: Vec<u32>, // pattern p is terms[pattern_start[p]..pattern_start[p + 1]]
+    terms: Vec<u32>,
+    anchor_bits: Vec<u64>,    // by term id: the term anchors at least one pattern (tested for every token)
+    anchor_start: Vec<u32>,   // by term id, into anchors (CSR)
+    anchors: Vec<(u32, u32)>, // (pattern, offset of the anchor in it)
 }
 
-impl Automaton {
-    fn new(patterns: &[Vec<u32>], n_terms: usize) -> Self {
-        let mut root_next = vec![0u32; n_terms];
-        let mut in_phrase = vec![false; n_terms];
-        let mut children: Vec<Vec<(u32, u32)>> = vec![Vec::new()];
-        let mut out = vec![NIL];
-        for (p, pattern) in patterns.iter().enumerate() {
-            let mut s = 0u32;
-            for &a in pattern {
-                in_phrase[a as usize] = true;
-                let existing = if s == 0 {
-                    Some(root_next[a as usize]).filter(|&n| n != 0)
-                } else {
-                    children[s as usize].iter().find(|&&(b, _)| b == a).map(|&(_, n)| n)
-                };
-                s = existing.unwrap_or_else(|| {
-                    let n = children.len() as u32;
-                    children.push(Vec::new());
-                    out.push(NIL);
-                    children[s as usize].push((a, n));
-                    if s == 0 {
-                        root_next[a as usize] = n;
+impl PhrasePlan {
+    fn new(patterns: &[Vec<u32>], n_terms: usize, df: &[u32]) -> Self {
+        let anchor_of = |p: &Vec<u32>| (0..p.len()).min_by_key(|&j| df[p[j] as usize]).unwrap();
+        let mut anchor_start = vec![0u32; n_terms + 1];
+        for p in patterns {
+            anchor_start[p[anchor_of(p)] as usize + 1] += 1;
+        }
+        for t in 0..n_terms {
+            anchor_start[t + 1] += anchor_start[t];
+        }
+        let mut fill = anchor_start.clone();
+        let mut anchors = vec![(0, 0); patterns.len()];
+        let mut anchor_bits = vec![0u64; n_terms.div_ceil(64)];
+        for (pi, p) in patterns.iter().enumerate() {
+            let j = anchor_of(p);
+            let t = p[j] as usize;
+            anchors[fill[t] as usize] = (pi as u32, j as u32);
+            fill[t] += 1;
+            anchor_bits[t / 64] |= 1 << (t % 64);
+        }
+        let mut pattern_start = vec![0u32];
+        pattern_start.extend(patterns.iter().scan(0, |n, p| {
+            *n += p.len() as u32;
+            Some(*n)
+        }));
+        PhrasePlan { pattern_start, terms: patterns.concat(), anchor_bits, anchor_start, anchors }
+    }
+
+    /// Calls `found(p)` for each pattern that starts at a candidate position of `seq`; `anchored` lists the
+    /// positions of anchor terms.
+    #[inline]
+    fn check(&self, seq: &[u32], anchored: &[u32], mut found: impl FnMut(u32)) {
+        for &i in anchored {
+            let t = seq[i as usize] as usize;
+            for &(p, j) in &self.anchors[self.anchor_start[t] as usize..self.anchor_start[t + 1] as usize] {
+                let terms = &self.terms[self.pattern_start[p as usize] as usize..self.pattern_start[p as usize + 1] as usize];
+                if let Some(start) = (i as usize).checked_sub(j as usize) {
+                    if seq.get(start..start + terms.len()) == Some(terms) {
+                        found(p);
                     }
-                    n
-                });
-            }
-            out[s as usize] = p as u32;
-        }
-
-        let n_edges: usize = children.iter().skip(1).map(Vec::len).sum();
-        let size = (2 * n_edges).next_power_of_two().max(2);
-        let mut ac = Automaton {
-            root_next,
-            in_phrase,
-            edge_keys: vec![u64::MAX; size],
-            edge_vals: vec![0; size],
-            edge_shift: 64 - size.trailing_zeros(),
-            fail: vec![0; children.len()],
-            out,
-            dict_link: vec![NIL; children.len()],
-        };
-        for (s, edges) in children.iter().enumerate().skip(1) {
-            for &(a, n) in edges {
-                let key = (s as u64) << 32 | a as u64;
-                let mut i = ac.edge_slot(key);
-                while ac.edge_keys[i] != u64::MAX {
-                    i = (i + 1) & (size - 1);
                 }
-                ac.edge_keys[i] = key;
-                ac.edge_vals[i] = n;
             }
         }
-
-        // Breadth-first, so every shallower state's fail and dictionary links are final before they are used.
-        let mut queue: Vec<u32> = children[0].iter().map(|&(_, n)| n).collect();
-        let mut head = 0;
-        while head < queue.len() {
-            let u = queue[head];
-            head += 1;
-            for &(a, v) in &children[u as usize] {
-                let f = if u == 0 { 0 } else { ac.step(ac.fail[u as usize], a) };
-                ac.fail[v as usize] = f;
-                ac.dict_link[v as usize] = if ac.out[f as usize] != NIL { f } else { ac.dict_link[f as usize] };
-                queue.push(v);
-            }
-        }
-        ac
-    }
-
-    #[inline]
-    fn edge_slot(&self, key: u64) -> usize {
-        (key.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> self.edge_shift) as usize
-    }
-
-    #[inline]
-    fn edge(&self, s: u32, a: u32) -> Option<u32> {
-        let key = (s as u64) << 32 | a as u64;
-        let mask = self.edge_keys.len() - 1;
-        let mut i = self.edge_slot(key);
-        loop {
-            let k = self.edge_keys[i];
-            if k == key {
-                return Some(self.edge_vals[i]);
-            }
-            if k == u64::MAX {
-                return None;
-            }
-            i = (i + 1) & mask;
-        }
-    }
-
-    #[inline]
-    fn step(&self, mut s: u32, a: u32) -> u32 {
-        if !self.in_phrase[a as usize] {
-            return 0;
-        }
-        while s != 0 {
-            if let Some(n) = self.edge(s, a) {
-                return n;
-            }
-            s = self.fail[s as usize];
-        }
-        self.root_next[a as usize]
     }
 }
 
@@ -664,7 +604,7 @@ fn split_lines(data: &[u8], n: usize) -> Vec<&[u8]> {
     cuts.windows(2).map(|w| &data[w[0]..w[1]]).collect()
 }
 
-fn scan(data: &[u8], dict: &TermTable, ac: &Automaton, n_patterns: usize, plan: &BoolPlan, first_ids: &FirstIds) -> Shard {
+fn scan(data: &[u8], dict: &TermTable, phrases: &PhrasePlan, plan: &BoolPlan, first_ids: &FirstIds) -> Shard {
     let mut shard = Shard {
         bool_acc: vec![BoolAcc::default(); plan.query_of_slot.len()],
         matches: Vec::new(),
@@ -677,7 +617,9 @@ fn scan(data: &[u8], dict: &TermTable, ac: &Automaton, n_patterns: usize, plan: 
     let mut present = vec![0u64; dict.bytes.len().div_ceil(64)];
     let mut hits: Vec<u32> = Vec::new(); // this doc's distinct query terms
     let mut triggered: Vec<(u32, u32)> = Vec::new(); // their non-empty trigger ranges
-    let mut pattern_last = vec![0u32; n_patterns]; // last doc id + 1 a pattern was reported for
+    let mut pattern_last = vec![0u32; phrases.anchors.len()]; // last doc id + 1 a pattern was reported for
+    let mut seq: Vec<u32> = Vec::new(); // the doc's tokens as term ids, NIL for any other token
+    let mut anchored: Vec<u32> = Vec::new(); // positions in seq of anchor terms
     let mut i = 0;
     while i < data.len() {
         let (id, text) = parse_id(data, i);
@@ -688,12 +630,15 @@ fn scan(data: &[u8], dict: &TermTable, ac: &Automaton, n_patterns: usize, plan: 
             }
             window = id / 64;
         }
-        let mut state = 0u32; // a phrase never spans two documents
         i = tokenize_doc(data, text, dict, |hit| {
             let Some(t) = hit else {
-                state = 0;
+                seq.push(NIL);
                 return;
             };
+            if phrases.anchor_bits[t as usize / 64] >> (t % 64) & 1 != 0 {
+                anchored.push(seq.len() as u32);
+            }
+            seq.push(t);
             let (w, bit) = (t as usize / 64, 1u64 << (t % 64));
             if present[w] & bit == 0 {
                 present[w] |= bit;
@@ -706,17 +651,16 @@ fn scan(data: &[u8], dict: &TermTable, ac: &Automaton, n_patterns: usize, plan: 
                     window_words[roles.window_term as usize] |= 1 << (id % 64);
                 }
             }
-            state = ac.step(state, t);
-            let mut o = if ac.out[state as usize] != NIL { state } else { ac.dict_link[state as usize] };
-            while o != NIL {
-                let p = ac.out[o as usize];
-                if pattern_last[p as usize] != stamp {
-                    pattern_last[p as usize] = stamp;
-                    shard.matches.push((p, id));
-                }
-                o = ac.dict_link[o as usize];
+        });
+        // A phrase never spans two documents: seq holds this doc only.
+        phrases.check(&seq, &anchored, |p| {
+            if pattern_last[p as usize] != stamp {
+                pattern_last[p as usize] = stamp;
+                shard.matches.push((p, id));
             }
         });
+        seq.clear();
+        anchored.clear();
         // The doc's term set is complete: evaluate each query one of its terms triggers, MULTI ones once.
         for &(from, to) in &triggered {
             for trig in &plan.triggers[from as usize..to as usize] {
@@ -836,7 +780,6 @@ fn main() {
             queries.push(Query::Bool(b));
         }
     }
-    let ac = Automaton::new(&patterns, dict.terms.len());
     let n_terms = dict.terms.len();
     let mut terms = TermTable::new(&dict);
     drop(dict);
@@ -846,6 +789,7 @@ fn main() {
     let (df, sampled_docs) = estimate_df(docs, &terms);
     let plan = BoolPlan::new(&bools, n_terms, &df, sampled_docs);
     terms.set_roles(&plan);
+    let phrases = PhrasePlan::new(&patterns, n_terms, &df);
     lap("sample");
 
     // The pass: one doc range per worker, cut at line starts.
@@ -853,7 +797,7 @@ fn main() {
     let shards: Vec<Shard> = std::thread::scope(|s| {
         let handles: Vec<_> = split_lines(docs, workers)
             .into_iter()
-            .map(|part| s.spawn(|| scan(part, &terms, &ac, patterns.len(), &plan, &first_ids)))
+            .map(|part| s.spawn(|| scan(part, &terms, &phrases, &plan, &first_ids)))
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
