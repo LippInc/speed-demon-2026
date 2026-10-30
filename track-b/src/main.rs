@@ -241,7 +241,9 @@ impl PhrasePlan {
     }
 }
 
-/// The start of the first line that starts at or after `from` (spec 2.1: every line ends with LF).
+/// The start of the line after the first LF at or after `from`: 0 for `from` 0, the end if no LF follows (spec 2.1:
+/// every line ends with LF).
+/// A `from` that is itself a line start returns the next line; both ends of a cut use this, so the ranges still tile.
 fn line_start(data: &[u8], from: usize) -> usize {
     match data[from..].iter().position(|&b| b == b'\n') {
         _ if from == 0 => 0,
@@ -413,15 +415,16 @@ const BIT_SLICES: [u64; 6] = [
 struct Window {
     base: u32,
     words: Vec<u64>, // by term id
-    touched: Vec<u32>,
+    // (term, its trigger range): the range is read at the hit that first sets the term's word, next to the probe
+    // that just found the term, instead of as a miss on trigger_start in the flush.
+    touched: Vec<(u32, u32, u32)>,
 }
 
 impl Window {
     /// Folds every query that a term of the window triggers, once, and clears the window's words.
     fn flush(&mut self, plan: &BoolPlan, acc: &mut [BoolAcc]) {
         let (base, stamp) = (self.base, self.base / 64 + 1);
-        for &t in &self.touched {
-            let (from, to) = (plan.trigger_start[t as usize], plan.trigger_start[t as usize + 1]);
+        for &(_, from, to) in &self.touched {
             for trig in &plan.triggers[from as usize..to as usize] {
                 let q = (trig.query & !MULTI) as usize;
                 if trig.query & MULTI != 0 {
@@ -446,7 +449,7 @@ impl Window {
                 }
             }
         }
-        for &t in &self.touched {
+        for &(t, _, _) in &self.touched {
             self.words[t as usize] = 0;
         }
         self.touched.clear();
@@ -524,7 +527,8 @@ fn scan(data: &[u8], dict: &TermTable, phrases: &PhrasePlan, plan: &BoolPlan) ->
                 return; // a phrase-only term
             };
             if *word == 0 {
-                window.touched.push(t);
+                let (from, to) = (plan.trigger_start[t as usize], plan.trigger_start[t as usize + 1]);
+                window.touched.push((t, from, to));
             }
             *word |= 1 << (id % 64);
         });
