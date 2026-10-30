@@ -9,7 +9,7 @@
 use std::ffi::c_void;
 use std::fs::File;
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 unsafe extern "C" {
@@ -72,19 +72,16 @@ fn cut_at_lf(b: &[u8], body: usize, parts: usize) -> Vec<usize> {
     cuts
 }
 
-/// Runs `f` on each byte range on its own thread.
-fn each_range(cuts: &[usize], f: impl Fn(usize, usize) + Sync) {
-    std::thread::scope(|s| {
-        for r in cuts.windows(2) {
-            let f = &f;
-            s.spawn(move || f(r[0], r[1]));
-        }
-    });
-}
+/// A shared output array that threads fill at disjoint indices (each thread owns whole partitions).
+struct Slots<T>(*mut T);
+unsafe impl<T> Sync for Slots<T> {}
 
-/// A shared output array that threads fill at disjoint indices (each index comes from one fetch_add).
-struct Slots(*mut u64);
-unsafe impl Sync for Slots {}
+impl<T> Slots<T> {
+    /// SAFETY: the caller is the only writer of index i.
+    unsafe fn put(&self, i: usize, value: T) {
+        unsafe { *self.0.add(i) = value }
+    }
+}
 
 /// Compressed adjacency: the edges of node u are edges[start(u)..end[u]], each packed as
 /// (weight << 32) | head.
@@ -108,64 +105,125 @@ impl Csr {
     }
 }
 
-/// Turns per-node degree counts into each node's first edge slot, in place; returns the edge total.
-fn degrees_to_cursors(deg: &[AtomicU32]) -> usize {
-    let mut sum = 0usize;
-    for d in deg {
-        let k = d.load(Ordering::Relaxed) as usize;
-        d.store(sum as u32, Ordering::Relaxed);
-        sum += k;
-    }
-    assert!(sum <= u32::MAX as usize, "edge count {sum} does not fit the u32 CSR offsets");
-    sum
+/// One edge on its way into a CSR: (row, head, weight). 12 bytes.
+type Record = (u32, u32, u32);
+
+/// Node-range partitions per worker (a design constant): enough that threads taking partitions from
+/// a counter finish together, few enough that each thread's per-partition buckets stay large.
+const PARTS_PER_WORKER: usize = 4;
+
+/// Runs job(0..threads) on scoped threads and returns their results in order.
+fn on_threads<T: Send>(threads: usize, job: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    std::thread::scope(|s| {
+        let job = &job;
+        let running: Vec<_> = (0..threads).map(|k| s.spawn(move || job(k))).collect();
+        running.into_iter().map(|h| h.join().unwrap()).collect()
+    })
 }
 
-/// Pass 1 counts degrees, pass 2 writes every edge into both CSRs at its node's atomic cursor.
-/// After pass 2 each cursor has advanced to its node's end, which is exactly what Csr::end holds.
-fn build_graph(graph: &[u8], body: usize, n: usize, threads: usize, t: &mut Vec<(&'static str, Instant)>) -> (Csr, Csr) {
-    let cuts = cut_at_lf(graph, body, threads);
-    let out_cur: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
-    let in_cur: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
-    each_range(&cuts, |start, end| {
-        let mut i = start;
-        while i < end {
-            let u = read_num(graph, &mut i) as usize;
-            let v = read_num(graph, &mut i) as usize;
-            while graph[i] != b'\n' {
-                i += 1;
-            }
-            i += 1;
-            out_cur[u].fetch_add(1, Ordering::Relaxed);
-            in_cur[v].fetch_add(1, Ordering::Relaxed);
-        }
-    });
-    t.push(("pass1", Instant::now()));
+/// Phase names and the time each ended, for the stderr phase line.
+type Phases = Vec<(&'static str, Instant)>;
 
-    let m = degrees_to_cursors(&out_cur);
-    degrees_to_cursors(&in_cur);
-    let mut fwd = vec![0u64; m];
-    let mut rev = vec![0u64; m];
-    let (fwd_out, rev_out) = (Slots(fwd.as_mut_ptr()), Slots(rev.as_mut_ptr()));
-    each_range(&cuts, |start, end| {
-        let (fwd_out, rev_out) = (&fwd_out, &rev_out);
-        let mut i = start;
-        while i < end {
-            let u = read_num(graph, &mut i);
-            let v = read_num(graph, &mut i);
-            let w = read_num(graph, &mut i); // at most 4,294,967,295 (spec section 2): fits the high half
-            let f = out_cur[u as usize].fetch_add(1, Ordering::Relaxed) as usize;
-            let r = in_cur[v as usize].fetch_add(1, Ordering::Relaxed) as usize;
-            // SAFETY: f and r come from fetch_add on cursors that stay inside u's and v's slot ranges,
-            // so no two writes share an index and every index is below m.
-            unsafe {
-                *fwd_out.0.add(f) = w << 32 | v;
-                *rev_out.0.add(r) = w << 32 | u;
+/// The reverse CSR is built in this many slabs of consecutive partitions (a design constant), so
+/// only half the edges sit in records next to both CSRs: build peak below the query phase's.
+/// Re-filing the parse records by head instead (no second read of fwd) measured 176 MB of anon
+/// peak locally at 12 workers against 134 MB this way, so the slabs stay.
+const REV_SLABS: usize = 2;
+
+/// Writes the rows of partitions first.. of g from the records filed for them (buckets[thread][k]
+/// for partition first + k; partition p = nodes with id >> shift == p), each partition on one
+/// thread: a local degree count, a prefix sum from the partition's first edge slot, then a scatter
+/// into its own slices of g.end and g.edges. No atomics; each thread first-touches its own pages.
+/// Partitions before `first` must already be placed.
+fn place(buckets: &[Vec<Vec<Record>>], first: usize, shift: u32, g: &mut Csr, threads: usize) {
+    let n = g.end.len();
+    let mut first_slot = vec![g.start(first << shift) as u32];
+    for p in 0..buckets[0].len() {
+        first_slot.push(first_slot[p] + buckets.iter().map(|b| b[p].len() as u32).sum::<u32>());
+    }
+    let (edges, end) = (Slots(g.edges.as_mut_ptr()), Slots(g.end.as_mut_ptr()));
+    let next = AtomicUsize::new(0);
+    on_threads(threads, |_| {
+        let mut cursor = Vec::new();
+        loop {
+            let p = next.fetch_add(1, Ordering::Relaxed);
+            if p + 1 >= first_slot.len() {
+                return;
+            }
+            let lo = (first + p) << shift;
+            cursor.clear();
+            cursor.resize(n.min(lo + (1 << shift)) - lo, 0u32);
+            let records = || buckets.iter().flat_map(|b| &b[p]);
+            records().for_each(|r| cursor[r.0 as usize - lo] += 1);
+            let mut at = first_slot[p];
+            for (k, c) in cursor.iter_mut().enumerate() {
+                at += std::mem::replace(c, at);
+                // SAFETY: node lo + k is in partition p, which only this thread writes.
+                unsafe { end.put(lo + k, at) };
+            }
+            for r in records() {
+                let c = &mut cursor[r.0 as usize - lo];
+                // SAFETY: c walks this row's own slots inside partition p's slice of edges.
+                unsafe { edges.put(*c as usize, (r.2 as u64) << 32 | r.1 as u64) };
+                *c += 1;
             }
         }
     });
-    t.push(("pass2", Instant::now()));
-    let ends = |c: Vec<AtomicU32>| c.into_iter().map(AtomicU32::into_inner).collect();
-    (Csr { end: ends(out_cur), edges: fwd }, Csr { end: ends(in_cur), edges: rev })
+}
+
+/// Builds both CSRs without atomics. Parse: each thread parses its byte range once and files every
+/// edge as (tail, head, w) into its own bucket for the tail's partition; place() builds fwd. Rev, in
+/// REV_SLABS rounds: threads read forward partitions and file (head, tail, w) by head partition for
+/// this slab's heads, then place() builds those reverse partitions.
+/// Why: the atomic build paid two locked adds per line in each pass into random slots, and each
+/// locked add drains the store buffer behind the previous line's store misses. Measured on the box
+/// (d-7, 8a68049): build 104.6 -> 85 ms; locally (full seed 1, interleaved with the atomic two-pass
+/// build) 590-640 ms -> 185-200 ms at 12 workers.
+/// Partitions are the smallest power-of-two node range that splits this input's n nodes into at
+/// most PARTS_PER_WORKER * threads ranges.
+fn build_graph(graph: &[u8], body: usize, n: usize, threads: usize, t: &mut Phases) -> (Csr, Csr) {
+    let shift = (0..).find(|&s| (n.max(1) - 1) >> s < PARTS_PER_WORKER * threads).unwrap();
+    let parts = ((n.max(1) - 1) >> shift) + 1;
+    let cuts = cut_at_lf(graph, body, threads);
+    let by_tail = on_threads(threads, |k| {
+        let (mut mine, mut i) = (vec![Vec::new(); parts], cuts[k]);
+        while i < cuts[k + 1] {
+            let u = read_num(graph, &mut i) as u32;
+            let v = read_num(graph, &mut i) as u32;
+            // w is at most 4,294,967,295 (spec section 2), so all three fit u32.
+            mine[(u >> shift) as usize].push((u, v, read_num(graph, &mut i) as u32));
+        }
+        mine
+    });
+    t.push(("parse", Instant::now()));
+    let m = by_tail.iter().flatten().map(Vec::len).sum();
+    assert!(m <= u32::MAX as usize, "CSR offsets are u32");
+    let mut fwd = Csr { end: vec![0; n], edges: vec![0; m] };
+    place(&by_tail, 0, shift, &mut fwd, threads);
+    drop(by_tail);
+    t.push(("fwd", Instant::now()));
+    let mut rev = Csr { end: vec![0; n], edges: vec![0; m] };
+    for slab in 0..REV_SLABS {
+        let (first, last) = (parts * slab / REV_SLABS, parts * (slab + 1) / REV_SLABS);
+        let next = AtomicUsize::new(0);
+        let by_head = on_threads(threads, |_| {
+            let mut mine = vec![Vec::new(); last - first];
+            while let Some(p) = Some(next.fetch_add(1, Ordering::Relaxed)).filter(|&p| p < parts) {
+                for u in p << shift..n.min((p + 1) << shift) {
+                    for &e in fwd.adj(u) {
+                        let q = (e as u32 >> shift) as usize;
+                        if (first..last).contains(&q) {
+                            mine[q - first].push((e as u32, u as u32, (e >> 32) as u32));
+                        }
+                    }
+                }
+            }
+            mine
+        });
+        place(&by_head, first, shift, &mut rev, threads);
+    }
+    t.push(("rev", Instant::now()));
+    (fwd, rev)
 }
 
 /// A heap entry: 12 bytes packed instead of the 16 a (u64, u32) tuple takes.
@@ -476,22 +534,13 @@ fn main() {
 
     let next = AtomicUsize::new(0);
     let mut answers = vec![(0u64, 0u64, false); pairs.len()];
-    let results: Vec<Vec<(usize, (u64, u64, bool))>> = std::thread::scope(|s| {
-        let handles: Vec<_> = (0..threads)
-            .map(|_| {
-                let (fwd, rev, pairs, next) = (&fwd, &rev, &pairs, &next);
-                s.spawn(move || {
-                    let mut sc = Scratch::new();
-                    let mut done = Vec::new();
-                    loop {
-                        let q = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(&(src, dst)) = pairs.get(q) else { return done };
-                        done.push((q, answer(fwd, rev, &mut sc, src, dst)));
-                    }
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    let results = on_threads(threads, |_| {
+        let (mut sc, mut done) = (Scratch::new(), Vec::new());
+        loop {
+            let q = next.fetch_add(1, Ordering::Relaxed);
+            let Some(&(src, dst)) = pairs.get(q) else { return done };
+            done.push((q, answer(&fwd, &rev, &mut sc, src, dst)));
+        }
     });
     for (q, a) in results.into_iter().flatten() {
         answers[q] = a;
