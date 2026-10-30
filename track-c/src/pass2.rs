@@ -90,6 +90,16 @@ pub fn run<L: Lookup + ?Sized + Sync>(b: &[u8], starts: &[usize], lookup: &L, gr
                                 }
                             }
                         }
+                        if w == 0 {
+                            // Retired slot generations would otherwise live to the end of the run.
+                            // Between the two barriers no worker is inside a lookup: every lookup ran
+                            // in parse_range before the first one. Measured (sdrig, this VM): M 20.3 ->
+                            // 19.5 MiB, T unchanged; most growth happens in round 1, before the first
+                            // free, so those retired generations still overlap the peak.
+                            // SAFETY: the two barriers bracket this call, and lookups happen only
+                            // outside that window, so none is in flight or can start before it returns.
+                            unsafe { intern.free_retired() };
+                        }
                         me.rounds += 1;
                         barrier.wait();
                         if all_done {

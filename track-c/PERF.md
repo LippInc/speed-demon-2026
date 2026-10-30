@@ -9,6 +9,9 @@ Every step from the reference to your final version, each with the live-board ru
 | 2 | push dea7a01343cf, scored ok | run-c4eb9098eeb1 | 0.93 | 10 | 41.8 |
 | 3 | push 98a661eeaaa6, scored ok | run-a2be17d4d6ad | 0.79 | 10 | 43.5 |
 | 4 | push 5ecc03f78566, scored ok | run-6f175e156c66 | 0.17 | 16 | 56.4 |
+| 5 | push dbc91d1aaa1a, scored ok | run-9dc01455a1b6 | 0.16 | 16 | 56.7 |
+| 6 | push bdf05643a17c, scored ok | run-abaf5b333b4c | 0.17 | 15 | 56.5 |
+| 7 | push 5263115c0f8b, scored ok | run-ead27acd0328 | 0.17 | 16 | 56.6 |
 
 ## Experiment log
 
@@ -23,3 +26,6 @@ Each experiment's numbers are added here once the live board has measured it and
   floor12 on the box but far smaller in memory, so a better score; kept.
 - c-5 arena, commit 60e701c: intern hits compare against a per-shard copy of each distinct name instead of the input
   mapping. Verdict NOISE on the box score; merged into c-6, which needs the arena's stable storage.
+- c-6 lock-free, commit ef1b494: intern hits take no lock (atomic slots published with Release, read with Acquire;
+  names in append-only arena chunks); the shard lock is taken only to insert. Verdict KEEP on the box score; no board run
+  yet.

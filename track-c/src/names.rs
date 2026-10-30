@@ -3,6 +3,7 @@
 //! bitset's popcount.
 
 use std::cell::UnsafeCell;
+use std::mem::MaybeUninit;
 use std::ptr;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
@@ -31,13 +32,12 @@ fn hash(raw: &[u8]) -> u64 {
     h ^ (h >> 33)
 }
 
-/// One slot. `meta` is 0 while empty, else `(low 32 hash bits) << 32 | (id + 1)`; `name` points at
-/// the name in its shard's arena: a little-endian u32 length, then the raw bytes. The stored hash
-/// bits pick the home slot again when the table doubles, and filter probes before the byte compare.
-struct Slot {
-    meta: AtomicU64,
-    name: AtomicPtr<u8>,
-}
+/// One slot: 0 while empty, else `(low 32 hash bits) << 32 | (record offset + 1)`, where the record is
+/// the name's entry in the arena (`Arena`). 8 bytes, where c-6's slot was 16 (meta plus a name
+/// pointer), and records replace a per-name entry: measured (sdrig, this VM) M 19.5 -> 15.6 MiB, T
+/// unchanged (0.386 -> 0.381 s). The stored hash bits pick the home slot again when the table
+/// doubles, and filter probes before the byte compare.
+type Slot = AtomicU64;
 
 /// One generation of a shard's slots (a power of two of them).
 struct Slots {
@@ -47,32 +47,26 @@ struct Slots {
 
 impl Slots {
     fn new(len: usize) -> Box<Slots> {
-        let slots = (0..len).map(|_| Slot { meta: AtomicU64::new(0), name: AtomicPtr::new(ptr::null_mut()) }).collect();
-        Box::new(Slots { mask: len - 1, slots })
+        Box::new(Slots { mask: len - 1, slots: (0..len).map(|_| AtomicU64::new(0)).collect() })
     }
 
     /// Probes for `key` from its home slot. Returns its id, or the index of the empty slot that
-    /// ends the probe. Every slot read here was published (name, then meta with Release) before
-    /// its meta is seen non-zero (Acquire), so the arena bytes it points at are complete.
+    /// ends the probe. A slot is published (record written, then the slot stored with Release) before
+    /// it is seen non-zero here (Acquire), so the record it names is complete.
     #[inline]
-    fn find(&self, key: &[u8], tag: u32) -> Result<u32, usize> {
+    fn find(&self, arena: &Arena, key: &[u8], tag: u32) -> Result<u32, usize> {
         let mut pos = tag as usize & self.mask;
         loop {
-            let slot = &self.slots[pos];
-            let meta = slot.meta.load(Ordering::Acquire);
-            if meta == 0 {
+            let slot = self.slots[pos].load(Ordering::Acquire);
+            if slot == 0 {
                 return Err(pos);
             }
-            if (meta >> 32) as u32 == tag {
-                // SAFETY: a published name points into an arena chunk that lives, unmoved, as long as
-                // the Intern does (chunks are only ever appended), and holds a length then that many bytes.
-                let stored = unsafe {
-                    let p = slot.name.load(Ordering::Relaxed);
-                    let len = u32::from_le_bytes(*(p as *const [u8; 4])) as usize;
-                    std::slice::from_raw_parts(p.add(4), len)
-                };
+            if (slot >> 32) as u32 == tag {
+                // SAFETY: a published slot names a complete record in an arena block that lives,
+                // unmoved, as long as the Intern does.
+                let (stored, id) = unsafe { arena.record(slot as u32 - 1) };
                 if stored == key {
-                    return Ok(meta as u32 - 1);
+                    return Ok(id);
                 }
             }
             pos = (pos + 1) & self.mask;
@@ -80,46 +74,149 @@ impl Slots {
     }
 }
 
-/// What only the inserting thread touches, under the shard's lock.
-struct Writer {
-    /// Every generation of slots, the current one last. Older ones are kept until the Intern drops,
-    /// because a lock-free reader may still be probing one.
-    generations: Vec<Box<Slots>>,
-    names: usize,
-    /// Append-only arena chunks: each distinct name's bytes, copied once on insert, so a hit compares
-    /// against them instead of the name's first occurrence in the ~200 MB mapping (c-join.md:196), a
-    /// random and almost always uncached read. On the c-4 harness (12 workers, this VM) parse + intern
-    /// fell from 541 to 410 ms, and on the box T from 0.159 to 0.150 s (c-5, 60e701c), for about 1.5 MB.
-    /// A chunk is never resized, so the names in it never move. Its bytes are `UnsafeCell`s because
-    /// readers hold pointers into a chunk while the writer appends behind them: the writer only ever
-    /// writes bytes no published name covers, through raw pointers, never through a `&mut` chunk.
-    chunks: Vec<Box<[UnsafeCell<u8>]>>,
+/// Every distinct name, copied once on insert as a record `[len: u32 LE][id: u32 LE][raw bytes]`, so
+/// a hit compares against it instead of the name's first occurrence in the ~200 MB mapping
+/// (c-join.md:196), a random and almost always uncached read. On the c-4 harness (12 workers, this
+/// VM) parse + intern fell from 541 to 410 ms, and on the box T from 0.159 to 0.150 s (c-5, 60e701c).
+///
+/// Records are addressed by a 32-bit offset into a fixed directory of blocks, block k holding
+/// `ARENA_BLOCK << k` bytes, so an offset finds its block by arithmetic and no block ever moves or is
+/// resized. A record never straddles two blocks: the tail of a block too short for the next record
+/// is skipped. Blocks are allocated on first use and published, like the records, by the slot's
+/// Release store.
+///
+/// One arena serves all shards, so its blocks grow large (the last one about half the names' bytes),
+/// and large blocks are mapped lazily: allocated uninitialised, a block's pages that no record has
+/// reached yet are never touched, so never charged. Per-shard arenas had small heap blocks whose
+/// unused tails shared pages with other allocations (3.3 MB allocated for 1.9 MB of records at full
+/// scale). Measured (sdrig, this VM, alternating A/B against per-shard arenas): M 15.8 -> 14.5 MiB, T
+/// unchanged (0.377-0.413 vs 0.404-0.413 s). Each shard reserves RESERVE bytes at a
+/// time under the arena's lock and writes its records there under its own lock, so the arena lock is
+/// taken about once per 50 inserts: with it taken on every insert, T rose 10-17 % on this VM (12
+/// workers inserting most names in the first round). It is always taken after a shard's lock.
+struct Arena {
+    blocks: [AtomicPtr<u8>; 32],
+    writer: ArenaWriter,
+}
+
+/// The arena's insert side, on its own cache line so inserts do not disturb readers of `blocks`.
+#[repr(align(64))]
+struct ArenaWriter(Mutex<ArenaBlocks>);
+
+/// The blocks the directory points into, owned here so they are freed with the Intern, and the next
+/// free offset. Block bytes are `UnsafeCell`s because readers hold pointers into a block while
+/// the writer appends behind them: the writer only writes bytes no published record covers, through
+/// raw pointers. They start uninitialised: nothing reads a byte before a record is written over it.
+struct ArenaBlocks {
+    blocks: Vec<Box<[MaybeUninit<UnsafeCell<u8>>]>>,
     used: usize,
 }
 
-/// Arena chunks start at 4 KiB and double up to 64 KiB, so a shard's arena grows with what it holds.
-const CHUNK_MIN: usize = 4 << 10;
-const CHUNK_MAX: usize = 64 << 10;
+/// The first arena block's size; block k is this times 2^k.
+const ARENA_BLOCK: usize = 4 << 10;
+
+/// What a shard reserves from the arena at a time (a divisor of ARENA_BLOCK). A shard's unused
+/// reservation at the end is at most this, so 256 KiB over 256 shards.
+const RESERVE: usize = 1 << 10;
+
+/// Offset where block k starts: the sizes of blocks 0..k summed.
+fn block_start(k: usize) -> usize {
+    ARENA_BLOCK * ((1 << k) - 1)
+}
+
+/// The block an offset falls in.
+fn block_of(offset: usize) -> usize {
+    (offset / ARENA_BLOCK + 1).ilog2() as usize
+}
+
+impl Arena {
+    fn new() -> Arena {
+        Arena {
+            blocks: std::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
+            writer: ArenaWriter(Mutex::new(ArenaBlocks { blocks: Vec::new(), used: 0 })),
+        }
+    }
+
+    /// The name bytes and id of the record at `offset`.
+    ///
+    /// # Safety
+    /// `offset` must come from a slot published after its record was written (`Writer::store`).
+    #[inline]
+    unsafe fn record(&self, offset: u32) -> (&[u8], u32) {
+        let offset = offset as usize;
+        let k = block_of(offset);
+        // Relaxed: the block pointer was stored before the slot that names this record was
+        // published with Release, and the caller loaded that slot with Acquire.
+        let p = unsafe { self.blocks[k].load(Ordering::Relaxed).add(offset - block_start(k)) };
+        unsafe {
+            let len = u32::from_le_bytes(*(p as *const [u8; 4])) as usize;
+            let id = u32::from_le_bytes(*(p.add(4) as *const [u8; 4]));
+            (std::slice::from_raw_parts(p.add(8), len), id)
+        }
+    }
+
+    /// Reserves `len` bytes (a multiple of RESERVE, so a reservation never straddles a block; blocks
+    /// are multiples of it too) and returns their offset. Allocates the block on first use.
+    fn reserve(&self, len: usize) -> usize {
+        let mut a = self.writer.0.lock().unwrap();
+        // Skip to the first block whose remainder holds the reservation (blocks double, so this ends).
+        while a.used + len > block_start(block_of(a.used) + 1) {
+            a.used = block_start(block_of(a.used) + 1);
+        }
+        assert!(a.used + len < u32::MAX as usize, "names over 4 GiB");
+        let k = block_of(a.used);
+        if a.blocks.len() <= k {
+            // A block is allocated only when a reservation first lands in it (k = blocks.len() here,
+            // since `used` only moves forward one block at a time).
+            let block = Box::<[UnsafeCell<u8>]>::new_uninit_slice(ARENA_BLOCK << k);
+            self.blocks[k].store(block.as_ptr() as *mut u8, Ordering::Relaxed);
+            a.blocks.push(block);
+        }
+        let offset = a.used;
+        a.used += len;
+        offset
+    }
+
+    /// Where offset `offset` is, for the shard that reserved it to write a record there.
+    fn at(&self, offset: usize) -> *mut u8 {
+        let k = block_of(offset);
+        // Relaxed: the block was allocated under the arena lock before this offset was reserved.
+        unsafe { self.blocks[k].load(Ordering::Relaxed).add(offset - block_start(k)) }
+    }
+}
+
+/// What only the inserting thread touches, under the shard's lock.
+struct Writer {
+    /// Every generation of slots, the current one last. Older ones are kept until the next quiescent
+    /// point (`free_retired`), because a lock-free reader may still be probing one.
+    generations: Vec<Box<Slots>>,
+    names: usize,
+    /// The shard's current arena reservation: records go at `next`, up to `end`.
+    next: usize,
+    end: usize,
+}
 
 impl Writer {
-    /// Copies `key` into the arena behind its length; returns where it starts.
-    fn store(&mut self, key: &[u8]) -> *mut u8 {
-        let need = 4 + key.len();
-        if self.chunks.last().is_none_or(|c| c.len() - self.used < need) {
-            let next = self.chunks.last().map_or(CHUNK_MIN, |c| (c.len() * 2).min(CHUNK_MAX));
-            self.chunks.push((0..next.max(need)).map(|_| UnsafeCell::new(0)).collect());
-            self.used = 0;
+    /// Writes the record for `key` with `id` into this shard's reservation, reserving more first if
+    /// it does not fit; returns its offset.
+    fn store(&mut self, arena: &Arena, key: &[u8], id: u32) -> u32 {
+        let need = 8 + key.len();
+        if self.next + need > self.end {
+            let len = need.next_multiple_of(RESERVE);
+            self.next = arena.reserve(len);
+            self.end = self.next + len;
         }
-        let chunk = self.chunks.last().unwrap();
-        // SAFETY: `used..used + need` lies inside the chunk and no published name covers it yet, so
-        // nothing reads these bytes while they are written.
+        // SAFETY: the record lies inside this shard's reservation, which only this shard writes,
+        // under its lock, and no published slot names these bytes yet, so nothing reads them.
         unsafe {
-            let at = UnsafeCell::raw_get(chunk.as_ptr().add(self.used));
+            let at = arena.at(self.next);
             ptr::copy_nonoverlapping((key.len() as u32).to_le_bytes().as_ptr(), at, 4);
-            ptr::copy_nonoverlapping(key.as_ptr(), at.add(4), key.len());
-            self.used += need;
-            at
+            ptr::copy_nonoverlapping(id.to_le_bytes().as_ptr(), at.add(4), 4);
+            ptr::copy_nonoverlapping(key.as_ptr(), at.add(8), key.len());
         }
+        let offset = self.next as u32;
+        self.next += need;
+        offset
     }
 
     /// Doubles the slots: copies every published slot into a new generation (only this thread
@@ -129,14 +226,13 @@ impl Writer {
         let old = self.generations.last().unwrap();
         let new = Slots::new(old.slots.len() * 2);
         for slot in old.slots.iter() {
-            let meta = slot.meta.load(Ordering::Relaxed);
-            if meta != 0 {
-                let mut pos = (meta >> 32) as usize & new.mask;
-                while new.slots[pos].meta.load(Ordering::Relaxed) != 0 {
+            let slot = slot.load(Ordering::Relaxed);
+            if slot != 0 {
+                let mut pos = (slot >> 32) as usize & new.mask;
+                while new.slots[pos].load(Ordering::Relaxed) != 0 {
                     pos = (pos + 1) & new.mask;
                 }
-                new.slots[pos].name.store(slot.name.load(Ordering::Relaxed), Ordering::Relaxed);
-                new.slots[pos].meta.store(meta, Ordering::Relaxed);
+                new.slots[pos].store(slot, Ordering::Relaxed);
             }
         }
         // Release: a reader that loads this pointer (Acquire) sees every slot copied above.
@@ -159,9 +255,10 @@ struct Shard {
 
 /// Raw name bytes (between the quotes, escapes kept) -> dense id. `""` -> `"` is one to one, so raw
 /// bytes are distinct exactly when the unescaped values are; `""` and an empty unquoted field are
-/// both the empty key. Every hit is an exact byte compare against the copy in the shard's arena.
+/// both the empty key. Every hit is an exact byte compare against the copy in the arena.
 pub struct Intern {
     shards: Vec<Shard>,
+    arena: Arena,
     next_id: AtomicU32,
 }
 
@@ -174,11 +271,25 @@ impl Intern {
                 let first = Slots::new(len);
                 Shard {
                     current: AtomicPtr::new(&*first as *const Slots as *mut Slots),
-                    writer: Mutex::new(Writer { generations: vec![first], names: 0, chunks: Vec::new(), used: 0 }),
+                    writer: Mutex::new(Writer { generations: vec![first], names: 0, next: 0, end: 0 }),
                 }
             })
             .collect();
-        Intern { shards, next_id: AtomicU32::new(0) }
+        Intern { shards, arena: Arena::new(), next_id: AtomicU32::new(0) }
+    }
+
+    /// Frees every shard's retired slot generations, keeping only the current one.
+    ///
+    /// # Safety
+    /// No `id` call may be in flight on any thread, and none may start until this returns: a lookup
+    /// can hold a pointer to any generation it loaded from `current`, but only until it returns.
+    pub unsafe fn free_retired(&self) {
+        for shard in &self.shards {
+            let mut w = shard.writer.lock().unwrap();
+            let current = w.generations.pop().unwrap();
+            w.generations.clear();
+            w.generations.push(current);
+        }
     }
 
     /// Distinct names interned so far; ids are 0..count.
@@ -192,16 +303,16 @@ impl Intern {
         let h = hash(key);
         let tag = h as u32;
         let shard = &self.shards[(h >> (64 - SHARD_BITS)) as usize];
-        // SAFETY: `current` always points at a generation owned by the shard's writer, and no
-        // generation is freed before the Intern drops.
+        // SAFETY: `current` always points at a generation owned by the shard's writer; a generation
+        // this lookup can reach is freed only at a quiescent point, when no lookup is in flight.
         let slots = unsafe { &*shard.current.load(Ordering::Acquire) };
-        if let Ok(id) = slots.find(key, tag) {
+        if let Ok(id) = slots.find(&self.arena, key, tag) {
             return id;
         }
         // Miss: take the lock, re-check the current generation (another worker may have inserted
         // it, or grown the table), then insert and publish.
         let mut w = shard.writer.lock().unwrap();
-        let mut pos = match w.generations.last().unwrap().find(key, tag) {
+        let mut pos = match w.generations.last().unwrap().find(&self.arena, key, tag) {
             Ok(id) => return id,
             Err(pos) => pos,
         };
@@ -211,16 +322,14 @@ impl Intern {
         // stress runs at SD_INTERN_SLOTS=2.
         if (w.names + 1) * 2 > w.generations.last().unwrap().slots.len() {
             w.grow(&shard.current);
-            pos = w.generations.last().unwrap().find(key, tag).expect_err("name absent before the grow");
+            pos = w.generations.last().unwrap().find(&self.arena, key, tag).expect_err("name absent before the grow");
         }
         // New name: its id is taken under the shard lock, so ids stay dense across shards.
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         assert!(id < u32::MAX, "more than 2^32 - 1 distinct names");
-        let name = w.store(key);
-        let slot = &w.generations.last().unwrap().slots[pos];
-        slot.name.store(name, Ordering::Relaxed);
-        // Release: a reader that sees this meta (Acquire) sees the name pointer and its bytes.
-        slot.meta.store((tag as u64) << 32 | (id as u64 + 1), Ordering::Release);
+        let offset = w.store(&self.arena, key, id);
+        // Release: a reader that sees this slot (Acquire) sees the record and its block pointer.
+        w.generations.last().unwrap().slots[pos].store((tag as u64) << 32 | (offset as u64 + 1), Ordering::Release);
         w.names += 1;
         id
     }
