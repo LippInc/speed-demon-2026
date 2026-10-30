@@ -1,0 +1,3 @@
+# x86-64-v3 (AVX2), the scoring CPU's level; see the rules: never the build host's own CPU flags.
+[build]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
