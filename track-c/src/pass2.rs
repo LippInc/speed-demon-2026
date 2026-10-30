@@ -1,9 +1,10 @@
 //! Pass 2: every worker parses its own records into its own per-group slots and interns each name
 //! in the shared table. Each group's name bitset belongs to one worker (group % workers), which
-//! alone writes it, in bounded rounds: a worker buffers up to ROUND_PAIRS (group, id) pairs, all
-//! workers meet at a barrier, each sets the bits of the groups it owns from every worker's buffer,
-//! they meet again, and the next round starts with empty buffers. Name memory is the intern table,
-//! the bitsets and workers x ROUND_PAIRS pairs, never a function of the record count.
+//! alone writes it, in bounded rounds: a worker files each (group, id) pair into one bucket per
+//! owner until any bucket is full, all workers meet at a barrier, each sets the bits of the groups
+//! it owns from the buckets addressed to it, they meet again, and the next round starts with empty
+//! buckets. Name memory is the intern table, the bitsets and workers x ROUND_PAIRS pairs, never a
+//! function of the record count.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Barrier, RwLock};
@@ -13,7 +14,8 @@ use crate::names::{Intern, NameSet};
 use crate::records::{Slot, parse_range};
 use crate::regions::Lookup;
 
-/// Pairs one worker buffers per round (8 B each, so 128 KiB a worker).
+/// Pairs one worker buffers per round (8 B each, so 128 KiB a worker), split evenly over its
+/// per-owner buckets.
 const ROUND_PAIRS: usize = 16 * 1024;
 
 /// What pass 2 returns.
@@ -41,15 +43,23 @@ struct Worker {
 /// `starts[k]..starts[k + 1]`.
 pub fn run<L: Lookup + ?Sized + Sync>(b: &[u8], starts: &[usize], lookup: &L, groups: usize, intern: &Intern) -> Pass2 {
     let workers = starts.len() - 1;
-    let buffers: Vec<RwLock<Vec<(u32, u32)>>> =
-        (0..workers).map(|_| RwLock::new(Vec::with_capacity(ROUND_PAIRS))).collect();
+    // Group -> (owner, index among the owner's groups), so the hot loop needs no `%` or division.
+    let route: Vec<(usize, u32)> = (0..groups).map(|g| (g % workers, (g / workers) as u32)).collect();
+    // Per worker, one bucket per owner of (owner-local group, id). Each owner reads only the buckets
+    // addressed to it, short contiguous runs, where it used to filter every worker's whole buffer:
+    // the noowner probe (7632abe) put that step at about 24 ms of the box's T. Measured (this VM, 12
+    // workers, full seed 1, interleaved medians of 7): pass2+names 325 -> 273 ms; 27 rounds instead of
+    // 18, since skew fills the busiest owner's bucket first; M unchanged (sdrig, about 14.5 MB a run).
+    let cap = (ROUND_PAIRS / workers).max(1);
+    let buckets: Vec<RwLock<Vec<Vec<(u32, u32)>>>> =
+        (0..workers).map(|_| RwLock::new((0..workers).map(|_| Vec::with_capacity(cap)).collect())).collect();
     let barrier = Barrier::new(workers);
     let finished = AtomicUsize::new(0);
 
     let results: Vec<Worker> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..workers)
             .map(|w| {
-                let (buffers, barrier, finished) = (&buffers, &barrier, &finished);
+                let (buckets, route, barrier, finished) = (&buckets, &route, &barrier, &finished);
                 s.spawn(move || {
                     let t = Instant::now();
                     let mut me = Worker {
@@ -63,14 +73,17 @@ pub fn run<L: Lookup + ?Sized + Sync>(b: &[u8], starts: &[usize], lookup: &L, gr
                     let mut done = false;
                     loop {
                         // Between the previous round's second barrier and this round's first, only
-                        // the owner touches its buffer.
+                        // the writer touches its buckets.
                         {
-                            let mut buf = buffers[w].write().unwrap();
-                            buf.clear();
+                            let mut mine = buckets[w].write().unwrap();
+                            mine.iter_mut().for_each(Vec::clear);
                             if !done {
                                 me.records += parse_range(b, &mut i, end, lookup, &mut me.slots, |g, start, len| {
-                                    buf.push((g as u32, intern.id(b, start, len)));
-                                    buf.len() < ROUND_PAIRS
+                                    let (owner, local) = route[g];
+                                    let bucket = &mut mine[owner];
+                                    bucket.push((local, intern.id(b, start, len)));
+                                    // The round ends when any bucket is full.
+                                    bucket.len() < cap
                                 });
                                 if i >= end {
                                     done = true;
@@ -83,11 +96,9 @@ pub fn run<L: Lookup + ?Sized + Sync>(b: &[u8], starts: &[usize], lookup: &L, gr
                         // Every worker that finishes did so before this barrier, and none can
                         // finish again before the next one, so all workers read the same value.
                         let all_done = finished.load(Ordering::Relaxed) == workers;
-                        for buf in buffers {
-                            for &(g, id) in buf.read().unwrap().iter() {
-                                if g as usize % workers == w {
-                                    me.owned[g as usize / workers].insert(id);
-                                }
+                        for theirs in buckets {
+                            for &(local, id) in &theirs.read().unwrap()[w] {
+                                me.owned[local as usize].insert(id);
                             }
                         }
                         if w == 0 {
