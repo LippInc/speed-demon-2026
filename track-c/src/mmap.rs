@@ -1,12 +1,6 @@
 //! Read-only file mappings through libc's mmap (std links libc; no crate needed).
 
-use std::ffi::c_void;
-use std::fs::File;
-use std::os::fd::AsRawFd;
-
-const PROT_READ: i32 = 0x1;
-const MAP_PRIVATE: i32 = 0x02;
-const MAP_FAILED: *mut c_void = !0 as *mut c_void;
+use std::{ffi::c_void, fs::File, os::fd::AsRawFd};
 
 unsafe extern "C" {
     fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
@@ -22,8 +16,9 @@ pub fn map_file(path: &str) -> &'static [u8] {
     }
     // SAFETY: a fresh read-only private mapping of an input file nobody writes during the run.
     unsafe {
-        let ptr = mmap(std::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, file.as_raw_fd(), 0);
-        assert!(ptr != MAP_FAILED, "mmap {path} failed");
+        // prot 1 = PROT_READ, flags 2 = MAP_PRIVATE (mmap(2)); -1 (all bits set) is MAP_FAILED.
+        let ptr = mmap(std::ptr::null_mut(), len, 1, 2, file.as_raw_fd(), 0);
+        assert!(ptr as usize != usize::MAX, "mmap {path} failed");
         std::slice::from_raw_parts(ptr as *const u8, len)
     }
 }

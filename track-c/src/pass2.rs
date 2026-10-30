@@ -10,13 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Barrier, RwLock};
 use std::time::{Duration, Instant};
 
-use crate::names::{Intern, NameSet};
-use crate::records::{Slot, parse_range};
-use crate::regions::Lookup;
-
-/// Pairs one worker buffers per round (8 B each, so 128 KiB a worker), split evenly over its
-/// per-owner buckets.
-const ROUND_PAIRS: usize = 16 * 1024;
+use crate::{names::Intern, names::NameSet, records::parse_range, records::Slot, regions::Lookup};
 
 /// What pass 2 returns.
 pub struct Pass2 {
@@ -34,6 +28,7 @@ pub struct Pass2 {
 }
 
 /// One worker's result.
+#[derive(Default)]
 struct Worker {
     slots: Vec<Slot>,
     owned: Vec<NameSet>,
@@ -47,13 +42,15 @@ struct Worker {
 pub fn run<L: Lookup + ?Sized + Sync>(b: &[u8], starts: &[usize], lookup: &L, groups: usize, intern: &Intern) -> Pass2 {
     let workers = starts.len() - 1;
     // Group -> (owner, index among the owner's groups), so the hot loop needs no `%` or division.
-    let route: Vec<(usize, u32)> = (0..groups).map(|g| (g % workers, (g / workers) as u32)).collect();
+    let route: Vec<(usize, usize)> = (0..groups).map(|g| (g % workers, g / workers)).collect();
     // Per worker, one bucket per owner of (owner-local group, id). Each owner reads only the buckets
     // addressed to it, short contiguous runs, where it used to filter every worker's whole buffer:
     // the noowner probe (7632abe) put that step at about 24 ms of the box's T. Measured (this VM, 12
     // workers, full seed 1, interleaved medians of 7): pass2+names 325 -> 273 ms; 27 rounds instead of
     // 18, since skew fills the busiest owner's bucket first; M unchanged (sdrig, about 14.5 MB a run).
-    let cap = (ROUND_PAIRS / workers).max(1);
+    // Pairs one worker buffers per round (8 B each, so 128 KiB a worker), split evenly over its
+    // per-owner buckets.
+    let cap = (16 * 1024 / workers).max(1);
     let buckets: Vec<RwLock<Vec<Vec<(u32, u32)>>>> =
         (0..workers).map(|_| RwLock::new((0..workers).map(|_| Vec::with_capacity(cap)).collect())).collect();
     let barrier = Barrier::new(workers);
@@ -69,34 +66,30 @@ pub fn run<L: Lookup + ?Sized + Sync>(b: &[u8], starts: &[usize], lookup: &L, gr
                     let t = Instant::now();
                     let mut me = Worker {
                         slots: vec![Slot::default(); groups],
-                        owned: (w..groups).step_by(workers).map(|_| NameSet::default()).collect(),
-                        records: 0,
-                        time: Duration::ZERO,
-                        rounds: 0,
+                        owned: (w..groups).step_by(workers).map(|_| Default::default()).collect(),
+                        ..Default::default()
                     };
-                    let (mut i, end) = (starts[w], starts[w + 1]);
-                    let mut done = false;
+                    let (mut i, end, mut done) = (starts[w], starts[w + 1], false);
                     loop {
                         // Between the previous round's second barrier and this round's first, only
                         // the writer touches its buckets.
                         {
                             let mut mine = buckets[w].write().unwrap();
                             mine.iter_mut().for_each(Vec::clear);
-                            if !done {
+                            if i < end {
                                 me.records += parse_range(b, &mut i, end, lookup, &mut me.slots, |g, start, len| {
                                     let (owner, local) = route[g];
-                                    let bucket = &mut mine[owner];
-                                    bucket.push((local, intern.id(b, start, len)));
+                                    mine[owner].push((local as u32, intern.id(b, start, len)));
                                     // The round ends when any bucket is full.
-                                    bucket.len() < cap
+                                    mine[owner].len() < cap
                                 });
-                                if i >= end {
-                                    done = true;
-                                    me.time = t.elapsed();
-                                    finished.fetch_add(1, Ordering::Relaxed);
-                                    // Pairwise end check (e1): the parse must stop exactly on the cut.
-                                    exact.fetch_and(i == end, Ordering::Relaxed);
-                                }
+                            }
+                            if i >= end && !done {
+                                done = true;
+                                me.time = t.elapsed();
+                                finished.fetch_add(1, Ordering::Relaxed);
+                                // Pairwise end check (e1): the parse must stop exactly on the cut.
+                                exact.fetch_and(i == end, Ordering::Relaxed);
                             }
                         }
                         barrier.wait();
@@ -130,7 +123,8 @@ pub fn run<L: Lookup + ?Sized + Sync>(b: &[u8], starts: &[usize], lookup: &L, gr
         handles.into_iter().map(|h| h.join().expect("parse worker panicked")).collect()
     });
 
-    let distinct = (0..groups).map(|g| results[g % workers].owned[g / workers].len()).collect();
+    let owned = |g: usize| results[g % workers].owned[g / workers].len();
+    let distinct = (0..groups).map(owned).collect();
     Pass2 {
         records: results.iter().map(|r| r.records).sum(),
         times: results.iter().map(|r| r.time).collect(),

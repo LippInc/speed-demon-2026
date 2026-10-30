@@ -2,15 +2,11 @@
 //! (0 upward), and each group keeps a bitset over those ids (pass2.rs), so names_distinct is the
 //! bitset's popcount.
 
-use std::cell::UnsafeCell;
-use std::mem::MaybeUninit;
-use std::ptr;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use std::{cell::UnsafeCell, mem::MaybeUninit, ptr, sync::Mutex};
 
 /// One little-endian word of the mapping at `at`; bytes past its end read as 0, so nothing is read
 /// beyond it.
-#[inline]
 fn word(b: &[u8], at: usize) -> u64 {
     b.get(at..at + 8).map_or_else(|| {
         let mut w = [0u8; 8];
@@ -20,7 +16,6 @@ fn word(b: &[u8], at: usize) -> u64 {
 }
 
 /// 64 x 64 -> 128-bit multiply, folded to 64 bits (wyhash's mum).
-#[inline]
 fn mum(a: u64, b: u64) -> u64 {
     let x = a as u128 * b as u128;
     x as u64 ^ (x >> 64) as u64
@@ -33,7 +28,6 @@ fn mum(a: u64, b: u64) -> u64 {
 /// interleaved medians of 9): pass2+names 252 -> 224 ms; probes per lookup 1.320 -> 1.324 on average,
 /// 23 -> 26 at most (seed 7331: 1.322 -> 1.325, 31 -> 23). Returns the hash and the two words, which
 /// the record compare reuses (`Arena::matches`).
-#[inline]
 pub fn hash(b: &[u8], start: usize, len: usize) -> (u64, u64, u64) {
     let (lo, hi) = if len >= 8 { (word(b, start), word(b, start + len - 8)) } else { (word(b, start) & ((1 << (8 * len)) - 1), 0) };
     let mut acc = 0x8ebc_6af0_9c88_c6e3 ^ len as u64;
@@ -52,42 +46,35 @@ pub fn hash(b: &[u8], start: usize, len: usize) -> (u64, u64, u64) {
 /// filter probes before the compare; growth finds a name's home slot again by rehashing its record.
 type Slot = AtomicU64;
 
-/// One generation of a shard's slots (a power of two of them).
-struct Slots {
-    mask: usize,
-    slots: Box<[Slot]>,
-}
+/// One generation of a shard's slots, as (mask, slots); a power of two of them.
+struct Slots(usize, Box<[Slot]>);
 
 impl Slots {
     fn new(len: usize) -> Box<Slots> {
-        Box::new(Slots { mask: len - 1, slots: (0..len).map(|_| AtomicU64::new(0)).collect() })
+        Box::new(Slots(len - 1, (0..len).map(|_| AtomicU64::new(0)).collect()))
     }
 
     /// Probes for `key` from its home slot. Returns its id, or the index of the empty slot that
     /// ends the probe. A slot is published (record written, then the slot stored with Release) before
     /// it is seen non-zero here (Acquire), so the record it names is complete.
-    #[inline]
     fn find(&self, key: (&[u8], u64, u64), h: u64) -> Result<u32, usize> {
-        let mut pos = h as usize & self.mask;
+        let mut pos = h as usize & self.0;
         loop {
-            let slot = self.slots[pos].load(Ordering::Acquire);
+            let slot = self.1[pos].load(Ordering::Acquire);
             if slot == 0 {
                 return Err(pos);
             }
-            if slot >> 48 == h >> 32 & 0xFFFF {
-                // SAFETY: a published slot names a complete record in an arena block that lives,
-                // unmoved, as long as the Intern does.
-                if let Some(id) = unsafe { matches(record(slot), key) } {
-                    return Ok(id);
-                }
+            // SAFETY: a published slot names a complete record in an arena block that lives,
+            // unmoved, as long as the Intern does.
+            if slot >> 48 == h >> 32 & 0xFFFF && let Some(id) = unsafe { matches(record(slot), key) } {
+                return Ok(id);
             }
-            pos = (pos + 1) & self.mask;
+            pos = (pos + 1) & self.0;
         }
     }
 }
 
 /// The record a published slot names.
-#[inline]
 fn record(slot: u64) -> *const u8 {
     std::ptr::with_exposed_provenance(slot as usize & ((1 << 48) - 1))
 }
@@ -101,7 +88,6 @@ fn record(slot: u64) -> *const u8 {
 ///
 /// # Safety
 /// `p` must come from a slot published after its record was written (`Writer::store`).
-#[inline]
 unsafe fn matches(p: *const u8, (key, lo, hi): (&[u8], u64, u64)) -> Option<u32> {
     unsafe {
         let len = u32::from_le_bytes(*(p as *const [u8; 4])) as usize;
@@ -149,17 +135,11 @@ struct ArenaWriter(Mutex<ArenaBlocks>);
 /// free offset. Block bytes are `UnsafeCell`s because readers hold pointers into a block while
 /// the writer appends behind them: the writer only writes bytes no published record covers, through
 /// raw pointers. They start uninitialised: nothing reads a byte before a record is written over it.
-struct ArenaBlocks {
-    blocks: Vec<Box<[MaybeUninit<UnsafeCell<u8>>]>>,
-    used: usize,
-}
+#[derive(Default)]
+struct ArenaBlocks(Vec<Box<[MaybeUninit<UnsafeCell<u8>>]>>, usize);
 
 /// The first arena block's size; block k is this times 2^k.
 const ARENA_BLOCK: usize = 4 << 10;
-
-/// What a shard reserves from the arena at a time (a divisor of ARENA_BLOCK). A shard's unused
-/// reservation at the end is at most this, so 256 KiB over 256 shards.
-const RESERVE: usize = 1 << 10;
 
 /// Offset where block k starts: the sizes of blocks 0..k summed.
 fn block_start(k: usize) -> usize {
@@ -172,23 +152,16 @@ fn block_of(offset: usize) -> usize {
 }
 
 impl Arena {
-    fn new() -> Arena {
-        Arena {
-            blocks: std::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
-            writer: ArenaWriter(Mutex::new(ArenaBlocks { blocks: Vec::new(), used: 0 })),
-        }
-    }
-
-    /// Reserves `len` bytes (a multiple of RESERVE, so a reservation never straddles a block; blocks
-    /// are multiples of it too) and returns their offset. Allocates the block on first use.
+    /// Reserves `len` bytes (a multiple of the 1 KiB reserve step, so a reservation never straddles
+    /// a block; blocks are multiples of it too) and returns their offset. Allocates on first use.
     fn reserve(&self, len: usize) -> usize {
         let mut a = self.writer.0.lock().unwrap();
         // Skip to the first block whose remainder holds the reservation (blocks double, so this ends).
-        while a.used + len > block_start(block_of(a.used) + 1) {
-            a.used = block_start(block_of(a.used) + 1);
+        while a.1 + len > block_start(block_of(a.1) + 1) {
+            a.1 = block_start(block_of(a.1) + 1);
         }
-        assert!(a.used + len < u32::MAX as usize, "names over 4 GiB");
-        let k = block_of(a.used);
+        assert!(a.1 + len < u32::MAX as usize, "names over 4 GiB");
+        let k = block_of(a.1);
         // A block is allocated when a reservation first lands in it, decided by block k's own
         // directory pointer. The skip above can pass over several blocks (a reservation longer than
         // the next block, e.g. a name of 4 KiB or more, c-join.md:50), so testing `blocks.len() <= k`
@@ -198,18 +171,17 @@ impl Arena {
         if self.blocks[k].load(Ordering::Relaxed).is_null() {
             let block = Box::<[UnsafeCell<u8>]>::new_uninit_slice(ARENA_BLOCK << k);
             self.blocks[k].store(block.as_ptr() as *mut u8, Ordering::Relaxed);
-            a.blocks.push(block);
+            a.0.push(block);
         }
-        let offset = a.used;
-        a.used += len;
-        offset
+        a.1 += len;
+        a.1 - len
     }
 
     /// Where offset `offset` is, for the shard that reserved it to write a record there.
     fn at(&self, offset: usize) -> *mut u8 {
-        let k = block_of(offset);
         // Relaxed: the block was allocated under the arena lock before this offset was reserved.
-        unsafe { self.blocks[k].load(Ordering::Relaxed).add(offset - block_start(k)) }
+        let p = self.blocks[block_of(offset)].load(Ordering::Relaxed);
+        unsafe { p.add(offset - block_start(block_of(offset))) }
     }
 }
 
@@ -231,21 +203,22 @@ impl Writer {
         // At least 8 name bytes, zero beyond the name, so `matches` can read a whole word.
         let need = 8 + key.len().max(8);
         if self.next + need > self.end {
-            let len = need.next_multiple_of(RESERVE);
+            let len = need.next_multiple_of(1 << 10); // the reserve step: 1 KiB
             self.next = arena.reserve(len);
             self.end = self.next + len;
         }
+        let at = arena.at(self.next);
+        // The record's 8-byte head `[len: u32 LE][id: u32 LE]`, written below as one word.
+        let head = ((id as u64) << 32 | key.len() as u64).to_le_bytes();
         // SAFETY: the record lies inside this shard's reservation, which only this shard writes,
         // under its lock, and no published slot names these bytes yet, so nothing reads them.
         unsafe {
-            let at = arena.at(self.next);
-            ptr::copy_nonoverlapping((key.len() as u32).to_le_bytes().as_ptr(), at, 4);
-            ptr::copy_nonoverlapping(id.to_le_bytes().as_ptr(), at.add(4), 4);
+            ptr::copy_nonoverlapping(head.as_ptr(), at, 8);
             ptr::copy_nonoverlapping(key.as_ptr(), at.add(8), key.len());
             ptr::write_bytes(at.add(8 + key.len()), 0, need - 8 - key.len());
         }
         self.next += need;
-        arena.at(self.next - need)
+        at
     }
 
     /// Doubles the slots: copies every published slot into a new generation (only this thread
@@ -253,21 +226,18 @@ impl Writer {
     /// find every name it held, and a miss there sends them to the locked re-check.
     fn grow(&mut self, current: &AtomicPtr<Slots>) {
         let old = self.generations.last().unwrap();
-        let new = Slots::new(old.slots.len() * 2);
-        for slot in old.slots.iter() {
-            let slot = slot.load(Ordering::Relaxed);
-            if slot != 0 {
-                // SAFETY: a published slot names a complete record (`Writer::store`).
-                let name = unsafe {
-                    let p = record(slot);
-                    std::slice::from_raw_parts(p.add(8), u32::from_le_bytes(*(p as *const [u8; 4])) as usize)
-                };
-                let mut pos = hash(name, 0, name.len()).0 as usize & new.mask;
-                while new.slots[pos].load(Ordering::Relaxed) != 0 {
-                    pos = (pos + 1) & new.mask;
-                }
-                new.slots[pos].store(slot, Ordering::Relaxed);
+        let new = Slots::new(old.1.len() * 2);
+        for entry in old.1.iter().filter(|s| s.load(Ordering::Relaxed) != 0) {
+            let slot = entry.load(Ordering::Relaxed);
+            // SAFETY: a published slot names a complete record (`Writer::store`).
+            let p = record(slot);
+            let len = u32::from_le_bytes(unsafe { *(p as *const [u8; 4]) }) as usize;
+            let name = unsafe { std::slice::from_raw_parts(p.add(8), len) };
+            let mut pos = hash(name, 0, name.len()).0 as usize & new.0;
+            while new.1[pos].load(Ordering::Relaxed) != 0 {
+                pos = (pos + 1) & new.0;
             }
+            new.1[pos].store(slot, Ordering::Relaxed);
         }
         // Release: a reader that loads this pointer (Acquire) sees every slot copied above.
         current.store(&*new as *const Slots as *mut Slots, Ordering::Release);
@@ -309,7 +279,14 @@ impl Intern {
                 }
             })
             .collect();
-        Intern { shards, arena: Arena::new(), next_id: AtomicU32::new(0) }
+        Intern {
+            shards,
+            arena: Arena {
+                blocks: std::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
+                writer: ArenaWriter(Mutex::new(ArenaBlocks::default())),
+            },
+            next_id: AtomicU32::new(0),
+        }
     }
 
     /// Frees every shard's retired slot generations, keeping only the current one.
@@ -320,9 +297,8 @@ impl Intern {
     pub unsafe fn free_retired(&self) {
         for shard in &self.shards {
             let mut w = shard.writer.lock().unwrap();
-            let current = w.generations.pop().unwrap();
-            w.generations.clear();
-            w.generations.push(current);
+            let keep = w.generations.len() - 1;
+            w.generations.drain(..keep);
         }
     }
 
@@ -345,7 +321,8 @@ impl Intern {
         // Miss: take the lock, re-check the current generation (another worker may have inserted
         // it, or grown the table), then insert and publish.
         let mut w = shard.writer.lock().unwrap();
-        let mut pos = match w.generations.last().unwrap().find(key, h) {
+        let mut last = w.generations.last().unwrap();
+        let mut pos = match last.find(key, h) {
             Ok(id) => return id,
             Err(pos) => pos,
         };
@@ -353,9 +330,10 @@ impl Intern {
         // reach then keeps an empty slot, which is what ends a lock-free probe for a name it lacks: a
         // full retired generation (2 slots, both used) made such a probe spin forever, found by the
         // stress runs at SD_INTERN_SLOTS=2.
-        if (w.names + 1) * 2 > w.generations.last().unwrap().slots.len() {
+        if (w.names + 1) * 2 > last.1.len() {
             w.grow(&shard.current);
-            pos = w.generations.last().unwrap().find(key, h).expect_err("name absent before the grow");
+            last = w.generations.last().unwrap();
+            pos = last.find(key, h).expect_err("name absent before the grow");
         }
         // New name: its id is taken under the shard lock, so ids stay dense across shards.
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -363,7 +341,7 @@ impl Intern {
         let addr = w.store(&self.arena, key.0, id).expose_provenance() as u64;
         assert!(addr >> 48 == 0, "a record address above 48 bits");
         // Release: a reader that sees this slot (Acquire) sees the record and its block pointer.
-        w.generations.last().unwrap().slots[pos].store((h >> 32 & 0xFFFF) << 48 | addr, Ordering::Release);
+        w.generations.last().unwrap().1[pos].store((h >> 32 & 0xFFFF) << 48 | addr, Ordering::Release);
         w.names += 1;
         id
     }
@@ -373,15 +351,12 @@ impl Intern {
 #[derive(Default)]
 pub struct NameSet(Vec<u64>);
 
-/// Growth step in words (1 KiB): few reallocations, and at most 1 KiB of slack per group.
-const GROW_WORDS: usize = 128;
-
 impl NameSet {
-    #[inline]
     pub fn insert(&mut self, id: u32) {
         let word = (id / 64) as usize;
         if word >= self.0.len() {
-            let len = (word + 1).next_multiple_of(GROW_WORDS);
+            // Growth step 128 words (1 KiB): few reallocations, and at most 1 KiB of slack per group.
+            let len = (word + 1).next_multiple_of(128);
             self.0.reserve_exact(len - self.0.len());
             self.0.resize(len, 0);
         }

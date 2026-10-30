@@ -41,7 +41,6 @@ impl Slot {
 /// zeros) instead of one byte a step; the last 31 bytes of the mapping go byte by byte, so nothing is
 /// read past its end. Measured (this VM, 12 workers, full seed 1, interleaved medians): pass2+names
 /// 294 -> 244 ms.
-#[inline]
 fn find(b: &[u8], mut i: usize, c: u8) -> usize {
     #[cfg(target_feature = "avx2")]
     while i + 32 <= b.len() {
@@ -62,7 +61,6 @@ fn find(b: &[u8], mut i: usize, c: u8) -> usize {
 /// One text field (name or note) starting at `i`, which is followed by a comma.
 /// Returns where the raw bytes between the quotes start and how many there are (escapes kept),
 /// the value's length once `""` is unescaped, and the index just past the comma.
-#[inline]
 fn text_field(b: &[u8], i: usize) -> (usize, usize, u64, usize) {
     if b[i] != b'"' {
         // Unquoted: everything up to the comma (c-join.md:28).
@@ -71,22 +69,19 @@ fn text_field(b: &[u8], i: usize) -> (usize, usize, u64, usize) {
     }
     // Quoted: ends at the first `"` not part of a `""` pair (c-join.md:33). Commas, LF and BOM
     // bytes inside are data, so they never stop the scan.
-    let start = i + 1;
-    let mut j = start;
+    let (start, mut j) = (i + 1, i + 1);
     let mut escapes = 0u64;
     loop {
         let q = find(b, j, b'"');
-        if b.get(q + 1) == Some(&b'"') {
-            escapes += 1;
-            j = q + 2;
-        } else {
+        if b.get(q + 1) != Some(&b'"') {
             return (start, q - start, (q - start) as u64 - escapes, q + 2);
         }
+        escapes += 1;
+        j = q + 2;
     }
 }
 
 /// An unsigned decimal ending at `stop`; returns it and the index just past `stop`.
-#[inline]
 fn uint_until(b: &[u8], mut i: usize, stop: u8) -> (u64, usize) {
     let mut n = 0u64;
     while b[i] != stop {
@@ -94,27 +89,6 @@ fn uint_until(b: &[u8], mut i: usize, stop: u8) -> (u64, usize) {
         i += 1;
     }
     (n, i + 1)
-}
-
-/// `-?[0-9]+\.[0-9]{2}` as integer cents (c-join.md:24, 37); returns it and the index just past it.
-#[inline]
-fn amount(b: &[u8], i: usize) -> (i64, usize) {
-    let negative = b[i] == b'-';
-    let (whole, i) = uint_until(b, i + negative as usize, b'.');
-    let cents = whole as i64 * 100 + ((b[i] - b'0') * 10 + (b[i + 1] - b'0')) as i64;
-    (if negative { -cents } else { cents }, i + 2)
-}
-
-#[inline]
-pub fn skip_bom(b: &[u8], i: usize) -> usize {
-    if b[i..].starts_with(BOM) { i + BOM.len() } else { i }
-}
-
-/// Index just past the header: a BOM may start the file, and the header holds no quotes and ends
-/// at the first LF (c-join.md:18-19, 43).
-pub fn header_end(b: &[u8]) -> usize {
-    let i = skip_bom(b, 0);
-    i + b[i..].iter().position(|&c| c == b'\n').map_or(b.len() - i, |p| p + 1)
 }
 
 /// Parses the records that start in `*i..end` (`*i` is a record start; the last record may run past
@@ -132,12 +106,16 @@ pub fn parse_range<L: Lookup + ?Sized>(
     let mut records = 0;
     while *i < end {
         // A BOM directly after a terminator is skipped (c-join.md:36).
-        let at = skip_bom(b, *i);
+        let at = if b[*i..].starts_with(BOM) { *i + 3 } else { *i };
         let (id, next) = uint_until(b, at, b',');
         let (name_start, name_raw_len, name_len, next) = text_field(b, next);
         let (_, _, note_len, next) = text_field(b, next);
         let (region_id, next) = uint_until(b, next, b',');
-        let (cents, next) = amount(b, next);
+        // `-?[0-9]+\.[0-9]{2}` as integer cents (c-join.md:24, 37).
+        let negative = b[next] == b'-';
+        let (whole, next) = uint_until(b, next + negative as usize, b'.');
+        let cents = whole as i64 * 100 + ((b[next] - b'0') * 10 + (b[next + 1] - b'0')) as i64;
+        let (cents, next) = (if negative { -cents } else { cents }, next + 2);
         // Terminator: CRLF or LF (c-join.md:21), skipped without a branch: one byte, plus one for a CR.
         // At the end of a file without a final terminator this is one past the end, which ends the
         // range all the same. Measured (this VM, 12 workers, full seed 1, interleaved medians of 9):
@@ -146,16 +124,13 @@ pub fn parse_range<L: Lookup + ?Sized>(
 
         let group = lookup.group(region_id as usize);
         let s = &mut slots[group];
-        if s.count == 0 {
-            // min and max start from the slot's first amount, never from 0.
-            s.amount_min = cents;
-            s.amount_max = cents;
-        }
+        // min and max start from the slot's first amount, never from 0.
+        let first = s.count == 0;
         s.count += 1;
         s.id_sum += id;
         s.amount_sum += cents;
-        s.amount_min = s.amount_min.min(cents);
-        s.amount_max = s.amount_max.max(cents);
+        s.amount_min = if first { cents } else { s.amount_min.min(cents) };
+        s.amount_max = if first { cents } else { s.amount_max.max(cents) };
         s.name_bytes += name_len;
         s.note_bytes += note_len;
         records += 1;
@@ -164,4 +139,37 @@ pub fn parse_range<L: Lookup + ?Sized>(
         }
     }
     records
+}
+
+// Record-start cuts for N workers: records.csv is split into N equal byte ranges, and each range
+// after the first starts at its first record start, found by a short forward search — no parallel
+// scan of the file.
+
+/// Record starts for `workers` ranges: `starts[k]..starts[k + 1]` holds the records worker k parses,
+/// and `starts[workers]` is the end of the file. `first` is where the first record starts (past the
+/// header, which holds no quotes); a range with no record start gets no records.
+///
+/// e1: by the grammar (c-join.md:17-36) a record opens with a digit (the id) or a BOM right after
+/// its terminator (CRLF or LF, both ending in LF), and no quoted field ever holds an LF followed by
+/// a digit or BOM (names hold no LF at all, notes are lowercase words), so LF + digit/BOM marks a
+/// record start and each start is one short search from the range's offset instead of pass 1's full
+/// quote-parity scan of every byte. Pass 2 checks pairwise that every worker stopped exactly on its
+/// cut, and main reruns the whole file on one worker if not, so a wrong cut can never change the
+/// answer. Measured (this VM, full data, 12 workers, interleaved medians of 11, warm page cache):
+/// pass1 7.3 -> 0.1 ms, total 112.6 -> 109.4 ms.
+pub fn record_starts(b: &[u8], first: usize, workers: usize) -> Vec<usize> {
+    // Equal byte ranges: len / workers each (rounded up), the last one shorter.
+    let chunk = b.len().div_ceil(workers).max(1);
+    let mut starts = vec![b.len(); workers + 1];
+    starts[0] = first;
+    for k in 1..workers {
+        starts[k] = ((k * chunk).min(b.len())..b.len())
+            .find(|&p| b[p - 1] == b'\n' && (b[p].is_ascii_digit() || b[p..].starts_with(BOM)))
+            .unwrap_or(b.len());
+    }
+    // A range with no record start begins where the next one does.
+    for k in (0..workers).rev() {
+        starts[k] = starts[k].min(starts[k + 1]);
+    }
+    starts
 }
