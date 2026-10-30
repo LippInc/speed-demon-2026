@@ -280,13 +280,14 @@ fn tokenize_doc(data: &[u8], mut i: usize, dict: &Dict, mut on_token: impl FnMut
     i + 1
 }
 
-/// Document frequency of the query terms, estimated on about 1/SAMPLE_SHARE of the corpus read as whole lines from
-/// SAMPLE_WINDOWS evenly spaced windows. It only picks each query's trigger terms (BoolPlan), so a poor estimate
-/// can slow the pass down but never change an answer.
+/// Document frequency of the query terms, estimated on about 1/SAMPLE_SHARE of the corpus (about 1 %) read as whole
+/// lines from SAMPLE_WINDOWS evenly spaced windows; also returns how many docs it read. It only chooses an evaluation
+/// order (each query's trigger terms, and which queries take the window path; BoolPlan), so it cannot change an
+/// answer: a poor estimate can only slow the pass down. It is not a second pass.
 const SAMPLE_WINDOWS: usize = 64;
 const SAMPLE_SHARE: usize = 128;
 
-fn estimate_df(docs: &[u8], dict: &Dict) -> Vec<u32> {
+fn estimate_df(docs: &[u8], dict: &Dict) -> (Vec<u32>, u32) {
     let n_terms = dict.terms.len();
     let mut df = vec![0u32; n_terms];
     let mut seen = vec![0u32; n_terms];
@@ -312,7 +313,7 @@ fn estimate_df(docs: &[u8], dict: &Dict) -> Vec<u32> {
             });
         }
     }
-    df
+    (df, stamp)
 }
 
 /// BOOL queries evaluated per document inside the pass, so no posting list is ever stored (b-2 kept 47.6 MB of
@@ -329,6 +330,10 @@ const OP_NOT: u32 = 2;
 const MULTI: u32 = 1 << 31; // Trigger::query flag: the query has several triggers, so one doc can reach it twice
 const ALWAYS: u32 = 1 << 30; // Trigger::query flag: single term or OR only; 44 M of the 85 M seed-1 matches need no fold
 const FLAGS: u32 = MULTI | ALWAYS;
+/// A query whose cover is estimated to hold at least one doc in WINDOW_SHARE takes the window path (`fold_window`).
+/// Per doc, it would cost an evaluation, a count and a sum for each doc of its cover. Per window, it costs one
+/// word-wide fold of its terms' window bits. 1,042 seed-1 queries with |R| > N/16 held 66 M of the 85 M matches.
+const WINDOW_SHARE: u64 = 64;
 
 /// One query listed under one of its trigger terms, with its code inline so a doc's evaluations read the
 /// trigger list front to back instead of jumping to each query.
@@ -342,6 +347,12 @@ struct BoolPlan {
     query_of_slot: Vec<u32>, // accumulator slot -> distinct BOOL query
     trigger_start: Vec<u32>, // per term, into triggers (CSR, sized from the query terms)
     triggers: Vec<Trigger>,
+    // The window path: per term its index among the window terms (NIL if none); per window query its code over
+    // window-term indices (same layout as Trigger::code) and its accumulator slot.
+    window_term: Vec<u32>,
+    n_window_terms: usize,
+    window_code: Vec<[u32; MAX_BOOL_TERMS]>,
+    window_slot: Vec<u32>,
 }
 
 /// Trigger terms of a query: every doc in R contains one of them. {first} holds for R = S(first); OR adds its
@@ -361,29 +372,42 @@ fn cover(q: &BoolQuery, df: &[u32]) -> Vec<u32> {
 }
 
 impl BoolPlan {
-    fn new(queries: &[BoolQuery], n_terms: usize, df: &[u32]) -> Self {
+    fn new(queries: &[BoolQuery], n_terms: usize, df: &[u32], sampled_docs: u32) -> Self {
         assert!(n_terms < 1 << OP_SHIFT);
         let covers: Vec<Vec<u32>> = queries.iter().map(|q| cover(q, df)).collect();
+        let windowed: Vec<bool> = covers
+            .iter()
+            .map(|c| sampled_docs > 0 && c.iter().map(|&t| df[t as usize] as u64).sum::<u64>() * WINDOW_SHARE >= sampled_docs as u64)
+            .collect();
         let mut trigger_start = vec![0u32; n_terms + 1];
-        for &t in covers.iter().flatten() {
-            trigger_start[t as usize + 1] += 1;
+        for (cover, _) in covers.iter().zip(&windowed).filter(|(_, &w)| !w) {
+            for &t in cover {
+                trigger_start[t as usize + 1] += 1;
+            }
         }
         for t in 0..n_terms {
             trigger_start[t + 1] += trigger_start[t];
         }
         let mut fill = trigger_start.clone();
         let mut triggers = vec![Trigger { query: 0, code: [NIL; MAX_BOOL_TERMS] }; trigger_start[n_terms] as usize];
+        let mut window_term = vec![NIL; n_terms];
+        let mut n_window_terms = 0;
+        let mut window_code = Vec::new();
+        let mut window_queries = Vec::new();
         for (qi, (q, cover)) in queries.iter().zip(&covers).enumerate() {
-            let mut code = [NIL; MAX_BOOL_TERMS];
-            code[0] = q.first;
-            for (w, &(op, t)) in code[1..].iter_mut().zip(&q.rest) {
-                let op = match op {
-                    Op::And => OP_AND,
-                    Op::Or => OP_OR,
-                    Op::Not => OP_NOT,
+            if windowed[qi] {
+                let mut index = |t: u32| {
+                    if window_term[t as usize] == NIL {
+                        window_term[t as usize] = n_window_terms as u32;
+                        n_window_terms += 1;
+                    }
+                    window_term[t as usize]
                 };
-                *w = op << OP_SHIFT | t;
+                window_code.push(compile(q, &mut index));
+                window_queries.push(qi);
+                continue;
             }
+            let code = compile(q, &mut |t| t);
             // A query of OR operators only has all its terms as triggers, so being triggered is a match.
             let always = if q.rest.iter().all(|&(op, _)| matches!(op, Op::Or)) { ALWAYS } else { 0 };
             let query = qi as u32 | always | if cover.len() > 1 { MULTI } else { 0 };
@@ -404,13 +428,87 @@ impl BoolPlan {
             }
             trig.query = slot_of[q] | (trig.query & FLAGS);
         }
-        BoolPlan { query_of_slot, trigger_start, triggers }
+        let window_slot = window_queries
+            .iter()
+            .map(|&q| {
+                query_of_slot.push(q as u32);
+                query_of_slot.len() as u32 - 1
+            })
+            .collect();
+        BoolPlan { query_of_slot, trigger_start, triggers, window_term, n_window_terms, window_code, window_slot }
     }
 
     #[inline]
     fn triggered_by(&self, t: u32) -> &[Trigger] {
         &self.triggers[self.trigger_start[t as usize] as usize..self.trigger_start[t as usize + 1] as usize]
     }
+}
+
+/// A query's code: its first term, then op << OP_SHIFT | term per operator, NIL-padded; `term` maps each term id.
+fn compile(q: &BoolQuery, term: &mut impl FnMut(u32) -> u32) -> [u32; MAX_BOOL_TERMS] {
+    let mut code = [NIL; MAX_BOOL_TERMS];
+    code[0] = term(q.first);
+    for (w, &(op, t)) in code[1..].iter_mut().zip(&q.rest) {
+        let op = match op {
+            Op::And => OP_AND,
+            Op::Or => OP_OR,
+            Op::Not => OP_NOT,
+        };
+        *w = op << OP_SHIFT | term(t);
+    }
+    code
+}
+
+/// The same strict left fold as `holds`, over 64 docs at once: bit j of a window term's word says doc base + j
+/// contains it. AND, OR and NOT only combine bits that some term set, so docs missing from the range stay 0.
+#[inline]
+fn fold_window(code: &[u32; MAX_BOOL_TERMS], words: &[u64]) -> u64 {
+    let mut r = words[code[0] as usize];
+    for &w in &code[1..] {
+        if w == NIL {
+            break;
+        }
+        let b = words[(w & ((1 << OP_SHIFT) - 1)) as usize];
+        r = match w >> OP_SHIFT {
+            OP_AND => r & b,
+            OP_OR => r | b,
+            _ => r & !b,
+        };
+    }
+    r
+}
+
+/// Bit k of a bit position j, for every j at once: the sum of the set positions of w is
+/// sum over k of popcount(w & BIT_SLICES[k]) << k, so a window's id sum needs no walk over its matches.
+const BIT_SLICES: [u64; 6] = [
+    0xaaaa_aaaa_aaaa_aaaa,
+    0xcccc_cccc_cccc_cccc,
+    0xf0f0_f0f0_f0f0_f0f0,
+    0xff00_ff00_ff00_ff00,
+    0xffff_0000_ffff_0000,
+    0xffff_ffff_0000_0000,
+];
+
+/// Folds every window query over the window of docs base..base + 64 and clears the window bits.
+fn flush_window(plan: &BoolPlan, words: &mut [u64], base: u32, acc: &mut [BoolAcc], first_ids: &FirstIds) {
+    for (code, &slot) in plan.window_code.iter().zip(&plan.window_slot) {
+        let r = fold_window(code, words);
+        if r == 0 {
+            continue;
+        }
+        let slot = slot as usize;
+        let n = r.count_ones();
+        let offsets: u32 = BIT_SLICES.iter().enumerate().map(|(k, &m)| (r & m).count_ones() << k).sum();
+        acc[slot].count += n;
+        acc[slot].sum += base as u64 * n as u64 + offsets as u64;
+        // First ids only while this window can still hold one: the bound is NIL until ten are kept.
+        let mut bits = r;
+        while bits != 0 && base + bits.trailing_zeros() < first_ids.bound[slot].load(Ordering::Relaxed) {
+            first_ids.offer(slot, base + bits.trailing_zeros());
+            bits &= bits - 1;
+        }
+    }
+    words.fill(0);
 }
 
 /// spec 3: strict left fold, no precedence; `a OR b AND c` is `(a OR b) AND c` (b-index.md:136-141).
@@ -501,6 +599,9 @@ fn scan(data: &[u8], dict: &Dict, ac: &Automaton, n_patterns: usize, plan: &Bool
         matches: Vec::new(),
         evaluations: 0,
     };
+    // The window path's term bits for the current 64-doc window (doc ids id / 64 equal).
+    let mut window_words = vec![0u64; plan.n_window_terms];
+    let mut window = NIL;
     // The doc's query terms as a bitset (a few KB, so evaluations test it in L1), cleared after each doc from `hits`.
     let mut present = vec![0u64; dict.terms.len().div_ceil(64)];
     let mut hits: Vec<u32> = Vec::new(); // this doc's distinct query terms
@@ -509,6 +610,12 @@ fn scan(data: &[u8], dict: &Dict, ac: &Automaton, n_patterns: usize, plan: &Bool
     while i < data.len() {
         let (id, text) = parse_id(data, i);
         let stamp = id + 1;
+        if id / 64 != window {
+            if window != NIL {
+                flush_window(plan, &mut window_words, window * 64, &mut shard.bool_acc, first_ids);
+            }
+            window = id / 64;
+        }
         let mut state = 0u32; // a phrase never spans two documents
         i = tokenize_doc(data, text, dict, |hit| {
             let Some(t) = hit else {
@@ -519,6 +626,10 @@ fn scan(data: &[u8], dict: &Dict, ac: &Automaton, n_patterns: usize, plan: &Bool
             if present[w] & bit == 0 {
                 present[w] |= bit;
                 hits.push(t);
+                let wt = plan.window_term[t as usize];
+                if wt != NIL {
+                    window_words[wt as usize] |= 1 << (id % 64);
+                }
             }
             state = ac.step(state, t);
             let mut o = if ac.out[state as usize] != NIL { state } else { ac.dict_link[state as usize] };
@@ -554,6 +665,9 @@ fn scan(data: &[u8], dict: &Dict, ac: &Automaton, n_patterns: usize, plan: &Bool
             present[t as usize / 64] &= !(1 << (t % 64));
         }
         hits.clear();
+    }
+    if window != NIL {
+        flush_window(plan, &mut window_words, window * 64, &mut shard.bool_acc, first_ids);
     }
     shard
 }
@@ -650,7 +764,8 @@ fn main() {
     lap("queries");
 
     let docs = map_file(&format!("{data_dir}/docs.txt"));
-    let plan = BoolPlan::new(&bools, dict.terms.len(), &estimate_df(docs, &dict));
+    let (df, sampled_docs) = estimate_df(docs, &dict);
+    let plan = BoolPlan::new(&bools, dict.terms.len(), &df, sampled_docs);
     lap("sample");
 
     // The pass: one doc range per worker, cut at line starts.
@@ -663,7 +778,8 @@ fn main() {
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
     if phases {
-        eprintln!("(doc, query) BOOL evaluations: {}", shards.iter().map(|s| s.evaluations).sum::<u64>());
+        let evaluations: u64 = shards.iter().map(|s| s.evaluations).sum();
+        eprintln!("(doc, query) BOOL evaluations: {evaluations}; window queries: {}", plan.window_code.len());
     }
     lap("pass");
 
