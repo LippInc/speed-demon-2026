@@ -1,0 +1,113 @@
+//! Pass 2: every worker parses its own records into its own per-group slots and interns each name
+//! in the shared table. Each group's name bitset belongs to one worker (group % workers), which
+//! alone writes it, in bounded rounds: a worker buffers up to ROUND_PAIRS (group, id) pairs, all
+//! workers meet at a barrier, each sets the bits of the groups it owns from every worker's buffer,
+//! they meet again, and the next round starts with empty buffers. Name memory is the intern table,
+//! the bitsets and workers x ROUND_PAIRS pairs, never a function of the record count.
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Barrier, RwLock};
+use std::time::{Duration, Instant};
+
+use crate::names::{Intern, NameSet};
+use crate::records::{Slot, parse_range};
+use crate::regions::Lookup;
+
+/// Pairs one worker buffers per round (8 B each, so 128 KiB a worker).
+const ROUND_PAIRS: usize = 16 * 1024;
+
+/// What pass 2 returns.
+pub struct Pass2 {
+    /// Per worker, its per-group slots.
+    pub slots: Vec<Vec<Slot>>,
+    /// names_distinct per group.
+    pub distinct: Vec<u64>,
+    pub records: u64,
+    /// Per worker, the time until its range was parsed.
+    pub times: Vec<Duration>,
+    pub rounds: usize,
+}
+
+/// One worker's result.
+struct Worker {
+    slots: Vec<Slot>,
+    owned: Vec<NameSet>,
+    records: u64,
+    time: Duration,
+    rounds: usize,
+}
+
+/// Runs pass 2 on one worker per `starts` window: worker k parses the records starting in
+/// `starts[k]..starts[k + 1]`.
+pub fn run<L: Lookup + ?Sized + Sync>(b: &[u8], starts: &[usize], lookup: &L, groups: usize, intern: &Intern) -> Pass2 {
+    let workers = starts.len() - 1;
+    let buffers: Vec<RwLock<Vec<(u32, u32)>>> =
+        (0..workers).map(|_| RwLock::new(Vec::with_capacity(ROUND_PAIRS))).collect();
+    let barrier = Barrier::new(workers);
+    let finished = AtomicUsize::new(0);
+
+    let results: Vec<Worker> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..workers)
+            .map(|w| {
+                let (buffers, barrier, finished) = (&buffers, &barrier, &finished);
+                s.spawn(move || {
+                    let t = Instant::now();
+                    let mut me = Worker {
+                        slots: vec![Slot::default(); groups],
+                        owned: (w..groups).step_by(workers).map(|_| NameSet::default()).collect(),
+                        records: 0,
+                        time: Duration::ZERO,
+                        rounds: 0,
+                    };
+                    let (mut i, end) = (starts[w], starts[w + 1]);
+                    let mut done = false;
+                    loop {
+                        // Between the previous round's second barrier and this round's first, only
+                        // the owner touches its buffer.
+                        {
+                            let mut buf = buffers[w].write().unwrap();
+                            buf.clear();
+                            if !done {
+                                me.records += parse_range(b, &mut i, end, lookup, &mut me.slots, |g, start, len| {
+                                    buf.push((g as u32, intern.id(b, start, len)));
+                                    buf.len() < ROUND_PAIRS
+                                });
+                                if i >= end {
+                                    done = true;
+                                    me.time = t.elapsed();
+                                    finished.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        barrier.wait();
+                        // Every worker that finishes did so before this barrier, and none can
+                        // finish again before the next one, so all workers read the same value.
+                        let all_done = finished.load(Ordering::Relaxed) == workers;
+                        for buf in buffers {
+                            for &(g, id) in buf.read().unwrap().iter() {
+                                if g as usize % workers == w {
+                                    me.owned[g as usize / workers].insert(id);
+                                }
+                            }
+                        }
+                        me.rounds += 1;
+                        barrier.wait();
+                        if all_done {
+                            break me;
+                        }
+                    }
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("parse worker panicked")).collect()
+    });
+
+    let distinct = (0..groups).map(|g| results[g % workers].owned[g / workers].len()).collect();
+    Pass2 {
+        records: results.iter().map(|r| r.records).sum(),
+        times: results.iter().map(|r| r.time).collect(),
+        rounds: results[0].rounds,
+        slots: results.into_iter().map(|r| r.slots).collect(),
+        distinct,
+    }
+}

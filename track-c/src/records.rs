@@ -1,33 +1,51 @@
-//! records.csv: one sequential pass over the grammar of c-join.md:17-30, folding each record into
-//! its group's aggregates as it is parsed.
+//! records.csv: the grammar of c-join.md:17-30, parsed one byte range per worker. Each record folds
+//! into the worker's own per-group slot, and its name is handed to the caller (pass2.rs).
 
-use crate::names::{NameIds, NameSet};
 use crate::regions::Lookup;
 
 const BOM: &[u8] = b"\xEF\xBB\xBF";
 
-/// Running aggregates of one output line (c-join.md:109-118).
-#[derive(Default)]
-pub struct Group {
+/// One worker's running aggregates of one output line (c-join.md:109-118), names_distinct aside.
+#[derive(Default, Clone)]
+pub struct Slot {
     pub count: u64,
     pub id_sum: u64,
     pub amount_sum: i64,
     pub amount_min: i64,
     pub amount_max: i64,
-    pub names: NameSet,
     pub name_bytes: u64,
     pub note_bytes: u64,
 }
 
+impl Slot {
+    /// Folds another worker's slot for the same group into this one.
+    pub fn merge(&mut self, other: &Slot) {
+        if other.count == 0 {
+            return;
+        }
+        if self.count == 0 {
+            *self = other.clone();
+            return;
+        }
+        self.count += other.count;
+        self.id_sum += other.id_sum;
+        self.amount_sum += other.amount_sum;
+        self.amount_min = self.amount_min.min(other.amount_min);
+        self.amount_max = self.amount_max.max(other.amount_max);
+        self.name_bytes += other.name_bytes;
+        self.note_bytes += other.note_bytes;
+    }
+}
+
 /// One text field (name or note) starting at `i`, which is followed by a comma.
-/// Returns the raw bytes between the quotes (escapes kept), the value's length once `""` is
-/// unescaped, and the index just past the comma.
+/// Returns where the raw bytes between the quotes start and how many there are (escapes kept),
+/// the value's length once `""` is unescaped, and the index just past the comma.
 #[inline]
-fn text_field(b: &'static [u8], i: usize) -> (&'static [u8], u64, usize) {
+fn text_field(b: &[u8], i: usize) -> (usize, usize, u64, usize) {
     if b[i] != b'"' {
         // Unquoted: everything up to the comma (c-join.md:28).
         let end = i + b[i..].iter().position(|&c| c == b',').expect("unterminated field");
-        return (&b[i..end], (end - i) as u64, end + 1);
+        return (i, end - i, (end - i) as u64, end + 1);
     }
     // Quoted: ends at the first `"` not part of a `""` pair (c-join.md:33). Commas, LF and BOM
     // bytes inside are data, so they never stop the scan.
@@ -40,7 +58,7 @@ fn text_field(b: &'static [u8], i: usize) -> (&'static [u8], u64, usize) {
             escapes += 1;
             j = q + 2;
         } else {
-            return (&b[start..q], (q - start) as u64 - escapes, q + 2);
+            return (start, q - start, (q - start) as u64 - escapes, q + 2);
         }
     }
 }
@@ -66,46 +84,63 @@ fn amount(b: &[u8], i: usize) -> (i64, usize) {
 }
 
 #[inline]
-fn skip_bom(b: &[u8], i: usize) -> usize {
+pub fn skip_bom(b: &[u8], i: usize) -> usize {
     if b[i..].starts_with(BOM) { i + BOM.len() } else { i }
 }
 
-/// Parses every record of `b` into `groups` (indexed by the lookup's group); returns the record count.
-pub fn parse<L: Lookup + ?Sized>(b: &'static [u8], lookup: &L, groups: &mut [Group], names: &mut NameIds) -> u64 {
-    // A BOM may start the file; the header holds no quotes and ends at the first LF (c-join.md:18-19, 43).
-    let mut i = skip_bom(b, 0);
-    i += b[i..].iter().position(|&c| c == b'\n').map_or(b.len() - i, |p| p + 1);
+/// Index just past the header: a BOM may start the file, and the header holds no quotes and ends
+/// at the first LF (c-join.md:18-19, 43).
+pub fn header_end(b: &[u8]) -> usize {
+    let i = skip_bom(b, 0);
+    i + b[i..].iter().position(|&c| c == b'\n').map_or(b.len() - i, |p| p + 1)
+}
+
+/// Parses the records that start in `*i..end` (`*i` is a record start; the last record may run past
+/// `end`) into `slots`, indexed by the lookup's group, and calls `on_name(group, raw_start, raw_len)`
+/// with each record's raw name. Stops after a record whose `on_name` returns false, leaving `*i` at
+/// the next record start, so the caller can resume. Returns the records parsed.
+pub fn parse_range<L: Lookup + ?Sized>(
+    b: &[u8],
+    i: &mut usize,
+    end: usize,
+    lookup: &L,
+    slots: &mut [Slot],
+    mut on_name: impl FnMut(usize, usize, usize) -> bool,
+) -> u64 {
     let mut records = 0;
-    while i < b.len() {
+    while *i < end {
         // A BOM directly after a terminator is skipped (c-join.md:36).
-        i = skip_bom(b, i);
-        let (id, next) = uint_until(b, i, b',');
-        let (name, name_len, next) = text_field(b, next);
-        let (_, note_len, next) = text_field(b, next);
+        let at = skip_bom(b, *i);
+        let (id, next) = uint_until(b, at, b',');
+        let (name_start, name_raw_len, name_len, next) = text_field(b, next);
+        let (_, _, note_len, next) = text_field(b, next);
         let (region_id, next) = uint_until(b, next, b',');
         let (cents, next) = amount(b, next);
         // Terminator: CRLF, LF, or end of file (c-join.md:21).
-        i = match b.get(next) {
+        *i = match b.get(next) {
             Some(b'\r') => next + 2,
             Some(b'\n') => next + 1,
             _ => next,
         };
 
-        let g = &mut groups[lookup.group(region_id as usize)];
-        if g.count == 0 {
-            // min and max start from the group's first amount, never from 0.
-            g.amount_min = cents;
-            g.amount_max = cents;
+        let group = lookup.group(region_id as usize);
+        let s = &mut slots[group];
+        if s.count == 0 {
+            // min and max start from the slot's first amount, never from 0.
+            s.amount_min = cents;
+            s.amount_max = cents;
         }
-        g.count += 1;
-        g.id_sum += id;
-        g.amount_sum += cents;
-        g.amount_min = g.amount_min.min(cents);
-        g.amount_max = g.amount_max.max(cents);
-        g.names.insert(names.id(name));
-        g.name_bytes += name_len;
-        g.note_bytes += note_len;
+        s.count += 1;
+        s.id_sum += id;
+        s.amount_sum += cents;
+        s.amount_min = s.amount_min.min(cents);
+        s.amount_max = s.amount_max.max(cents);
+        s.name_bytes += name_len;
+        s.note_bytes += note_len;
         records += 1;
+        if !on_name(group, name_start, name_raw_len) {
+            break;
+        }
     }
     records
 }
