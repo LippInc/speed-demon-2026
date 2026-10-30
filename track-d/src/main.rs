@@ -6,6 +6,7 @@
 //! source with no out-edges), then a bidirectional Dijkstra per query on a worker thread, with
 //! per-thread scratch sized by the search, not by n.
 
+use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
 use std::ffi::c_void;
 use std::fs::File;
 use std::os::fd::AsRawFd;
@@ -453,6 +454,14 @@ impl Scratch {
 /// mu is the best s-t path seen so far, updated on every relaxation that labels a node the other side
 /// has labelled (zero-weight edges make "the frontiers met" too early a stop). Stop once the two heap
 /// tops sum to mu or more, or either side runs dry. Returns the distance and the number of settles.
+/// Pops ahead whose CSR rows are prefetched (a design constant). The CSRs (94 MB) are four times the
+/// box's L3, so a settle's edge row is a DRAM miss; the next pops of this side sit at the end of
+/// radix bucket 0, so their rows can load while u is relaxed. Measured locally (full seed 1,
+/// interleaved with d-8, query phase medians): 875 -> 564 ms at 12 workers, 795 -> 490 ms at 4.
+/// Distances 4 / 8 / 16 gave 569 / 564 / 565 ms at 12; prefetching only end[next] gave 725-739 ms,
+/// and prefetching each neighbour's label slot as well bought under 2 %, so neither is here.
+const PREFETCH_AHEAD: usize = 8;
+
 fn bidirectional(g: [&Csr; 2], sc: &mut Scratch, s: u32, t: u32) -> (u64, u64) {
     sc.reset();
     for (side, root) in [(0, s), (1, t)] {
@@ -483,6 +492,11 @@ fn bidirectional(g: [&Csr; 2], sc: &mut Scratch, s: u32, t: u32) -> (u64, u64) {
             continue; // stale: u was relabelled lower after this entry was pushed
         }
         settles += 1;
+        // The next pops of this side are the last entries of bucket 0 (it pops from its end).
+        for e in sc.heaps[side].buckets[0].iter().rev().take(PREFETCH_AHEAD) {
+            let row = g[side].edges.as_ptr().wrapping_add(g[side].start(e.node as usize));
+            unsafe { _mm_prefetch(row as *const i8, _MM_HINT_T0) }; // a hint: never faults
+        }
         for &e in g[side].adj(u as usize) {
             let (v, nd) = (e as u32, d + (e >> 32));
             let iv = sc.slot(v);

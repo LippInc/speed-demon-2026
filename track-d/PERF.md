@@ -24,8 +24,14 @@ Every step from the reference to your final version, each with the live-board ru
 - Monotone radix heap for both search sides, replacing the binary heaps (commit 82a7e0e, branch exp/d-5-radix). Verdict: kept. Board run 5263115 · Track D (run-f1748b5f56b9), row 9.
 - Label-map locality: every query starts in a small L2-sized label table of shared 20-byte labels and moves to a large table only when it outgrows it (commit 3ce5d27, branch exp/d-6-labels). Verdict: kept. Its board row comes later, so no number here.
 
+- Graph build without atomics, written compactly (commit dc9a503, branch exp/d-8-compact): the d-7 build with one placement routine shared by the forward CSR and both reverse slabs, and one thread helper. Verdict: kept; bench K 14.49. Its board row comes later, so no time or memory number here.
+
+- Prefetch of the CSR rows of the next pops in the query loop (commit 40418c5, branch exp/d-10-relax): on each settle, the edge rows of the next eight entries this side will pop start loading before the current node is relaxed. Verdict: kept; bench K 15.84. Its board row comes later, so no time or memory number here.
+
 ## Failed experiments
 
+- Push pruning in the query loop (not committed, branch exp/d-10-relax): skip a heap push when the new distance plus the other side's minimum already reaches the best path found. Exact, and it cut pushes on full seed 1 by about a twentieth, but the local query time did not move, so it stayed off the branch.
+- Release of a big label table after its query, with glibc's mmap threshold pinned (commit 223e5ac, branch exp/d-9-scratch). Verdict: dropped. Regrowing the big tables cost time and the bench box's memory did not fall; bench K 13.91. No board run, so no number here.
 - Graph build without atomics, as first written (commit 8a68049, branch exp/d-7-build): parse into per-thread buckets by tail partition, then per-partition local degree count, prefix sum and scatter, reverse CSR from the forward one in two slabs. Verdict: noise on K. It was faster on the bench box, but it added 111 code lines, which cost about as much; bench K 14.12. Rewritten compactly as d-8. No board run, so no time or memory number here.
 - Forward-only early-exit Dijkstra, no reverse CSR (commit 15c71b6, branch exp/d-2b-fwd). Verdict: slower than the bidirectional floor on the bench box, so bidirectional stays (plan D2). No board run yet, so no number here.
 - BFS locality relabel of both CSRs before the queries (commit acd7dc4, branch exp/d-3-relabel). It halves the local query phase, but the sequential BFS and the rebuild cost more than that saves on the bench box: slower than the floor there, so it is dropped (plan D3). No board run yet, so no number here.
