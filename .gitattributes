@@ -1,0 +1,5 @@
+# scripts/kickoff.sh: LF line ends in the repo and in every checkout (R-repo-hygiene); the lines below override it
+* text=auto eol=lf
+# scripts/kickoff.sh: vendored files keep their exact bytes whatever core.autocrlf says (cargo checks them against .cargo-checksum.json)
+vendor/** -text
+**/vendor/** -text

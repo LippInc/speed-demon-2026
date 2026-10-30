@@ -1,5 +1,12 @@
 # Speed Demon 2026 starter
 
+## Tracks in this entry
+
+- Track A: [track-a/](track-a/README.md)
+- Track B: [track-b/](track-b/README.md)
+- Track C: [track-c/](track-c/README.md)
+- Track D: [track-d/](track-d/README.md)
+
 A working entry for all four tracks of [Speed Demon 2026](https://speeddemon.dev). Each `track-*` folder holds the organisers' naive Python reference, packaged the way the live board builds and runs it. Use it to check your setup end to end, then replace the reference with your own code.
 
 ## Start in five steps
