@@ -781,12 +781,27 @@ fn main() {
         }
     }
     let n_terms = dict.terms.len();
-    let mut terms = TermTable::new(&dict);
-    drop(dict);
     lap("queries");
 
     let docs = map_file(&format!("{data_dir}/docs.txt"));
-    let (df, sampled_docs) = estimate_df(docs, &terms);
+    let (df, sampled_docs) = estimate_df(docs, &TermTable::new(&dict));
+    // Renumber the terms by descending sampled df, so the terms most tokens hit have neighbouring ids and their
+    // per-term entries, roles and bits share a few hundred KB of cache lines. Only speed depends on the order.
+    let mut order: Vec<usize> = (0..n_terms).collect();
+    order.sort_by_key(|&t| std::cmp::Reverse(df[t]));
+    let mut new_id = vec![0u32; n_terms];
+    for (new, &old) in order.iter().enumerate() {
+        new_id[old] = new as u32;
+    }
+    (dict.terms, dict.hashes) = order.iter().map(|&t| (dict.terms[t], dict.hashes[t])).unzip();
+    let df: Vec<u32> = order.iter().map(|&t| df[t]).collect();
+    for q in &mut bools {
+        q.first = new_id[q.first as usize];
+        q.rest.iter_mut().for_each(|(_, t)| *t = new_id[*t as usize]);
+    }
+    patterns.iter_mut().flatten().for_each(|t| *t = new_id[*t as usize]);
+    let mut terms = TermTable::new(&dict);
+    drop(dict);
     let plan = BoolPlan::new(&bools, n_terms, &df, sampled_docs);
     terms.set_roles(&plan);
     let phrases = PhrasePlan::new(&patterns, n_terms, &df);
