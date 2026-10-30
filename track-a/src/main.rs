@@ -1,8 +1,11 @@
 //! Track A: per (hour, endpoint) request count, nearest-rank p50/p95/p99 latency and 5xx rate.
-//! One pass over an mmap of /data/requests.log, split into byte ranges, one private table per thread.
+//! One pass over an mmap of /data/requests.log, split into byte ranges, one private table per thread;
+//! the merge, percentile selection and formatting then run in parallel, one hour per task.
 
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::Write;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::os::fd::AsRawFd;
 use std::thread;
 
@@ -235,59 +238,115 @@ fn push_hour(out: &mut Vec<u8>, hour: u32) {
     out.extend_from_slice(b":00:00Z");
 }
 
-/// Spec 3.4 nearest rank: the value at 1-indexed rank ceil(p * n / 100) of the sorted latencies.
-fn percentile(sorted: &[u32], p: u64) -> u64 {
-    let rank = (p * sorted.len() as u64 + 99) / 100;
-    sorted[rank as usize - 1] as u64
+/// Exact nearest-rank p50, p95, p99 of an unsorted slice by selection, which is linear where a full sort is not.
+fn percentiles(lat: &mut [u32]) -> [u32; 3] {
+    // Spec 3.4: 0-based index of rank ceil(p * n / 100).
+    let idx = |p: usize| (p * lat.len() + 99) / 100 - 1;
+    let (i50, i95, i99) = (idx(50), idx(95), idx(99));
+    // Select the highest rank first: everything left of it is no larger, so each lower rank is selected
+    // within the left part only.
+    let (_, &mut v99, _) = lat.select_nth_unstable(i99);
+    let (_, &mut v95, _) = lat[..=i99].select_nth_unstable(i95);
+    let (_, &mut v50, _) = lat[..=i95].select_nth_unstable(i50);
+    [v50, v95, v99]
+}
+
+/// Merges every thread's groups of one hour and formats their output lines, in endpoint order (spec 4).
+/// Each thread's groups are sorted by (hour, endpoint), so the hour is one contiguous run in each of them.
+fn format_hour(tables: &[Vec<Group>], hour: u32, scratch: &mut Vec<u32>) -> Vec<u8> {
+    let mut refs: Vec<&Group> = tables
+        .iter()
+        .flat_map(|gs| &gs[gs.partition_point(|g| g.hour < hour)..gs.partition_point(|g| g.hour <= hour)])
+        .collect();
+    refs.sort_unstable_by(|x, y| x.ep.cmp(y.ep));
+    let mut hour_text = Vec::with_capacity(20);
+    push_hour(&mut hour_text, hour);
+    let mut buf = Vec::new();
+    for run in refs.chunk_by(|x, y| x.ep == y.ep) {
+        scratch.clear();
+        let mut errors = 0u64;
+        for g in run {
+            scratch.extend_from_slice(&g.latencies);
+            errors += g.errors;
+        }
+        let count = scratch.len() as u64;
+        let [p50, p95, p99] = percentiles(scratch);
+        buf.extend_from_slice(&hour_text);
+        buf.push(b' ');
+        buf.extend_from_slice(run[0].ep);
+        // Spec 3.6: error_ppm = floor(errors * 1000000 / count), in 64 bits.
+        for v in [count, p50 as u64, p95 as u64, p99 as u64, errors, errors * 1_000_000 / count] {
+            buf.push(b' ');
+            push_u64(&mut buf, v);
+        }
+        buf.push(b'\n');
+    }
+    buf
 }
 
 fn main() {
     let file = File::open(INPUT).expect("open input");
     let len = file.metadata().expect("stat input").len() as usize;
-    let mut out = BufWriter::with_capacity(1 << 16, File::create(OUTPUT).expect("create output"));
+    let mut out = File::create(OUTPUT).expect("create output");
     if len == 0 {
         // Spec 3.7: an empty log gives an empty summary.
         return;
     }
     let data = map_file(&file, len);
 
-    let ranges = line_ranges(data, worker_count());
-    let per_thread: Vec<Vec<Group>> = thread::scope(|s| {
-        let handles: Vec<_> = ranges.iter().map(|&(a, b)| s.spawn(move || scan(data, a, b))).collect();
+    let workers = worker_count();
+    let ranges = line_ranges(data, workers);
+    let tables: Vec<Vec<Group>> = thread::scope(|s| {
+        let handles: Vec<_> = ranges
+            .iter()
+            .map(|&(a, b)| {
+                s.spawn(move || {
+                    // Sorted here, in parallel, so the tail finds each hour as one run per thread.
+                    let mut groups = scan(data, a, b);
+                    groups.sort_unstable_by(|x, y| (x.hour, x.ep).cmp(&(y.hour, y.ep)));
+                    groups
+                })
+            })
+            .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    // Merge: sort every thread's groups by the output order (spec 4), then fold equal keys together.
-    let mut all: Vec<Group> = per_thread.into_iter().flatten().collect();
-    all.sort_unstable_by(|x, y| (x.hour, x.ep).cmp(&(y.hour, y.ep)));
+    // The tail is split by hour: hours are disjoint parts of the key space that are also contiguous in the
+    // output, so each part is merged, selected and formatted by one thread with no locks, and the parts are
+    // written in order. The hours come from the input itself.
+    let mut hours: Vec<u32> =
+        tables.iter().flat_map(|gs| gs.chunk_by(|x, y| x.hour == y.hour).map(|run| run[0].hour)).collect();
+    hours.sort_unstable();
+    hours.dedup();
 
-    let mut line = Vec::with_capacity(256);
-    let mut it = all.into_iter().peekable();
-    while let Some(mut g) = it.next() {
-        while let Some(next) = it.next_if(|n| n.hour == g.hour && n.ep == g.ep) {
-            g.latencies.extend_from_slice(&next.latencies);
-            g.errors += next.errors;
+    // Threads take the next hour from a shared counter, so uneven hours still balance.
+    let next = AtomicUsize::new(0);
+    let (tx, rx) = mpsc::channel::<(usize, Vec<u8>)>();
+    thread::scope(|s| {
+        for _ in 0..workers {
+            let (tables, hours, next, tx) = (&tables, &hours, &next, tx.clone());
+            s.spawn(move || {
+                let mut scratch = Vec::new();
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= hours.len() {
+                        break;
+                    }
+                    tx.send((i, format_hour(tables, hours[i], &mut scratch))).unwrap();
+                }
+            });
         }
-        g.latencies.sort_unstable();
-        let count = g.latencies.len() as u64;
-        line.clear();
-        push_hour(&mut line, g.hour);
-        line.push(b' ');
-        line.extend_from_slice(g.ep);
-        for v in [
-            count,
-            percentile(&g.latencies, 50),
-            percentile(&g.latencies, 95),
-            percentile(&g.latencies, 99),
-            g.errors,
-            // Spec 3.6: floor(errors * 1000000 / count), in 64 bits.
-            g.errors * 1_000_000 / count,
-        ] {
-            line.push(b' ');
-            push_u64(&mut line, v);
+        drop(tx);
+        // Write each hour's buffer as soon as every earlier hour is written, overlapping the write with the
+        // remaining work and freeing buffers early.
+        let mut pending: Vec<Option<Vec<u8>>> = vec![None; hours.len()];
+        let mut written = 0;
+        for (i, buf) in rx {
+            pending[i] = Some(buf);
+            while let Some(buf) = pending.get_mut(written).and_then(Option::take) {
+                out.write_all(&buf).expect("write output");
+                written += 1;
+            }
         }
-        line.push(b'\n');
-        out.write_all(&line).expect("write output");
-    }
-    out.flush().expect("flush output");
+    });
 }
