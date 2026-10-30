@@ -9,7 +9,8 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs::File;
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Mutex;
 use std::time::Instant;
 
 const NIL: u32 = u32::MAX;
@@ -240,155 +241,242 @@ impl Automaton {
     }
 }
 
-/// Posting storage of one worker. A list is a chain of blocks that doubles from 8 B up to 256 B, so slack is
-/// bounded by the last block and nothing is copied to grow it (b-1's 16 B..4 KB in 4x steps with an 8 B header
-/// allocated 54-79 MB for 29.4 MB of varints). Each size class bumps through its own slabs, so a block is aligned
-/// to its size and its start and end follow from any position inside it plus the slab's class: the only header is
-/// the 4 B link to the previous block. Blocks hold LEB128 varints of doc-id gaps; a gap is at least 1, so no
-/// varint byte is 0, and the zero bytes left at the end of a block (fresh slabs are zeroed) mark where it stops.
-const SLAB_BITS: u32 = 14;
-const SLAB: usize = 1 << SLAB_BITS; // small, so the half-used slab each of the six classes keeps open stays cheap
-const LINK: usize = 4; // previous block's start, NIL for the first block
-const CLASS_SIZE: [usize; 6] = [8, 16, 32, 64, 128, 256];
-
-struct Arena {
-    slabs: Vec<Box<[u8]>>,
-    slab_class: Vec<u8>,
-    open: [(u32, usize); CLASS_SIZE.len()], // per class: slab being filled (NIL = none) and bytes used in it
+/// Reads the decimal doc id that starts the line at `i` (spec 2.1); returns it and the index just past its TAB.
+#[inline]
+fn parse_id(data: &[u8], mut i: usize) -> (u32, usize) {
+    let mut id = 0u32;
+    while i < data.len() && data[i] != b'\t' {
+        id = id * 10 + (data[i] - b'0') as u32;
+        i += 1;
+    }
+    (id, i + 1)
 }
 
-impl Arena {
-    fn new() -> Self {
-        Arena { slabs: Vec::new(), slab_class: Vec::new(), open: [(NIL, 0); CLASS_SIZE.len()] }
-    }
-
-    #[inline]
-    fn class_of(&self, pos: u32) -> usize {
-        self.slab_class[(pos >> SLAB_BITS) as usize] as usize
-    }
-
-    #[inline]
-    fn bytes(&self, pos: u32, len: usize) -> &[u8] {
-        let off = (pos as usize) & (SLAB - 1);
-        &self.slabs[(pos >> SLAB_BITS) as usize][off..off + len]
-    }
-
-    #[inline]
-    fn bytes_mut(&mut self, pos: u32, len: usize) -> &mut [u8] {
-        let off = (pos as usize) & (SLAB - 1);
-        &mut self.slabs[(pos >> SLAB_BITS) as usize][off..off + len]
-    }
-
-    /// Start of the block that holds `pos`: blocks are aligned to their size.
-    #[inline]
-    fn block_start(&self, pos: u32) -> (u32, usize) {
-        let size = CLASS_SIZE[self.class_of(pos)];
-        (pos & !(size as u32 - 1), size)
-    }
-
-    /// Opens a block of `class` linked back to `prev`; returns the write cursor just after the link.
-    fn new_block(&mut self, class: usize, prev: u32) -> u32 {
-        let size = CLASS_SIZE[class];
-        let (mut slab, mut used) = self.open[class];
-        if slab == NIL || used + size > SLAB {
-            slab = self.slabs.len() as u32;
-            used = 0;
-            self.slabs.push(vec![0u8; SLAB].into_boxed_slice());
-            self.slab_class.push(class as u8);
-        }
-        self.open[class] = (slab, used + size);
-        let pos = slab << SLAB_BITS | used as u32;
-        self.bytes_mut(pos, LINK).copy_from_slice(&prev.to_le_bytes());
-        pos + LINK as u32
-    }
-}
-
-/// One worker's pass over its doc range: postings of every query term and the phrase matches.
-/// The per-term state is two dense u32 (8 B per term and worker, b-1 had 12 B): a sparse table would save
-/// little, since 728,779 of the 12 x 75,747 (term, worker) pairs are non-empty on seed 1 full (80 %).
-struct Shard {
-    arena: Arena,
-    cursor: Vec<u32>, // per term: write position in its tail block, 0 = no list (a cursor is never a block start)
-    last: Vec<u32>,   // per term: last doc id + 1, initially `base`, so the first gap is small too
-    base: u32,        // first doc id of this range
-    matches: Vec<(u32, u32)>, // (pattern, doc), docs ascending
-    docs_end: u32,            // one past the largest doc id seen
-}
-
-impl Shard {
-    #[inline]
-    fn push(&mut self, t: u32, doc: u32) {
-        let t = t as usize;
-        if self.last[t] == doc + 1 {
-            return; // documents are counted, not occurrences
-        }
-        let mut gap = doc + 1 - self.last[t];
-        self.last[t] = doc + 1;
-        let mut buf = [0u8; 5];
-        let mut n = 0;
-        while gap >= 0x80 {
-            buf[n] = gap as u8 | 0x80;
-            gap >>= 7;
-            n += 1;
-        }
-        buf[n] = gap as u8;
-        n += 1;
-
-        let mut c = self.cursor[t];
+/// Tokenizes the doc text from `i` to its LF (spec 2.2), calling `on_token` with the term id of each token that is
+/// a query term and None for any other token; returns the index just past the LF.
+#[inline(always)]
+fn tokenize_doc(data: &[u8], mut i: usize, dict: &Dict, mut on_token: impl FnMut(Option<u32>)) -> usize {
+    let end = data.len();
+    let mut token = [0u8; MAX_TERM];
+    while i < end && data[i] != b'\n' {
+        let mut c = FOLD[data[i] as usize];
         if c == 0 {
-            c = self.arena.new_block(0, NIL);
-        } else {
-            // c - 1 is the last byte written, inside the tail block even when that block is full.
-            let (start, size) = self.arena.block_start(c - 1);
-            if c as usize + n > start as usize + size {
-                // A varint never straddles two blocks, so a block decodes on its own.
-                let class = (self.arena.class_of(start) + 1).min(CLASS_SIZE.len() - 1);
-                c = self.arena.new_block(class, start);
+            i += 1;
+            continue;
+        }
+        let mut h = FNV_OFFSET;
+        let mut n = 0;
+        while c != 0 {
+            if n < MAX_TERM {
+                token[n] = c;
+            }
+            n += 1;
+            h = fnv_step(h, c);
+            i += 1;
+            c = if i < end { FOLD[data[i] as usize] } else { 0 };
+        }
+        on_token(if n <= MAX_TERM { dict.find(&token[..n], h) } else { None });
+    }
+    i + 1
+}
+
+/// Document frequency of the query terms, estimated on about 1/SAMPLE_SHARE of the corpus read as whole lines from
+/// SAMPLE_WINDOWS evenly spaced windows. It only picks each query's trigger terms (BoolPlan), so a poor estimate
+/// can slow the pass down but never change an answer.
+const SAMPLE_WINDOWS: usize = 64;
+const SAMPLE_SHARE: usize = 128;
+
+fn estimate_df(docs: &[u8], dict: &Dict) -> Vec<u32> {
+    let n_terms = dict.terms.len();
+    let mut df = vec![0u32; n_terms];
+    let mut seen = vec![0u32; n_terms];
+    let mut stamp = 0u32;
+    let window = docs.len() / SAMPLE_SHARE / SAMPLE_WINDOWS;
+    for k in 0..SAMPLE_WINDOWS {
+        let from = docs.len() * k / SAMPLE_WINDOWS;
+        let mut i = match docs[from..].iter().position(|&b| b == b'\n') {
+            _ if from == 0 => 0,
+            Some(p) => from + p + 1,
+            None => continue,
+        };
+        let stop = (i + window).min(docs.len());
+        while i < stop {
+            stamp += 1;
+            i = tokenize_doc(docs, parse_id(docs, i).1, dict, |t| {
+                if let Some(t) = t {
+                    if seen[t as usize] != stamp {
+                        seen[t as usize] = stamp;
+                        df[t as usize] += 1;
+                    }
+                }
+            });
+        }
+    }
+    df
+}
+
+/// BOOL queries evaluated per document inside the pass, so no posting list is ever stored (b-2 kept 47.6 MB of
+/// blocks and 7.3 MB of heads for 29.2 MB of varints at 12 workers). Under the strict left fold (spec 3) a doc is
+/// in R exactly when the same fold over the booleans "the doc contains t" is true, so a query is decided per doc
+/// from which of its terms the doc contains. A query is only evaluated for the docs that contain one of its
+/// trigger terms, a cover such that every doc in R contains one of them (`cover`); every query has one, so the
+/// path is exact for every shape, NOT forms and absent terms included.
+const MAX_BOOL_TERMS: usize = 6; // spec 2.3: a BOOL query has 1 to 6 terms
+const OP_SHIFT: u32 = 30; // a code word is op << 30 | term id; term ids stay below 2^30 (asserted in BoolPlan::new)
+const OP_AND: u32 = 0;
+const OP_OR: u32 = 1;
+const OP_NOT: u32 = 2;
+const MULTI: u32 = 1 << 31; // Trigger::query flag: the query has several triggers, so one doc can reach it twice
+const ALWAYS: u32 = 1 << 30; // Trigger::query flag: single term or OR only; 44 M of the 85 M seed-1 matches need no fold
+const FLAGS: u32 = MULTI | ALWAYS;
+
+/// One query listed under one of its trigger terms, with its code inline so a doc's evaluations read the
+/// trigger list front to back instead of jumping to each query.
+#[derive(Clone, Copy)]
+struct Trigger {
+    query: u32,
+    code: [u32; MAX_BOOL_TERMS], // first term, then op << OP_SHIFT | term per operator, NIL-padded
+}
+
+struct BoolPlan {
+    query_of_slot: Vec<u32>, // accumulator slot -> distinct BOOL query
+    trigger_start: Vec<u32>, // per term, into triggers (CSR, sized from the query terms)
+    triggers: Vec<Trigger>,
+}
+
+/// Trigger terms of a query: every doc in R contains one of them. {first} holds for R = S(first); OR adds its
+/// operand; AND narrows R to S(t), so it may replace the cover by {t} when t is estimated rarer; NOT keeps it.
+fn cover(q: &BoolQuery, df: &[u32]) -> Vec<u32> {
+    let mut cover = vec![q.first];
+    for &(op, t) in &q.rest {
+        match op {
+            Op::Or => cover.push(t),
+            Op::And if (df[t as usize] as u64) < cover.iter().map(|&c| df[c as usize] as u64).sum() => cover = vec![t],
+            Op::And | Op::Not => {}
+        }
+    }
+    cover.sort_unstable();
+    cover.dedup();
+    cover
+}
+
+impl BoolPlan {
+    fn new(queries: &[BoolQuery], n_terms: usize, df: &[u32]) -> Self {
+        assert!(n_terms < 1 << OP_SHIFT);
+        let covers: Vec<Vec<u32>> = queries.iter().map(|q| cover(q, df)).collect();
+        let mut trigger_start = vec![0u32; n_terms + 1];
+        for &t in covers.iter().flatten() {
+            trigger_start[t as usize + 1] += 1;
+        }
+        for t in 0..n_terms {
+            trigger_start[t + 1] += trigger_start[t];
+        }
+        let mut fill = trigger_start.clone();
+        let mut triggers = vec![Trigger { query: 0, code: [NIL; MAX_BOOL_TERMS] }; trigger_start[n_terms] as usize];
+        for (qi, (q, cover)) in queries.iter().zip(&covers).enumerate() {
+            let mut code = [NIL; MAX_BOOL_TERMS];
+            code[0] = q.first;
+            for (w, &(op, t)) in code[1..].iter_mut().zip(&q.rest) {
+                let op = match op {
+                    Op::And => OP_AND,
+                    Op::Or => OP_OR,
+                    Op::Not => OP_NOT,
+                };
+                *w = op << OP_SHIFT | t;
+            }
+            // A query of OR operators only has all its terms as triggers, so being triggered is a match.
+            let always = if q.rest.iter().all(|&(op, _)| matches!(op, Op::Or)) { ALWAYS } else { 0 };
+            let query = qi as u32 | always | if cover.len() > 1 { MULTI } else { 0 };
+            for &t in cover {
+                triggers[fill[t as usize] as usize] = Trigger { query, code };
+                fill[t as usize] += 1;
             }
         }
-        self.arena.bytes_mut(c, n).copy_from_slice(&buf[..n]);
-        self.cursor[t] = c + n as u32;
+        // Renumber the queries in trigger-list order, so the queries one common term triggers have neighbouring
+        // accumulators: a doc's evaluations then update a few cache lines instead of one line per query.
+        let mut slot_of = vec![NIL; queries.len()];
+        let mut query_of_slot = Vec::with_capacity(queries.len());
+        for trig in &mut triggers {
+            let q = (trig.query & !FLAGS) as usize;
+            if slot_of[q] == NIL {
+                slot_of[q] = query_of_slot.len() as u32;
+                query_of_slot.push(q as u32);
+            }
+            trig.query = slot_of[q] | (trig.query & FLAGS);
+        }
+        BoolPlan { query_of_slot, trigger_start, triggers }
     }
 
-    fn for_each_doc(&self, t: u32, mut f: impl FnMut(u32)) {
-        let c = self.cursor[t as usize];
-        if c == 0 {
+    #[inline]
+    fn triggered_by(&self, t: u32) -> &[Trigger] {
+        &self.triggers[self.trigger_start[t as usize] as usize..self.trigger_start[t as usize + 1] as usize]
+    }
+}
+
+/// spec 3: strict left fold, no precedence; `a OR b AND c` is `(a OR b) AND c` (b-index.md:136-141).
+/// (A branch-free fold over all MAX_BOOL_TERMS words measured slower here: most queries have 2 or 3 terms.)
+#[inline]
+fn holds(code: &[u32; MAX_BOOL_TERMS], present: &[u64]) -> bool {
+    let has = |t: u32| present[t as usize / 64] >> (t % 64) & 1 != 0;
+    let mut r = has(code[0]);
+    for &w in &code[1..] {
+        if w == NIL {
+            break;
+        }
+        let t = w & ((1 << OP_SHIFT) - 1);
+        r = match w >> OP_SHIFT {
+            OP_AND => r && has(t),
+            OP_OR => r || has(t),
+            _ => r && !has(t),
+        };
+    }
+    r
+}
+
+/// Per worker and BOOL query: the evaluation stamp (read only for MULTI queries) and the running count and sum.
+#[derive(Clone, Copy, Default)]
+struct BoolAcc {
+    done: u32, // last doc id + 1 this query was evaluated for
+    count: u32,
+    sum: u64,
+}
+
+/// The FIRST_IDS smallest matching ids of every BOOL query, shared by all workers. Keeping them per worker held
+/// 1.42 M (slot, doc) entries (12.6 MB at 12 workers): every worker kept ten for each common query. `bound` is the
+/// largest id kept once ten are kept (NIL before), so a later, larger id is rejected by one relaxed load and only a
+/// candidate takes the lock; a stale bound only sends a few more ids to the lock, which checks again.
+struct FirstIds {
+    bound: Vec<AtomicU32>,
+    kept: Vec<Mutex<Vec<u32>>>,
+}
+
+impl FirstIds {
+    fn new(n: usize) -> Self {
+        FirstIds { bound: (0..n).map(|_| AtomicU32::new(NIL)).collect(), kept: (0..n).map(|_| Mutex::new(Vec::new())).collect() }
+    }
+
+    #[inline]
+    fn offer(&self, slot: usize, id: u32) {
+        if id >= self.bound[slot].load(Ordering::Relaxed) {
             return;
         }
-        // Links run tail to head, so collect the chain first and decode it head first.
-        let mut chain = Vec::new();
-        let mut start = self.arena.block_start(c - 1).0;
-        loop {
-            chain.push(start);
-            let link = self.arena.bytes(start, LINK);
-            let prev = u32::from_le_bytes([link[0], link[1], link[2], link[3]]);
-            if prev == NIL {
-                break;
-            }
-            start = prev;
-        }
-        let mut last = self.base;
-        for &start in chain.iter().rev() {
-            let size = CLASS_SIZE[self.arena.class_of(start)];
-            let b = &self.arena.bytes(start, size)[LINK..];
-            let mut i = 0;
-            while i < b.len() && b[i] != 0 {
-                let mut v = 0u32;
-                let mut shift = 0;
-                loop {
-                    let byte = b[i];
-                    i += 1;
-                    v |= ((byte & 0x7f) as u32) << shift;
-                    if byte < 0x80 {
-                        break;
-                    }
-                    shift += 7;
-                }
-                last += v;
-                f(last - 1);
+        let mut kept = self.kept[slot].lock().unwrap();
+        let at = kept.partition_point(|&k| k < id);
+        if at < FIRST_IDS {
+            kept.insert(at, id);
+            kept.truncate(FIRST_IDS);
+            if kept.len() == FIRST_IDS {
+                self.bound[slot].store(kept[FIRST_IDS - 1], Ordering::Relaxed);
             }
         }
     }
+}
+
+/// One worker's pass over its doc range: per-query BOOL count, sum and first ids, and the phrase matches.
+struct Shard {
+    bool_acc: Vec<BoolAcc>,
+    matches: Vec<(u32, u32)>,    // (pattern, doc), docs ascending
+    evaluations: u64,            // (doc, query) evaluations, reported by SD_PHASES
 }
 
 /// Splits the corpus into `n` ranges that each start at the beginning of a line.
@@ -407,65 +495,65 @@ fn split_lines(data: &[u8], n: usize) -> Vec<&[u8]> {
     cuts.windows(2).map(|w| &data[w[0]..w[1]]).collect()
 }
 
-fn scan(data: &[u8], dict: &Dict, ac: &Automaton, n_patterns: usize) -> Shard {
-    // spec 2.1: every line starts with its decimal doc id, so the range's first id is read off its first line.
-    let base = data.iter().take_while(|&&b| b != b'\t').fold(0u32, |id, &b| id * 10 + (b - b'0') as u32);
+fn scan(data: &[u8], dict: &Dict, ac: &Automaton, n_patterns: usize, plan: &BoolPlan, first_ids: &FirstIds) -> Shard {
     let mut shard = Shard {
-        arena: Arena::new(),
-        cursor: vec![0; dict.terms.len()],
-        last: vec![base; dict.terms.len()],
-        base,
+        bool_acc: vec![BoolAcc::default(); plan.query_of_slot.len()],
         matches: Vec::new(),
-        docs_end: 0,
+        evaluations: 0,
     };
+    // The doc's query terms as a bitset (a few KB, so evaluations test it in L1), cleared after each doc from `hits`.
+    let mut present = vec![0u64; dict.terms.len().div_ceil(64)];
+    let mut hits: Vec<u32> = Vec::new(); // this doc's distinct query terms
     let mut pattern_last = vec![0u32; n_patterns]; // last doc id + 1 a pattern was reported for
-    let end = data.len();
     let mut i = 0;
-    let mut token = [0u8; MAX_TERM];
-    while i < end {
-        // spec 2.1: a line is the decimal doc id, a TAB, the text and an LF.
-        let mut id = 0u32;
-        while i < end && data[i] != b'\t' {
-            id = id * 10 + (data[i] - b'0') as u32;
-            i += 1;
-        }
-        i += 1;
-        shard.docs_end = id + 1;
+    while i < data.len() {
+        let (id, text) = parse_id(data, i);
+        let stamp = id + 1;
         let mut state = 0u32; // a phrase never spans two documents
-        while i < end && data[i] != b'\n' {
-            let mut c = FOLD[data[i] as usize];
-            if c == 0 {
-                i += 1;
-                continue;
-            }
-            let mut h = FNV_OFFSET;
-            let mut n = 0;
-            while c != 0 {
-                if n < MAX_TERM {
-                    token[n] = c;
-                }
-                n += 1;
-                h = fnv_step(h, c);
-                i += 1;
-                c = if i < end { FOLD[data[i] as usize] } else { 0 };
-            }
-            let Some(t) = (if n <= MAX_TERM { dict.find(&token[..n], h) } else { None }) else {
+        i = tokenize_doc(data, text, dict, |hit| {
+            let Some(t) = hit else {
                 state = 0;
-                continue;
+                return;
             };
-            shard.push(t, id);
+            let (w, bit) = (t as usize / 64, 1u64 << (t % 64));
+            if present[w] & bit == 0 {
+                present[w] |= bit;
+                hits.push(t);
+            }
             state = ac.step(state, t);
             let mut o = if ac.out[state as usize] != NIL { state } else { ac.dict_link[state as usize] };
             while o != NIL {
                 let p = ac.out[o as usize];
-                if pattern_last[p as usize] != id + 1 {
-                    pattern_last[p as usize] = id + 1;
+                if pattern_last[p as usize] != stamp {
+                    pattern_last[p as usize] = stamp;
                     shard.matches.push((p, id));
                 }
                 o = ac.dict_link[o as usize];
             }
+        });
+        // The doc's term set is complete: evaluate each query one of its terms triggers, MULTI ones once.
+        for &t in &hits {
+            for trig in plan.triggered_by(t) {
+                let q = (trig.query & !FLAGS) as usize;
+                if trig.query & MULTI != 0 {
+                    if shard.bool_acc[q].done == stamp {
+                        continue;
+                    }
+                    shard.bool_acc[q].done = stamp;
+                }
+                shard.evaluations += 1;
+                if trig.query & ALWAYS != 0 || holds(&trig.code, &present) {
+                    let acc = &mut shard.bool_acc[q];
+                    acc.count += 1;
+                    acc.sum += id as u64;
+                    first_ids.offer(q, id);
+                }
+            }
         }
-        i += 1;
+        for &t in &hits {
+            present[t as usize / 64] &= !(1 << (t % 64));
+        }
+        hits.clear();
     }
     shard
 }
@@ -486,18 +574,6 @@ impl Answer {
             self.first.push(id);
         }
     }
-
-    fn from_bitmap(bits: &[u64]) -> Self {
-        let mut a = Answer::default();
-        for (w, &word) in bits.iter().enumerate() {
-            let mut word = word;
-            while word != 0 {
-                a.add((w * 64) as u32 + word.trailing_zeros());
-                word &= word - 1;
-            }
-        }
-        a
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -515,75 +591,6 @@ struct BoolQuery {
 enum Query {
     Bool(usize),
     Phrase(usize),
-}
-
-struct Index {
-    shards: Vec<Shard>,
-    bitmaps: Vec<Option<Vec<u64>>>, // N-bit bitmap for each term with df > N/8, where it is no larger than varints
-    words: usize,
-}
-
-impl Index {
-    fn for_each_doc(&self, t: u32, mut f: impl FnMut(u32)) {
-        for shard in &self.shards {
-            shard.for_each_doc(t, &mut f);
-        }
-    }
-
-    fn load(&self, t: u32, dst: &mut [u64]) {
-        if let Some(bm) = &self.bitmaps[t as usize] {
-            dst.copy_from_slice(bm);
-        } else {
-            dst.fill(0);
-            self.for_each_doc(t, |d| dst[d as usize / 64] |= 1 << (d % 64));
-        }
-    }
-
-    /// spec 3: strict left fold, no precedence; `a OR b AND c` is `(a OR b) AND c` (b-index.md:136-141).
-    fn eval(&self, q: &BoolQuery, acc: &mut [u64], tmp: &mut [u64]) -> Answer {
-        self.load(q.first, acc);
-        for &(op, t) in &q.rest {
-            let bm = self.bitmaps[t as usize].as_deref();
-            match (op, bm) {
-                (Op::Or, Some(b)) => acc.iter_mut().zip(b).for_each(|(a, b)| *a |= b),
-                (Op::Not, Some(b)) => acc.iter_mut().zip(b).for_each(|(a, b)| *a &= !b),
-                (Op::And, Some(b)) => acc.iter_mut().zip(b).for_each(|(a, b)| *a &= b),
-                // OR and NOT with a sparse list touch only its docs; AND needs the list as a bitmap.
-                (Op::Or, None) => self.for_each_doc(t, |d| acc[d as usize / 64] |= 1 << (d % 64)),
-                (Op::Not, None) => self.for_each_doc(t, |d| acc[d as usize / 64] &= !(1 << (d % 64))),
-                (Op::And, None) => {
-                    self.load(t, tmp);
-                    acc.iter_mut().zip(tmp.iter()).for_each(|(a, b)| *a &= b);
-                }
-            }
-        }
-        Answer::from_bitmap(acc)
-    }
-}
-
-/// Runs `work(i)` for i in 0..n over the worker threads, handing out indices in chunks.
-fn parallel_for<R: Send>(n: usize, workers: usize, chunk: usize, init: impl Fn() -> R + Sync, work: impl Fn(&mut R, usize) + Sync) -> Vec<R> {
-    let next = AtomicUsize::new(0);
-    std::thread::scope(|s| {
-        let handles: Vec<_> = (0..workers)
-            .map(|_| {
-                s.spawn(|| {
-                    let mut state = init();
-                    loop {
-                        let start = next.fetch_add(chunk, Ordering::Relaxed);
-                        if start >= n {
-                            break;
-                        }
-                        for i in start..(start + chunk).min(n) {
-                            work(&mut state, i);
-                        }
-                    }
-                    state
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    })
 }
 
 fn main() {
@@ -642,53 +649,39 @@ fn main() {
     let ac = Automaton::new(&patterns, dict.terms.len());
     lap("queries");
 
-    // The pass: one doc range per worker, cut at line starts.
     let docs = map_file(&format!("{data_dir}/docs.txt"));
+    let plan = BoolPlan::new(&bools, dict.terms.len(), &estimate_df(docs, &dict));
+    lap("sample");
+
+    // The pass: one doc range per worker, cut at line starts.
+    let first_ids = FirstIds::new(plan.query_of_slot.len());
     let shards: Vec<Shard> = std::thread::scope(|s| {
         let handles: Vec<_> = split_lines(docs, workers)
             .into_iter()
-            .map(|part| s.spawn(|| scan(part, &dict, &ac, patterns.len())))
+            .map(|part| s.spawn(|| scan(part, &dict, &ac, patterns.len(), &plan, &first_ids)))
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    let n_docs = shards.iter().map(|s| s.docs_end).max().unwrap_or(0) as usize;
+    if phases {
+        eprintln!("(doc, query) BOOL evaluations: {}", shards.iter().map(|s| s.evaluations).sum::<u64>());
+    }
     lap("pass");
 
-    // Terms with df > N/8 get an N-bit bitmap: their varint list is about as large, and bitmaps fold fastest.
-    let mut index = Index { shards, bitmaps: Vec::new(), words: n_docs.div_ceil(64) };
-    let n_terms = dict.terms.len();
-    let found = parallel_for(n_terms, workers, 256, Vec::new, |found: &mut Vec<(u32, Vec<u64>)>, t| {
-        let mut df = 0;
-        index.for_each_doc(t as u32, |_| df += 1);
-        if df > n_docs / 8 {
-            let mut bm = vec![0u64; index.words];
-            index.for_each_doc(t as u32, |d| bm[d as usize / 64] |= 1 << (d % 64));
-            found.push((t as u32, bm));
-        }
-    });
-    index.bitmaps = vec![None; n_terms];
-    for (t, bm) in found.into_iter().flatten() {
-        index.bitmaps[t as usize] = Some(bm);
-    }
-    lap("encode");
-
-    let words = index.words;
-    let bool_answers = parallel_for(
-        bools.len(),
-        workers,
-        16,
-        || (vec![0u64; words], vec![0u64; words], Vec::new()),
-        |(acc, tmp, done): &mut (Vec<u64>, Vec<u64>, Vec<(usize, Answer)>), i| done.push((i, index.eval(&bools[i], acc, tmp))),
-    );
     let mut bool_results = vec![Answer::default(); bools.len()];
-    for (i, a) in bool_answers.into_iter().flat_map(|(_, _, done)| done) {
-        bool_results[i] = a;
+    for shard in &shards {
+        for (&q, acc) in plan.query_of_slot.iter().zip(&shard.bool_acc) {
+            bool_results[q as usize].count += acc.count as u64;
+            bool_results[q as usize].sum += acc.sum;
+        }
+    }
+    for (&q, kept) in plan.query_of_slot.iter().zip(first_ids.kept) {
+        bool_results[q as usize].first = kept.into_inner().unwrap();
     }
     lap("bool");
 
     // Shards are in doc order and each lists its matches in doc order, so every pattern's docs arrive ascending.
     let mut phrase_results = vec![Answer::default(); patterns.len()];
-    for shard in &index.shards {
+    for shard in &shards {
         for &(p, d) in &shard.matches {
             phrase_results[p as usize].add(d);
         }
