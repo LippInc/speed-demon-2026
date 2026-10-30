@@ -1,6 +1,7 @@
 # Track A: Ingest
 
-K 29.00 (box `sd-bench/A`, official; fresh 29.25): T 0.045 s, M 24.1 MB, S 625, D 1, sha 5/5+5/5.
+K 30.17 (box `sd-bench/A`, fresh, the lower reading; official 30.86): T 0.041 s, M 24.1 MB, S 641, D 1,
+sha 5/5+5/5.
 Reproduce with `sdrig run --track-dir track-a --track A --data <seed-1 full dir> --expected-sha <hash> --runs 5`.
 
 The task, the input files and the exact output format are in the [spec](https://github.com/hackathon-raptors/speed-demon-2026/blob/main/specs/a-ingest.md).
@@ -12,10 +13,11 @@ cuts it into one byte range per worker, each starting at a line start (`line_ran
 range once with private tables, so threads share nothing (`scan`, `Table`), then drops that range's page-table
 entries (`release_range`) so the process exit has fewer to tear down. The key has two levels: a small
 open-addressing table interns each endpoint to a local id, and each hour keeps an array from endpoint id to
-its group, so a line costs one probe in a cache-resident table plus an array index. The hour is parsed only when the 13-byte hour prefix differs from the previous line's;
+its group, so a line costs one probe in a cache-resident table plus an array index. The hour is parsed only when the 13-byte hour prefix (two u64 loads) differs from the previous line's;
 one 32-byte AVX2 load at byte 32 of the line finds the endpoint's `/` and, for most lines, the LF
-(`line_fields`); a 16-byte compare before the LF finds the space before the latency (`latency_space`), and
-latency and status are parsed from there.
+(`line_fields`); one 16-byte load before the LF finds the space before the latency and converts its 1 to 10
+digits with SIMD multiply-adds, with no per-digit loop (`parse_latency`); the 5xx flag is the status's first
+digit.
 
 Memory is kept small: a group is 16 bytes (u32 counts and chunk pointers; its key is its place in the hour's
 array), and its latencies go into chains of small chunks inside large per-(thread, hour) blocks (`Arena`), so

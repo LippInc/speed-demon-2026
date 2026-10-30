@@ -97,13 +97,6 @@ fn parse_hour(p: &[u8]) -> u32 {
     ((n(0..4) * 100 + n(5..7)) * 100 + n(8..10)) * 100 + n(11..13)
 }
 
-/// Unsigned decimal that must fit u32 (spec 2: latency is 0..=4294967295).
-fn parse_u32(s: &[u8]) -> u32 {
-    s.iter()
-        .try_fold(0u32, |acc, &b| acc.checked_mul(10)?.checked_add(digit(b)))
-        .expect("latency overflows u32")
-}
-
 /// Byte mask of `byte` in data[i..i + 32], one bit per byte.
 fn mask32(data: &[u8], i: usize, byte: u8) -> u32 {
     use std::arch::x86_64::*;
@@ -139,17 +132,33 @@ fn line_fields(data: &[u8], p: usize) -> (usize, usize) {
     }
 }
 
-/// The space before the latency, the last field of the line ending at lf: the highest space among the 16 bytes
-/// before the LF (spec 2: latency is at most 10 digits, and every line is at least 40 bytes, so the load stays
-/// inside the line). Measured on this VM, seed 1 full, against walking back byte by byte: scan 86 -> 80 ns per
-/// line at 4 workers, 82 -> 81 at 1 (the only part tried in a-6 that paid).
-fn latency_space(data: &[u8], lf: usize) -> usize {
+/// The space before the latency and the latency's value, for the line ending at lf, with no per-digit loop.
+/// One 16-byte load ends at the LF (spec 2: every line is at least 40 bytes, so it stays inside the line); the
+/// highest space in it precedes the latency's 1 to 10 digits (spec 2). Lanes left of the digits are zeroed,
+/// so the digits sit right-aligned in 16 lanes, and two multiply-add steps fold them into four 4-digit groups.
+/// The value is checked against u32, and every lane is checked to be a digit.
+/// Measured on this VM (cachegrind, seed 7 sample, 1 worker): conditional mispredicts 6.86 -> 5.32 per line,
+/// instructions 726 -> 693 per line, against walking back to the space and a per-digit checked loop.
+fn parse_latency(data: &[u8], lf: usize) -> (usize, u32) {
     use std::arch::x86_64::*;
     let v = &data[lf - 16..lf];
-    // Safety: v is 16 readable bytes and SSE2 is part of every x86-64 baseline.
-    let spaces = unsafe { _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(v.as_ptr() as *const __m128i), _mm_set1_epi8(b' ' as i8))) };
-    assert!(spaces != 0, "no space before the latency");
-    lf - 16 + (31 - (spaces as u32).leading_zeros()) as usize
+    // Safety: v is 16 readable bytes; SSE2 and SSSE3 are part of the x86-64-v3 baseline.
+    unsafe {
+        let x = _mm_loadu_si128(v.as_ptr() as *const __m128i);
+        let spaces = _mm_movemask_epi8(_mm_cmpeq_epi8(x, _mm_set1_epi8(b' ' as i8))) as u32;
+        assert!(spaces != 0, "no space before the latency");
+        let sp = 31 - spaces.leading_zeros();
+        assert!((5..=14).contains(&sp), "latency of 1 to 10 digits");
+        let lanes = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+        let digits = _mm_and_si128(_mm_sub_epi8(x, _mm_set1_epi8(b'0' as i8)), _mm_cmpgt_epi8(lanes, _mm_set1_epi8(sp as i8)));
+        let nine = _mm_min_epu8(digits, _mm_set1_epi8(9));
+        assert!(_mm_movemask_epi8(_mm_cmpeq_epi8(nine, digits)) == 0xFFFF, "expected a digit");
+        let pairs = _mm_maddubs_epi16(digits, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1));
+        let quads: [u32; 4] = std::mem::transmute(_mm_madd_epi16(pairs, _mm_setr_epi16(100, 1, 100, 1, 100, 1, 100, 1)));
+        // At most 10 digits, so lane 0 (bytes 0..4) is always zero.
+        let value = quads[1] as u64 * 100_000_000 + quads[2] as u64 * 10_000 + quads[3] as u64;
+        (lf - 16 + sp as usize, u32::try_from(value).expect("latency overflows u32"))
+    }
 }
 
 fn fold_mul(a: u64, b: u64) -> u64 {
@@ -311,7 +320,7 @@ impl Table {
         }
     }
 
-    fn add(&mut self, data: &'static [u8], arena: usize, ep: &'static [u8], status: u32, latency: u32) {
+    fn add(&mut self, data: &'static [u8], arena: usize, ep: &'static [u8], error: bool, latency: u32) {
         let e = self.endpoint(data, ep);
         let map = &mut self.maps[arena];
         if e >= map.len() {
@@ -335,7 +344,7 @@ impl Table {
             g.push_slot(a, ESCAPE | latency >> 24);
             g.push_slot(a, latency & 0xFF_FFFF);
         }
-        g.errors += (500..=599).contains(&status) as u32;
+        g.errors += error as u32;
     }
 
     fn grow(&mut self, data: &'static [u8]) {
@@ -355,23 +364,24 @@ impl Table {
 /// Aggregates every line starting in data[start..end].
 fn scan(data: &'static [u8], start: usize, end: usize) -> Table {
     let mut table = Table::new();
-    let mut prev_prefix: &[u8] = &[];
+    let mut prev_prefix = (u64::MAX, u64::MAX);
     let mut arena = 0;
     let mut p = start;
     while p < end {
-        // Lines usually share the previous line's hour, so compare the prefix before parsing it.
-        let prefix = &data[p..p + HOUR_PREFIX];
+        // Lines usually share the previous line's hour, so compare its 13-byte prefix first, as two overlapping
+        // u64 loads (bytes 0..8 and 5..13) rather than a slice compare.
+        let word = |i: usize| u64::from_le_bytes(data[i..i + 8].try_into().unwrap());
+        let prefix = (word(p), word(p + HOUR_PREFIX - 8));
         if prefix != prev_prefix {
-            arena = table.arena(parse_hour(prefix));
+            arena = table.arena(parse_hour(&data[p..p + HOUR_PREFIX]));
             prev_prefix = prefix;
         }
         let (ep_start, lf) = line_fields(data, p);
-        let sp = latency_space(data, lf);
-        let latency = parse_u32(&data[sp + 1..lf]);
-        // Spec 2 grammar: status is exactly three digits followed by SP.
-        let st = &data[sp - 3..sp];
-        let status = digit(st[0]) * 100 + digit(st[1]) * 10 + digit(st[2]);
-        table.add(data, arena, &data[ep_start..sp - 4], status, latency);
+        let (sp, latency) = parse_latency(data, lf);
+        // Spec 2 grammar: status is three digits, 100 to 599, followed by SP; it is a 5xx error exactly when its
+        // first digit is '5', so only that byte is read.
+        let error = data[sp - 3] == b'5';
+        table.add(data, arena, &data[ep_start..sp - 4], error, latency);
         p = lf + 1;
     }
     table

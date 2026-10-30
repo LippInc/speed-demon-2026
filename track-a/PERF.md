@@ -51,3 +51,6 @@ Experiments measured on our bench box only, with no board run (their box status 
   5/5+5/5 OK` against a-10's K 28.54 (M 27.9MB).
 - a-12: the exit teardown. Each scan range's page-table entries are dropped after its scan. `K 29.00 | T 0.045s |
   M 24.1MB | S 625 | sha 5/5+5/5 OK`.
+- a-13: a branch-free parse. The latency's 1 to 10 digits converted with one 16-byte load and SIMD multiply-adds,
+  the 5xx flag read from the status's first digit, and the hour prefix compared as two u64 words. `K 30.17 (fresh;
+  official 30.86) | T 0.041s | M 24.1MB | S 641 | sha 5/5+5/5 OK`.
