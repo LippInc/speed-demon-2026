@@ -2,9 +2,9 @@
 
 Reads `queries.txt` (BOOL and PHRASE queries) and `docs.txt` (one document per line) from `/data` and writes `results.txt` to `/out`: for each query, the number of matching documents, the sum of their ids and the ten smallest ids.
 
-56.35 s → 0.24 s (about 237×), 2.2 GB → 40 MB. No index is built: one parallel pass decides every BOOL query 1,024 documents at a time from bit-rows and a sorted log of the rarer terms' hits, and every phrase by checks at its rarest term.
+56.35 s → 0.22 s (about 260×), 2.2 GB → 39 MB. No index is built: one parallel pass decides every BOOL query 1,024 documents at a time from bit-rows and a sorted log of the rarer terms' hits, and every phrase by checks at its rarest term.
 
-Rust, standard library only. K 24.49 (box `sd-bench/B`, commit a129cda, b-68 on b-64; the lower of two seeds): T 0.238 s, M 39.9 MB, S 753, D 1 (no dependencies). Board: run-11f0e517f808 (commit c8760d4, the code of 5668086, before b-64 and b-68), K 23.15, T 0.279 s, our best board run.
+Rust, standard library only. K 25.33 (box `sd-bench/B`, commit a2b0dfd, b-84; the lower of two seeds, in the lower of two readings, the other 25.39): T 0.216 s, M 38.5 MB, S 836, D 1 (no dependencies). Board: run-188484269540 (commit 1be93e4, the code of acaa379, before b-84), K 24.86, T 0.230 s, our best board run.
 
 Terms: K is the organisers' score combining T (run time), M (peak memory), S (lines of code) and D (dependencies) against the reference, higher is better; the box is our bench machine with the scoring machine's CPU; b-NN is one experiment in PERF.md; KNOWN = a textbook technique, OURS = our own design.
 
@@ -13,23 +13,24 @@ Reproduce with seed 1's full data in `<data>`, then compare the hash with the fu
 
 | Trick | Where | PERF |
 |---|---|---|
-| One pass over the mapped corpus, one document range per thread | [`map_file`](src/main.rs#L85), [`scan`](src/main.rs#L735) | b-1 |
-| Only the query terms are looked up, in one compact table | [`TermTable`](src/main.rs#L121) | b-6, b-13, b-36a |
-| Each token's slot line prefetched one token ahead, the token reported one step late | [`hold`](src/main.rs#L221) | b-64 |
-| Phrases checked at the rarest term's byte offsets at the doc's end | [`PhrasePlan`](src/main.rs#L301) | b-8, b-56 |
-| BOOL queries folded per 1,024-document chunk: rows for common terms, a radix-sorted log for the rest, no posting store | [`ChunkLog`](src/main.rs#L556), [`fold_chunk`](src/main.rs#L514) | b-3, b-32b, b-68 |
-| A query is folded only in chunks where a term of its cover occurs | [`cover`](src/main.rs#L466) | b-3 |
-| Counts by popcount, id sums by bit-sliced popcounts | [`record`](src/main.rs#L540) | b-4 |
-| Tokens cut 32 bytes at a time, starts and ends as two masks | [`tokenize`](src/main.rs#L206), [`walk`](src/main.rs#L239) | b-31a, b-31b, b-31c, b-55, b-59 |
-| Trigger order and the dense/sparse cut from document frequencies sampled on 1/128 of the corpus | [`estimate_df`](src/main.rs#L385) | b-9, b-11, b-68 |
+| One pass over the mapped corpus, one document range per thread | [`map_file`](src/main.rs#L91), [`scan`](src/main.rs#L779) | b-1 |
+| Only the query terms are looked up, in one compact table | [`TermTable`](src/main.rs#L127) | b-6, b-13, b-36a |
+| The queries parsed by every worker at once into that one table, each new term published by a compare-and-swap | [`Interner`](src/main.rs#L264), [`parse`](src/main.rs#L834) | b-52, b-84 |
+| Each token's slot line prefetched one token ahead, the token reported one step late | [`hold`](src/main.rs#L195) | b-64 |
+| Phrases checked at the rarest term's byte offsets at the doc's end | [`PhrasePlan`](src/main.rs#L342) | b-8, b-56 |
+| BOOL queries folded per 1,024-document chunk: rows for common terms, a radix-sorted log for the rest, no posting store | [`ChunkLog`](src/main.rs#L599), [`fold_chunk`](src/main.rs#L557) | b-3, b-32b, b-68 |
+| A query is folded only in chunks where a term of its cover occurs | [`cover`](src/main.rs#L509) | b-3 |
+| Counts by popcount, id sums by bit-sliced popcounts | [`record`](src/main.rs#L583) | b-4 |
+| Tokens cut 32 bytes at a time, starts and ends as two masks | [`tokenize`](src/main.rs#L180), [`walk`](src/main.rs#L214) | b-31a, b-31b, b-31c, b-55, b-59 |
+| Trigger order and the dense/sparse cut from document frequencies sampled on 1/128 of the corpus | [`estimate_df`](src/main.rs#L427) | b-9, b-11, b-68 |
 
 Every measurement, failed experiments included, with its board run ID: [PERF.md](PERF.md). Receipts: [`reports/b/`](../reports/b/) at the repository root, one `harness-<commit>.txt` per measured submission commit, from the board's runs of that commit; each names the commit it measured, and the commit after a measured push only adds its receipt.
 
-Limit: tokenizing and looking up every token was about 95 ms of T on the box before any query is answered (b-66), until b-64 took about 18 ms of it; the chunk evaluation still runs about 2.2 G instructions at one worker, 15 % fewer than the 64-document window's fold, with a quarter of its L1 misses (b-68).
+Limit: each worker's pass is about 185 ms of the 216 ms run at 12 workers (box timers, b-81): tokenizing, looking up and recording every token about 95 ms, the chunk evaluation about 64 ms, the phrase checks about 17 ms. Most of the evaluation, about 47 ms, folds queries triggered by rare terms, each over 16 words for about 4 candidate documents (b-83).
 
 ## Approach
 
-The program reads `queries.txt` first. Every line is its own query (a line dedupe was 70 M of the parse's 110 M instructions; removing it took the VM's parse from 32 ms to 22.7 ms). One pass cuts the file at spaces, double quotes and LFs, 32 bytes per AVX2 compare, with no allocation per line (b-69: the VM's parse fell to about 13 ms). Every term is interned straight into the table the pass later probes. That table uses a fixed-width CRC32-C hash of the zero-padded term (b-74) and open addressing, starts at a size estimated from the length of `queries.txt`, and doubles whenever it would pass a load factor of 1/3. Each 4-byte slot holds the term's id in its low 30 bits and the hash's top 2 bits, so a miss reads one cache line. A hash match is confirmed against the term's bytes, which are stored inline and zero-padded in a 32-byte entry: one more line, and one 32-byte compare with the zero-padded token. Each PHRASE line becomes one pattern with one anchor, its term with the lowest estimated document frequency. The binary links the C runtime statically (probe b-21), so no dynamic loader runs before main.
+The program reads `queries.txt` first. Every line is its own query (a line dedupe was 70 M of the parse's 110 M instructions; removing it took the VM's parse from 32 ms to 22.7 ms). Every worker parses one range of whole lines at once (b-84). One pass cuts its lines at spaces, double quotes and LFs, 32 bytes per AVX2 compare, with no allocation per line (b-69), and every term is interned straight into the one table the pass later probes, shared by all workers. A new term's bytes go to an entry at an id the worker drew (64 at a time), then a compare-and-swap publishes its slot, so no worker takes a lock; the workers' queries are joined in file order. On the box the parse fell from about 12.5 ms on one thread to about 3.4 ms (b-84). That table uses a fixed-width CRC32-C hash of the zero-padded term (b-74) and open addressing. It is sized from the length of `queries.txt` first, and the parse runs again at twice the slots if the terms would pass a load factor of 1/3. Each 4-byte slot holds the term's id in its low 30 bits and the hash's top 2 bits, so a miss reads one cache line. A hash match is confirmed against the term's bytes, which are stored inline and zero-padded in a 32-byte entry: one more line, and one 32-byte compare with the zero-padded token. Each PHRASE line becomes one pattern with one anchor, its term with the lowest estimated document frequency. The binary links the C runtime statically (probe b-21), so no dynamic loader runs before main.
 
 Under the spec's strict left fold, whether a document is in a BOOL query's result depends only on which of the query's terms the document contains, so the same fold over 64-bit words, one bit per document, decides 64 documents at once. A document can only be in R if it contains a term of the query's cover. The cover starts as the first term; each OR operand is added to it; an AND operand may replace the cover when its estimated document frequency is lower. Every query is listed, with its code inline, under each term of its cover. Its accumulator slot follows that list order, so the queries one term triggers have neighbouring accumulators. Before the pass, document frequencies are estimated on 64 evenly spaced windows covering 1/128 of the corpus, only to make those choices. The sample's 64 windows are spread over the worker threads. The terms are then renumbered in place in the term table: the BOOL terms first, and each group by descending estimated frequency, so the terms most tokens hit have neighbouring ids and their table entries and rows share cache lines. A BOOL term sampled in at least 1/64 of the sampled documents is dense (738 of 53,444 on seed 1), and the dense terms are the first ids. A query whose cover holds a dense term is folded in every chunk; every other query is listed under its cover's terms. The BOOL and phrase plans are built on two threads.
 
@@ -43,6 +44,6 @@ None.
 
 ## With another 24 hours
 
-- The chunk evaluation (b-68): most of its folds are of queries whose operands are all rare, with one to three documents in the chunk, so they spend 16-word work on a few bits; testing those documents one by one read slower on the VM, so a cheaper per-document form is what is left to find.
-- The pass's table access: the one-token-ahead slot prefetch inside `walk` was the form left after b-58 and b-60, and it was kept (b-64: box T 0.268 → 0.250 s); a longer prefetch distance is unmeasured.
+- The chunk evaluation (b-68): most of its folds are of queries whose operands are all rare, with about 4 candidate documents in the chunk, so they spend 16-word work on a few bits. Folding those documents one by one read 2.3 times slower on the box, from a branch per document (b-83), so the next form folds only the words that hold a candidate, with no branch per document.
+- The token lookup: a longer prefetch distance read slower on the box (b-82, eight tokens in flight: T +4 ms), so the next form is a smaller table, an exact minimal perfect hash with a 16-bit pilot per bucket and the keys by id, about 600 KB where the probe chains of b-80 took 1.5 MB.
 - An 8-byte accumulator that keeps the duplicate-fold stamp inside it (narrow fields that spill exactly on wrap), so the halved footprint does not cost an extra line per fold (b-33b moved the stamp out and lost).

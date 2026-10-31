@@ -9,12 +9,12 @@
 //! triggers is folded once over its terms' rows (a rare term's row built from its log entries) with branch-free
 //! operator masks, the count is a popcount and the id sum comes from bit slices.
 //! Main tricks: `ChunkLog` and `fold_chunk` (b-68), `hold` (b-64), `PhrasePlan` (b-8), `TermTable` (b-36a),
-//! `estimate_df` (b-11).
+//! `estimate_df` (b-11), `Interner` (b-84).
 
 use std::arch::x86_64::*;
 use std::fs::File;
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU32, Ordering::{Acquire, Relaxed, Release}};
 use std::sync::Mutex;
 
 const NIL: u32 = u32::MAX;
@@ -138,33 +138,6 @@ struct TermTable {
 struct TermBytes([u8; MAX_TERM]);
 
 impl TermTable {
-    /// The id of `term` (spec 2.3: 1 to 32 bytes), added if new. The slots double whenever they would pass load 1/3,
-    /// rehashed from the entries: the 1 MB that 8 B slots took at load 2/3, with fewer collisions for the 2-bit tag
-    /// (b-36, cachegrind, 1 worker, seed 1: find's mispredicts 19.0 M with 8 B slots, 14.2 M at load 1/3).
-    fn intern(&mut self, term: &[u8]) -> u32 {
-        let mut padded = [0u8; MAX_TERM];
-        padded[..term.len()].copy_from_slice(term);
-        let h = hash32(&padded);
-        if let Some(t) = self.find(&padded, h, self.slot(h)) {
-            return t;
-        }
-        if 3 * (self.bytes.len() + 1) > self.slots.len() {
-            (self.slots, self.shift) = (vec![0; self.slots.len() * 2], self.shift - 1);
-            (0..self.bytes.len()).for_each(|t| self.place(hash32(&self.bytes[t].0), t as u32 + 1));
-        }
-        self.bytes.push(TermBytes(padded));
-        self.place(h, self.bytes.len() as u32);
-        self.bytes.len() as u32 - 1
-    }
-
-    fn place(&mut self, h: u32, id1: u32) {
-        let mut i = self.slot(h);
-        while self.slots[i] != 0 {
-            i = (i + 1) & (self.slots.len() - 1);
-        }
-        self.slots[i] = h & !TERM | id1;
-    }
-
     /// Renumbers the terms by ascending `key` in place: the slots keep their hash and get the new id, and the
     /// entries move (cheaper than rebuilding the table after the df sample). Returns each term's new id.
     fn renumber(&mut self, key: &[u64]) -> Vec<u32> {
@@ -179,11 +152,6 @@ impl TermTable {
         }
         self.bytes = order.iter().map(|&t| self.bytes[t]).collect();
         new_id
-    }
-
-    #[inline]
-    fn slot(&self, h: u32) -> usize {
-        (h.wrapping_mul(0x9e37_79b1) >> self.shift) as usize
     }
 
     /// The tag only filters; the bytes decide. Token and entry are both zero-padded to 32 bytes, so one 32-byte
@@ -228,7 +196,7 @@ impl TermTable {
         let tok = (to - from <= MAX_TERM).then(|| {
             let t = Chunk::load(data, from).folded(to - from);
             let h = hash32(&t);
-            let i = self.slot(h);
+            let i = slot(h, self.shift);
             unsafe { _mm_prefetch(self.slots.as_ptr().add(i) as *const i8, _MM_HINT_T0) };
             (t, h, i)
         });
@@ -275,6 +243,72 @@ impl TermTable {
                 return i + lf.trailing_zeros() as usize + 1;
             }
             i += 32;
+        }
+    }
+}
+
+/// The slot where the probe for hash `h` starts, in a table of 2^(32 - shift) slots.
+#[inline]
+fn slot(h: u32, shift: u32) -> usize {
+    (h.wrapping_mul(0x9e37_79b1) >> shift) as usize
+}
+
+/// Ids are drawn from the shared counter this many at a time, so the workers rarely touch its cache line.
+const ID_BLOCK: u32 = 64;
+
+/// A `TermTable` while every worker interns its share of queries.txt into it at once (b-84; the serial parse was
+/// 12.5 ms of the box's 24.5 ms serial prologue, b-81). A new term's bytes go to the entry at an id the worker drew,
+/// then a compare-and-swap on the empty slot publishes it (Release): a worker that loads the slot (Acquire) sees
+/// the bytes. Slots never move, so `main` sizes the table first and parses again at twice the slots when the drawn
+/// ids pass load 1/3 (b-36's load); any query file is exact. Box: parse 12.5 → 3.4 ms, T 0.224 → 0.216 s (b-84).
+struct Interner<'a> {
+    slots: &'a [AtomicU32],
+    shift: u32,
+    bytes: *mut TermBytes, // `cap` entries; entry k is written by the one worker that drew k, before a slot names k
+    cap: u32,
+    next: AtomicU32, // the next undrawn id; above `cap`, the table was too small
+}
+
+// The workers share it: an entry is only written by the worker that drew its id, before a slot publishes it.
+unsafe impl Sync for Interner<'_> {}
+
+impl<'a> Interner<'a> {
+    fn new(table: &'a mut TermTable) -> Self {
+        // AtomicU32 has u32's size and alignment; the &mut makes the slots ours for 'a.
+        let slots = unsafe { &*(table.slots.as_mut_slice() as *mut [u32] as *const [AtomicU32]) };
+        let (shift, cap) = (table.shift, (table.slots.len() / 3) as u32);
+        Interner { slots, shift, bytes: table.bytes.as_mut_ptr(), cap, next: AtomicU32::new(0) }
+    }
+
+    /// The id of `term` (spec 2.3: 1 to 32 bytes), added if new (any id once the table is too small). `ids` are this
+    /// worker's drawn, unused ids; one whose slot another worker took first stays for the next new term.
+    fn intern(&self, term: &[u8], ids: &mut std::ops::Range<u32>) -> u32 {
+        let mut padded = [0u8; MAX_TERM];
+        padded[..term.len()].copy_from_slice(term);
+        let h = hash32(&padded);
+        let mut i = slot(h, self.shift);
+        loop {
+            let s = self.slots[i].load(Acquire);
+            if s == 0 {
+                if ids.start == ids.end {
+                    let k = self.next.fetch_add(ID_BLOCK, Relaxed);
+                    *ids = k..k + ID_BLOCK;
+                }
+                let id = ids.start;
+                if id >= self.cap {
+                    return 0;
+                }
+                unsafe { self.bytes.add(id as usize).write(TermBytes(padded)) };
+                if self.slots[i].compare_exchange(0, h & !TERM | id + 1, Release, Relaxed).is_ok() {
+                    ids.start += 1;
+                    return id;
+                }
+                continue; // another worker took the slot: read it again
+            }
+            if (s ^ h) & !TERM == 0 && unsafe { &*self.bytes.add((s & TERM) as usize - 1) }.0 == padded {
+                return (s & TERM) - 1;
+            }
+            i = (i + 1) & (self.slots.len() - 1);
         }
     }
 }
@@ -785,6 +819,64 @@ enum Query {
     Phrase(usize),
 }
 
+/// The queries of whole lines of queries.txt, in order, numbered within those lines.
+#[derive(Default)]
+struct Parsed {
+    queries: Vec<Query>,
+    bools: Vec<Code>,
+    phrase_terms: Vec<u32>, // a phrase's terms go to one flat list, so a line allocates nothing
+    phrase_ends: Vec<u32>,
+}
+
+/// Parses whole lines of queries.txt; every line is its own query. A line dedupe (whole lines as keys of a std
+/// HashMap) was 70 M of the parse's 110 M instructions; removing it took the VM's parse from 32 ms to 22.7 ms,
+/// for 349 repeated lines of seed 1's 50,000; a repeated line now only costs its own evaluation (b-38, b-38a).
+fn parse(text: &[u8], terms: &Interner) -> Parsed {
+    let (mut p, mut ids) = (Parsed::default(), 0..0);
+    let mut intern = |t: &[u8]| terms.intern(t, &mut ids);
+    // One pass cuts the text at every space, double quote and LF, 32 bytes per compare (`Chunk`); the empty
+    // pieces are dropped, so a PHRASE line is its keyword and terms (spec 2.3: terms are a-z and 0-9). It replaces
+    // a split per line and per word, byte by byte, and a Vec per line: the parse fell from 76 M to 37 M
+    // instructions (cachegrind, seed 1) and from 22.4 ms to 16.6 ms on the VM (medians of 15 runs). (b-69)
+    let (mut words, mut from) = (Vec::new(), 0);
+    // `<=`: a chunk at the end itself marks the end (`lf`) when the length is a multiple of 32.
+    for i in (0..=text.len()).step_by(32) {
+        let chunk = Chunk::load(text, i);
+        let lf = chunk.lf(text, i);
+        let mut cuts = lf | chunk.eq_mask(b' ') | chunk.eq_mask(b'"');
+        while cuts != 0 {
+            let at = i + cuts.trailing_zeros() as usize;
+            if at > from {
+                words.push(&text[from..at]);
+            }
+            if lf >> (at - i) & 1 != 0 && !words.is_empty() {
+                p.queries.push(if words[0] == b"PHRASE" {
+                    p.phrase_terms.extend(words[1..].iter().map(|t| intern(t)));
+                    p.phrase_ends.push(p.phrase_terms.len() as u32);
+                    Query::Phrase(p.phrase_ends.len() - 1)
+                } else {
+                    // spec 2.3: "BOOL" term *(op term); op is AND (OP_AND = 0), OR or NOT.
+                    let mut code = [NIL; MAX_BOOL_TERMS];
+                    code[0] = intern(words[1]);
+                    for (w, pair) in code[1..].iter_mut().zip(words[2..].chunks(2)) {
+                        let op = (pair[0] == b"OR") as u32 * OP_OR + (pair[0] == b"NOT") as u32 * OP_NOT;
+                        *w = op << OP_SHIFT | intern(pair[1]);
+                    }
+                    p.bools.push(code);
+                    Query::Bool(p.bools.len() - 1)
+                });
+                words.clear();
+            }
+            (from, cuts) = (at + 1, cuts & (cuts - 1));
+        }
+    }
+    // The ids this worker drew and left unused are named by no slot; zeroed, every entry below `next` is written.
+    for k in ids.start..ids.end.min(terms.cap) {
+        unsafe { terms.bytes.add(k as usize).write(TermBytes([0; MAX_TERM])) };
+    }
+    p
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let data_dir = args.next().unwrap_or_else(|| "/data".into());
@@ -796,56 +888,36 @@ fn main() {
         _ => std::thread::available_parallelism().map_or(1, |n| n.get()),
     };
 
-    // Queries: intern every term; every line is its own query. A line dedupe (whole lines as keys of a std
-    // HashMap) was 70 M of the parse's 110 M instructions; removing it took the VM's parse from 32 ms to 22.7 ms,
-    // for 349 repeated lines of seed 1's 50,000; a repeated line now only costs its own evaluation (b-38, b-38a).
+    // Queries: each worker parses one range of whole lines (`parse`), all into one term table (`Interner`).
     let qtext = map_file(&format!("{data_dir}/queries.txt"));
-    // The table starts at the size its doublings reach for one distinct term per 24 bytes of queries.txt (seed 1:
-    // 75,747 in 1.76 MB, the same 2^18 slots), sized from the input as a speed hint only: more terms still double
-    // it. The doublings up to there, each a rehash and a copy of the term bytes into fresh pages, were 4 ms of the
-    // VM's 17 ms parse (medians of 21 runs, seed 1). (b-69)
-    let n_slots = (qtext.len() / 8).next_power_of_two().max(2);
-    let (shift, bytes) = (32 - n_slots.trailing_zeros(), Vec::with_capacity(n_slots / 3));
-    let mut terms = TermTable { slots: vec![0; n_slots], shift, bytes };
-    // A phrase's terms go to one flat list, so a line allocates nothing.
-    let (mut bools, mut phrase_terms, mut phrase_ends) = (Vec::<Code>::new(), Vec::new(), Vec::new());
-    let mut parse = |words: &[&[u8]]| {
-        if words[0] == b"PHRASE" {
-            phrase_terms.extend(words[1..].iter().map(|t| terms.intern(t)));
-            phrase_ends.push(phrase_terms.len() as u32);
-            return Query::Phrase(phrase_ends.len() - 1);
+    let cut = |k: usize| line_start(qtext, qtext.len() * k / workers);
+    // The table starts at the size the old doublings reached for one distinct term per 24 bytes of queries.txt
+    // (seed 1: 75,747 in 1.76 MB, 2^18 slots), sized from the input as a speed hint only: more terms parse again at
+    // twice the slots. The doublings up to there were 4 ms of the VM's 17 ms parse (medians of 21 runs, seed 1). (b-69)
+    let mut n_slots = (qtext.len() / 8).next_power_of_two().max(2);
+    let (mut terms, parts) = loop {
+        let bytes = Vec::with_capacity(n_slots / 3);
+        let mut table = TermTable { slots: vec![0; n_slots], shift: 32 - n_slots.trailing_zeros(), bytes };
+        let interner = Interner::new(&mut table);
+        let parts = parallel(workers, |k| parse(&qtext[cut(k)..cut(k + 1)], &interner));
+        let (n, cap) = (interner.next.into_inner(), interner.cap);
+        if n <= cap {
+            unsafe { table.bytes.set_len(n as usize) }; // every entry below n is written (`parse`)
+            break (table, parts);
         }
-        // spec 2.3: "BOOL" term *(op term); op is AND (OP_AND = 0), OR or NOT.
-        let mut code = [NIL; MAX_BOOL_TERMS];
-        code[0] = terms.intern(words[1]);
-        for (w, pair) in code[1..].iter_mut().zip(words[2..].chunks(2)) {
-            let op = (pair[0] == b"OR") as u32 * OP_OR + (pair[0] == b"NOT") as u32 * OP_NOT;
-            *w = op << OP_SHIFT | terms.intern(pair[1]);
-        }
-        bools.push(code);
-        Query::Bool(bools.len() - 1)
+        n_slots *= 2;
     };
-    // One pass cuts queries.txt at every space, double quote and LF, 32 bytes per compare (`Chunk`); the empty
-    // pieces are dropped, so a PHRASE line is its keyword and terms (spec 2.3: terms are a-z and 0-9). It replaces
-    // a split per line and per word, byte by byte, and a Vec per line: the parse fell from 76 M to 37 M
-    // instructions (cachegrind, seed 1) and from 22.4 ms to 16.6 ms on the VM (medians of 15 runs). (b-69)
-    let (mut queries, mut words, mut from) = (Vec::new(), Vec::new(), 0);
-    // `<=`: a chunk at the end itself marks the end (`lf`) when the length is a multiple of 32.
-    for i in (0..=qtext.len()).step_by(32) {
-        let chunk = Chunk::load(qtext, i);
-        let lf = chunk.lf(qtext, i);
-        let mut cuts = lf | chunk.eq_mask(b' ') | chunk.eq_mask(b'"');
-        while cuts != 0 {
-            let at = i + cuts.trailing_zeros() as usize;
-            if at > from {
-                words.push(&qtext[from..at]);
-            }
-            if lf >> (at - i) & 1 != 0 && !words.is_empty() {
-                queries.push(parse(&words));
-                words.clear();
-            }
-            (from, cuts) = (at + 1, cuts & (cuts - 1));
-        }
+    // The ranges joined in file order, their BOOL and PHRASE numbers moved past the ranges before them.
+    let (mut queries, mut bools, mut phrase_terms, mut phrase_ends) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for p in parts {
+        let (b, ph, t) = (bools.len(), phrase_ends.len(), phrase_terms.len() as u32);
+        queries.extend(p.queries.iter().map(|&q| match q {
+            Query::Bool(i) => Query::Bool(b + i),
+            Query::Phrase(i) => Query::Phrase(ph + i),
+        }));
+        bools.extend(p.bools);
+        phrase_terms.extend(p.phrase_terms);
+        phrase_ends.extend(p.phrase_ends.iter().map(|&e| e + t));
     }
     let n_terms = terms.bytes.len();
 
