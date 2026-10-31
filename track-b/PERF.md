@@ -34,7 +34,7 @@ Terms used below: the board is the organisers' live leaderboard, one run per pus
 | 25 | b-13, re-run (another track's push) | e71baea · Track B (run-243ba550bb65) | 0.39 | 33 | 63.9 | OURS | - | kept |
 | 26 | b-21: the C runtime linked statically, so no dynamic loader runs before main | c32fd6a · Track B (run-458067610cc9) | 0.38 | 33 | 64.0 | KNOWN | - | kept |
 | 27 | b-21 again: a C push re-ran the same B folder (kit 92d0a12) | 2979028 · Track B (run-721cdfcab188) | 0.39 | 33 | 63.9 | KNOWN | - | kept |
-| 28 | b-27: b-24's S trim with b-21's static C runtime (kit 6f66339) | 0c42543 · Track B (run-25fdad391ad8) | 0.39 | 28 | 64.8 | OURS | - | kept |
+| 28 | b-27: b-24's S trim with b-21's static C runtime (kit 6f66339) | 0c42543 · Track B (run-25fdad391ad8) | 0.39 | 28 | 64.8 | KNOWN + OURS | - | kept |
 | 29 | b-28: every BOOL query folded per 64-document window (kit 8fed7f2) | b581408 · Track B (run-0e68675834d6) | 0.38 | 34 | 65.2 | OURS | - | kept |
 | 30 | b-28 again: a D push re-ran the same B folder (kit 8fed7f2) | e2b846c · Track B (run-4e5ca7d3ed9a) | 0.38 | 34 | 65.2 | OURS | - | kept |
 | 31 | b-30: trigger ranges carried in the touched list (kit 232155c) | 5d16aa8 · Track B (run-66a6690ad61e) | 0.38 | 35 | 65.3 | OURS | - | kept |
@@ -75,7 +75,7 @@ What each push carried (the board re-runs the same code on every push):
 - **Step 37: b-36a and b-37a again.** A track C push re-ran the same B folder.
 - **Steps 38-39: experiments b-38a and b-38b**, every query line parsed as its own query (no line dedupe) and results.txt formatted by the workers, one contiguous slice of the queries each; step 39 is a track C push re-running the same B folder.
 
-Experiments measured only on the bench box (sd-bench/B), with no board run:
+Experiments read on the bench box (sd-bench/B); the lifted ones also have their board rows in the table above:
 
 - **b-0** (OURS), the data probes; the box measured the unchanged reference on that branch: `K 1.01 (lower: official) | official K 1.01 T 55.763s | fresh K 1.01 T 55.320s | M 2098.1MB M>=input S ? | sha 5/5+5/5 OK`.
 - **b-5** (KNOWN), an AVX2 tokenizer. It was dropped: no gain, and S grew by 50 lines. `K 16.23 (lower: fresh) | official K 16.26 T 0.517s (0.513-0.520) | fresh K 16.23 T 0.519s (0.517-0.542) | M 37.2MB S 874 L | sha 5/5+5/5 OK`.
@@ -233,7 +233,7 @@ Rejected:
 - b-25 (OURS): the window path opened to OR-only queries whose cover holds at least 1 document in 128, 256 or 512; dropped, the box read K 19.13, 18.96 and 18.65, so 1 in 64 stays.
 - b-29 (KNOWN): a 32 KB / 64 KB bit filter in front of the term slots; dropped, the box read T level or 1-2 ms worse.
 - b-34 (OURS): 4-byte term-table slots, a second 4-byte table beside the 8-byte parse table, one table for parse and pass, and load 1/3; all parts read level or worse in K and were reverted.
-- b-40 (OURS): the first-id loop entered only while the worker holds fewer than ten of the query's matches (b-40a); its readings, 23.27-23.35, meet b-38b's, 23.21-23.27, at 23.27, not beyond the spread (S +4); held for the next experiment, and none followed on this code.
+- b-40 (OURS): the first-id loop entered only while the worker holds fewer than ten of the query's matches (b-40a); its readings, 23.27-23.35, meet b-38b's, 23.21-23.27, at 23.27, not beyond the spread (S +4); held for the next experiment; b-41 was built on it and kept none of its cuts, so b-40a never reached the tip.
 - b-41 (OURS): four small cuts, a BOOL line's words in a fixed array of 11 slices instead of a Vec per line, the phrase anchor position kept without a branch, the term's first trigger entry prefetched, the df sample at 1/256; none kept, level with b-40a or slower.
 - b-45 (KNOWN): BOOL evaluation moved out of the pass, over per-term lists and bitmaps; the post-pass costs 1.4-1.6 s of CPU against the flush's about 1.1 s, and per-term lists alone are 55-73 MB; not built.
 - b-46 (OURS): BOOL terms numbered by query co-occurrence; the flush's D1 misses fell 12.3 M but the hit path's first-touch reads rose 10.3 M, and the order costs about 6.3 ms of serial plan time; net negative, not built.

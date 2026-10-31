@@ -15,7 +15,7 @@ Reproduce with seed 1's full data in `<data>`, then compare the hash with the fu
 | BOOL queries folded per 64-document window, no posting store | [`fold_window`](src/main.rs#L460) | b-3, b-4, b-28, b-32b, b-33a |
 | A query is folded only in windows where a term of its cover occurs | [`cover`](src/main.rs#L412) | b-3 |
 | Counts by popcount, id sums by bit-sliced popcounts, a repeat's fold masked | [`Window`](src/main.rs#L487) | b-4, b-35a |
-| Tokens cut 32 bytes at a time | [`tokenize`](src/main.rs#L202) | b-31b, b-31c |
+| Tokens cut 32 bytes at a time | [`tokenize`](src/main.rs#L202) | b-31a, b-31b, b-31c |
 | Trigger order from document frequencies sampled on 1/128 of the corpus | [`estimate_df`](src/main.rs#L343) | b-9, b-11 |
 
 Every measurement, failed experiments included, with its board run ID: [PERF.md](PERF.md). Receipts: `reports/b/` at the repository root, one `harness-<commit>.txt` per measured submission commit, from the board's runs of that commit; each names the commit it measured, and the commit after a measured push only adds its receipt.

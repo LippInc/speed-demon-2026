@@ -197,7 +197,7 @@ impl TermTable {
     /// a query term and None for any other token; returns the index just past the LF. The text is classified 32 bytes
     /// at a time (`Chunk`), and tokens are cut where the token-byte mask changes, so no branch is taken per byte: the
     /// byte loop's two branches (separator skip, token end) were 71 M of the run's 161 M mispredicts (cachegrind,
-    /// 1 worker, seed 1). (b-31b, b-31c)
+    /// 1 worker, seed 1). (b-31a, b-31b, b-31c)
     #[inline(always)]
     fn tokenize(&self, data: &[u8], mut i: usize, mut on_token: impl FnMut(Option<u32>)) -> usize {
         let mut start = NIL as usize; // the token in progress, if any
