@@ -372,7 +372,7 @@ impl PhrasePlan {
     /// equals a token when its bytes equal the token's up to ASCII case and end there (the term table's own
     /// test). The per-token sequence push is gone: 36.3 M pushes on seed 1 for 1.1 M anchor hits.
     #[inline]
-    fn check(&self, dt: &TermTable, doc: &[u8], hits: &[(usize, usize)], mut f: impl FnMut(u32)) {
+    fn check(&self, dt: &TermTable, doc: &[u8], hits: &[(usize, usize, u32)], mut f: impl FnMut(u32)) {
         let sep = |b: &u8| !b.is_ascii_alphanumeric();
         let is_term = |token: Option<&[u8]>, t: u32| {
             token.is_some_and(|tk| {
@@ -380,10 +380,15 @@ impl PhrasePlan {
                 tk.len() <= MAX_TERM && term[..tk.len()].eq_ignore_ascii_case(tk) && term.get(tk.len()).unwrap_or(&0) == &0
             })
         };
-        for &(t, at) in hits {
+        for &(t, at, left) in hits {
             let (from, to) = (self.anchor_start[t] as usize, self.anchor_start[t + 1] as usize);
             for &(p, j, lo, hi) in &self.anchors[from..to] {
                 let (before, after) = self.terms[lo as usize..hi as usize].split_at(j as usize);
+                // b-98: the doc's token just before the anchor (its term id, NIL if none) must be the pattern's term
+                // before it: one compare skips the pattern before any byte is read (box T 0.216 -> 0.211 s).
+                if before.last().is_some_and(|&b| b != left) {
+                    continue;
+                }
                 let mut fwd = doc[at..].split(sep).filter(|t| !t.is_empty());
                 let mut bwd = doc[..at].rsplit(sep).filter(|t| !t.is_empty());
                 if after.iter().all(|&t| is_term(fwd.next(), t)) && before.iter().rev().all(|&t| is_term(bwd.next(), t)) {
@@ -780,7 +785,8 @@ fn scan(data: &[u8], dict: &TermTable, phrases: &PhrasePlan, plan: &BoolPlan) ->
     let (mut acc, mut matches) = (vec![BoolAcc::default(); plan.slot.len()], Vec::new());
     // Ending a chunk with no hits adds nothing, so the first chunk needs no special case.
     let mut chunk = ChunkLog::new(plan);
-    // The doc's anchor occurrences as (term, byte offset); per pattern the last doc id + 1 it was reported for.
+    // The doc's anchor occurrences as (term, byte offset, the term before it); per pattern the last doc id + 1 it was
+    // reported for.
     let (mut hits, mut pattern_last) = (Vec::new(), vec![0u32; phrases.anchors.len()]);
     let mut i = 0;
     while i < data.len() {
@@ -790,10 +796,12 @@ fn scan(data: &[u8], dict: &TermTable, phrases: &PhrasePlan, plan: &BoolPlan) ->
             chunk.end(plan, &mut acc);
             chunk.base = id / CHUNK * CHUNK;
         }
+        let mut left = NIL; // the previous token's term id in this doc (b-98)
         i = dict.walk(data, text, |start, hit| {
+            let before = std::mem::replace(&mut left, hit.unwrap_or(NIL));
             let Some(t) = hit else { return };
             if phrases.anchor_bits[t as usize / 64] >> (t % 64) & 1 != 0 {
-                hits.push((t as usize, start - text));
+                hits.push((t as usize, start - text, before));
             }
             if (t as usize) < plan.n_bool {
                 chunk.hit(plan.n_dense, t as usize, id);
