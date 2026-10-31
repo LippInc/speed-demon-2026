@@ -1,9 +1,8 @@
 //! regions.csv: `region_id,country` lines, LF-terminated, ids unique and ascending, country `[A-Z]{3}`
 //! (c-join.md:58-59). Parsed into a dense table region id -> group index; group 0 is `_UNMATCHED`.
 
-use std::arch::x86_64::*;
-use std::sync::atomic::{AtomicU8, AtomicU16, AtomicUsize, Ordering::*};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU8, AtomicU16, AtomicUsize, Ordering::*};
 
 use crate::records::fold;
 
@@ -29,35 +28,25 @@ fn id(b: &[u8], prev: usize, lf: usize) -> usize {
     let len = (lf - 5 - prev) as u32;
     assert!(b[lf - 4] == b',' && len > 0, "bad line");
     if len > 7 {
-        return b[prev + 1..lf - 4].iter().fold(0, |n, &d| n * 10 + (d - b'0') as usize);
+        return b[prev + 1..lf - 4]
+            .iter()
+            .fold(0, |n, &d| n * 10 + (d - b'0') as usize);
     }
     let x = u64::from_le_bytes(b[lf - 12..lf - 4].try_into().unwrap()) ^ 0x3030_3030_3030_3030;
     fold(x >> (64 - 8 * len), len) as usize
 }
 
-/// Calls `line(prev, lf)` for every LF at `lf` in `from..to`, `prev` being the LF before it. LFs come
-/// from 32-byte AVX2 compares, one movemask per block, one trailing-zeros per line: no per-byte loop,
-/// no line split (c-47 s1).
+/// Calls `line(prev, lf)` for every LF at `lf` in `from..to`, `prev` being the LF before it. A
+/// per-byte loop is enough here: a worker's piece is 64 KiB (PIECE), and the AVX2 scan that replaced
+/// it (c-47 s1) only paid when one thread parsed the whole file.
 fn each_line(b: &[u8], from: usize, to: usize, mut line: impl FnMut(usize, usize)) {
     let mut prev = b[..from].iter().rposition(|&c| c == b'\n').unwrap_or(0);
-    let mut call = |lf: usize| {
-        line(prev, lf);
-        prev = lf;
-    };
-    let mut at = from;
-    while at + 32 <= to {
-        // SAFETY: `at + 32 <= to <= b.len()`; AVX2 is on at compile time (x86-64-v3).
-        let mut m = unsafe {
-            let block = _mm256_loadu_si256(b.as_ptr().add(at) as *const __m256i);
-            _mm256_movemask_epi8(_mm256_cmpeq_epi8(block, _mm256_set1_epi8(b'\n' as i8))) as u32
-        };
-        while m != 0 {
-            call(at + m.trailing_zeros() as usize);
-            m &= m - 1;
+    for lf in from..to {
+        if b[lf] == b'\n' {
+            line(prev, lf);
+            prev = lf;
         }
-        at += 32;
     }
-    (at..to).filter(|&i| b[i] == b'\n').for_each(call);
 }
 
 /// Bytes of regions.csv per piece a worker claims, a design constant: about 34 pieces for the 2.2 MB
@@ -84,11 +73,17 @@ pub struct Build<'a> {
 impl<'a> Build<'a> {
     pub fn new(b: &'a [u8]) -> Self {
         // c-57: an empty regions.csv (outside the grammar, kit case c14 madv-empty-regions) maps nothing instead of aborting.
-        let first = b.iter().position(|&c| c == b'\n').map_or(b.len(), |p| p + 1);
+        let first = b
+            .iter()
+            .position(|&c| c == b'\n')
+            .map_or(b.len(), |p| p + 1);
         // Ids are ascending (c-join.md:59), so the last line (it ends with LF, c-join.md:58) holds
         // the largest and sizes the table: ids 0..=max, plus the group-0 entry every larger id is
         // clamped to (`group`). Zeroed memory is fresh pages, which the workers fault in.
-        let last = b.len().checked_sub(1).and_then(|e| b[..e].iter().rposition(|&c| c == b'\n'));
+        let last = b
+            .len()
+            .checked_sub(1)
+            .and_then(|e| b[..e].iter().rposition(|&c| c == b'\n'));
         let max = last.map_or(0, |prev| id(b, prev, b.len() - 1));
         // SAFETY: all-zero bytes are valid atomics (0).
         let (table, code_group) = unsafe {
@@ -97,7 +92,15 @@ impl<'a> Build<'a> {
         };
         let keys = Mutex::new(vec![b"_UNMATCHED".to_vec()]);
         let (next, done) = (AtomicUsize::new(0), AtomicUsize::new(0));
-        Build { b, first, table, code_group, keys, next, done }
+        Build {
+            b,
+            first,
+            table,
+            code_group,
+            keys,
+            next,
+            done,
+        }
     }
 
     /// Fills the table from pieces until none is left unclaimed, then waits for the other workers'
@@ -110,7 +113,8 @@ impl<'a> Build<'a> {
             let from = self.first + k * PIECE;
             each_line(b, from, b.len().min(from + PIECE), |prev, lf| {
                 let c = &b[lf - 3..lf];
-                let code = (c[0] as usize * 676 + c[1] as usize * 26 + c[2] as usize).wrapping_sub(65 * 703);
+                let code = (c[0] as usize * 676 + c[1] as usize * 26 + c[2] as usize)
+                    .wrapping_sub(65 * 703);
                 // A byte outside A-Z indexes out of range or another code; the shape is the spec's.
                 let mut group = self.code_group[code].load(Relaxed);
                 if group == 0 {

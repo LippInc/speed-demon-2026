@@ -28,22 +28,9 @@ unsafe extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
 }
 
-/// Maps a whole file read-only (regions.csv). The mapping lives until exit, so it is never unmapped.
-fn map_file(path: &str) -> &'static [u8] {
-    let file = File::open(path).unwrap_or_else(|e| panic!("open {path}: {e}"));
-    let len = file.metadata().expect("stat").len() as usize;
-    // SAFETY: a fresh read-only private mapping of an input file nobody writes during the run.
-    let map = (len != 0).then(|| unsafe {
-        // prot 1 = PROT_READ, flags 2 = MAP_PRIVATE (mmap(2)); -1 (all bits set) is MAP_FAILED.
-        let ptr = mmap(std::ptr::null_mut(), len, 1, 2, file.as_raw_fd(), 0);
-        assert!(ptr as usize != usize::MAX, "mmap {path} failed");
-        std::slice::from_raw_parts(ptr, len)
-    });
-    map.unwrap_or(&[])
-}
-
-/// Maps records.csv followed by GUARD bytes repeating `"` `,` LF (records.rs), and returns the
-/// mapping and the file's length. A private anonymous reservation of the file's length plus 4 KiB is
+/// Maps a whole file (records.csv, regions.csv) followed by GUARD bytes repeating `"` `,` LF
+/// (records.rs), and returns the mapping and the file's length. The mapping lives until exit, so it
+/// is never unmapped. A private anonymous reservation of the file's length plus 4 KiB is
 /// mapped first, then the file over its start (MAP_FIXED), so the bytes after the file are the file's
 /// last page tail or the reservation, both private and zero; the guard is written there (at most one
 /// page copied, 4 KiB of M). Every scan then stops at the guard, so the parse needs no bounds checks.
@@ -77,7 +64,8 @@ fn main() {
 
     // regions.csv was parsed by one thread before any worker started: about 4.2 ms on box 2, 79 % of
     // it user code (c-47 F0 perf). The workers now parse it together at their start (regions::Build).
-    let regions = regions::Build::new(map_file(&format!("{data}/regions.csv")));
+    let (rbuf, rlen) = map_padded(&format!("{data}/regions.csv"));
+    let regions = regions::Build::new(&rbuf[..rlen]);
 
     let (b, len) = map_padded(&format!("{data}/records.csv"));
     // Index just past the header: a BOM may start the file, and the header holds no quotes and ends
@@ -86,17 +74,13 @@ fn main() {
     let bom = if file.starts_with(BOM) { BOM.len() } else { 0 };
     let lf = file[bom..].iter().position(|&c| c == b'\n');
     let first = lf.map_or(len, |p| p + bom + 1);
-    let (mut pass_workers, mut chunk) = (workers, pass2::CHUNK);
-    let pass2 = loop {
-        let pass2 = pass2::run(b, len, first, chunk, pass_workers, &regions);
-        if pass2.exact {
-            break pass2;
-        }
+    let mut pass2 = pass2::run(b, len, first, pass2::CHUNK, workers, &regions);
+    if !pass2.exact {
         // e1: a cut was not a record start, so the parse is untrustworthy and the owners hold names
         // from wrong records; rerun on one worker over the whole file, where the start (`first`) is
         // always right.
-        (pass_workers, chunk) = (1, len);
-    };
+        pass2 = pass2::run(b, len, first, len, 1, &regions);
+    }
 
     let keys = regions.keys();
     let groups = keys.len();

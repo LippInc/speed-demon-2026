@@ -35,7 +35,11 @@ impl Slot {
     /// An empty slot: the minimum and maximum start at the extremes, so the first amount replaces both
     /// and an empty slot merges as a no-op.
     pub fn new() -> Slot {
-        Slot { amount_min: i64::MAX, amount_max: i64::MIN, ..Default::default() }
+        Slot {
+            amount_min: i64::MAX,
+            amount_max: i64::MIN,
+            ..Default::default()
+        }
     }
 
     /// Folds another worker's slot for the same group into this one.
@@ -105,7 +109,10 @@ unsafe fn text(p: *const u8, i: usize) -> (usize, usize, u64, usize) {
 #[inline(always)]
 unsafe fn digits(p: *const u8, i: usize) -> (u64, u32) {
     let x = unsafe { load::<u64>(p, i) } ^ 0x3030_3030_3030_3030;
-    (x, ((x.wrapping_add(0x7676_7676_7676_7676) | x) & 0x8080_8080_8080_8080).trailing_zeros() / 8)
+    (
+        x,
+        ((x.wrapping_add(0x7676_7676_7676_7676) | x) & 0x8080_8080_8080_8080).trailing_zeros() / 8,
+    )
 }
 
 /// Folds the `len` (0 to 8) digit values at the bottom of `x` into their number. The digits move
@@ -130,7 +137,12 @@ pub(crate) fn fold(x: u64, len: u32) -> u64 {
 /// else goes to `slow`, off the hot path. The stop byte is read from the loaded word: shifted out
 /// of range (8 digits) the word's first digit is never a stop byte.
 #[inline(always)]
-unsafe fn uint(p: *const u8, i: usize, stop: u8, slow: unsafe fn(*const u8, usize) -> (u64, usize)) -> (u64, usize) {
+unsafe fn uint(
+    p: *const u8,
+    i: usize,
+    stop: u8,
+    slow: unsafe fn(*const u8, usize) -> (u64, usize),
+) -> (u64, usize) {
     let (x, len) = unsafe { digits(p, i) };
     if x.wrapping_shr(8 * len) as u8 == stop ^ b'0' {
         return (fold(x, len), i + len as usize + 1);
@@ -166,7 +178,7 @@ unsafe fn id_long(p: *const u8, i: usize) -> (u64, usize) {
 /// past it. Up to 5 whole digits (the generator's range, c-join.md 2.2) one load holds the whole
 /// part, the point and both fraction digits: by the grammar the first non-digit is the point, whose
 /// byte is cut out (the bytes above it shifted down one) so the rest folds as one number. 6 or more
-/// whole digits take the cold path.
+/// whole digits (beyond the spec) fold digit by digit, then take the two fraction digits.
 #[inline(always)]
 unsafe fn amount(p: *const u8, i: usize) -> (i64, usize) {
     let negative = unsafe { *p.add(i) } == b'-';
@@ -174,22 +186,21 @@ unsafe fn amount(p: *const u8, i: usize) -> (i64, usize) {
     let (x, len) = unsafe { digits(p, at) };
     let (cents, next) = if len <= 5 {
         let below = unsafe { _bzhi_u64(!0, 8 * len) };
-        (fold(x & below | (x >> 8) & !below, len + 2), at + len as usize + 3)
+        (
+            fold(x & below | (x >> 8) & !below, len + 2),
+            at + len as usize + 3,
+        )
     } else {
-        unsafe { amount_long(p, at) }
+        let (whole, next) = unsafe { uint_long(p, at) };
+        let frac = unsafe { load::<u16>(p, next) }.wrapping_sub(0x3030);
+        (
+            whole.wrapping_mul(100) + (frac & 0xFF) as u64 * 10 + (frac >> 8) as u64,
+            next + 2,
+        )
     };
     // The sign without a branch: two's complement negation when `negative` is 1.
     let n = negative as i64;
     ((cents as i64 ^ -n) + n, next)
-}
-
-/// `amount`'s slow path: the whole part digit by digit, then the two fraction digits.
-#[cold]
-#[inline(never)]
-unsafe fn amount_long(p: *const u8, at: usize) -> (u64, usize) {
-    let (whole, next) = unsafe { uint_long(p, at) };
-    let frac = unsafe { load::<u16>(p, next) }.wrapping_sub(0x3030);
-    (whole.wrapping_mul(100) + (frac & 0xFF) as u64 * 10 + (frac >> 8) as u64, next + 2)
 }
 
 /// Parses the records that start in `i..end` (`i` is a record start, the last record may run past

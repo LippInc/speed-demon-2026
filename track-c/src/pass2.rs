@@ -8,7 +8,7 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::names::{Msg, Name, Owner, owner};
+use crate::names::{Msg, Name, Owner};
 use crate::{records::Slot, records::parse_chunk, records::record_start, regions::Build};
 
 unsafe extern "C" {
@@ -61,11 +61,21 @@ struct Worker<'a> {
 
 impl<'a> Worker<'a> {
     fn new(w: usize, b: &'a [u8], boxes: &'a [Mutex<Mailbox>], owners: &'a [Mutex<Owner>]) -> Self {
-        let mut out: Vec<Vec<Msg>> = (0..boxes.len()).map(|_| Vec::with_capacity(BUCKET)).collect();
+        let mut out: Vec<Vec<Msg>> = (0..boxes.len())
+            .map(|_| Vec::with_capacity(BUCKET))
+            .collect();
         let cur: Vec<*mut Msg> = out.iter_mut().map(|v| v.as_mut_ptr()).collect();
         // SAFETY: each bucket has room for BUCKET slots.
         let lim = cur.iter().map(|&c| unsafe { c.add(BUCKET - 1) }).collect();
-        Worker { w, b, boxes, owners, out, cur, lim }
+        Worker {
+            w,
+            b,
+            boxes,
+            owners,
+            out,
+            cur,
+            lim,
+        }
     }
 
     /// Files every bucket in owner `o`'s mailbox and returns them emptied, unless another worker is
@@ -89,7 +99,8 @@ impl<'a> Worker<'a> {
         self.boxes[o].lock().unwrap().empty.append(&mut buckets);
     }
 
-    /// Writes a record's name into its owner's bucket.
+    /// Writes a record's name into its owner's bucket. The owner is the name hash's high bits times
+    /// the worker count: multiply-shift over the hash's 32 bits.
     #[inline(always)]
     fn send(&mut self, name: Name) {
         let workers = self.out.len();
@@ -98,13 +109,13 @@ impl<'a> Worker<'a> {
         unsafe {
             let (o, c) = match name {
                 Name::One(h, m) => {
-                    let o = owner(h, workers);
+                    let o = (h as u64 * workers as u64 >> 32) as usize;
                     let c = *self.cur.get_unchecked(o);
                     c.write(m);
                     (o, c.add(1))
                 }
                 Name::Two(h, m, tail) => {
-                    let o = owner(h, workers);
+                    let o = (h as u64 * workers as u64 >> 32) as usize;
                     let c = *self.cur.get_unchecked(o);
                     c.write(m);
                     c.add(1).write(tail);
@@ -152,10 +163,23 @@ impl<'a> Worker<'a> {
 /// Runs the pass on `workers` threads over the records of `b[..len]` from `first` to the end (`b`
 /// holds the guard after them), cut into `chunk`-byte pieces at record starts. Every worker first
 /// helps build the region table (`Build::ready`; at once on a rerun).
-pub fn run(b: &[u8], len: usize, first: usize, chunk: usize, workers: usize, regions: &Build) -> Pass2 {
+pub fn run(
+    b: &[u8],
+    len: usize,
+    first: usize,
+    chunk: usize,
+    workers: usize,
+    regions: &Build,
+) -> Pass2 {
     let file = &b[..len];
     let chunks = (len - first).div_ceil(chunk);
-    let start = |k: usize| if k == 0 { first } else { record_start(file, (first + k * chunk).min(len)) };
+    let start = |k: usize| {
+        if k == 0 {
+            first
+        } else {
+            record_start(file, (first + k * chunk).min(len))
+        }
+    };
     let boxes: Vec<Mutex<Mailbox>> = (0..workers).map(|_| Mutex::default()).collect();
     let owners: Vec<Mutex<Owner>> = (0..workers).map(|_| Mutex::new(Owner::new())).collect();
     let next = AtomicUsize::new(0);
@@ -211,9 +235,20 @@ pub fn run(b: &[u8], len: usize, first: usize, chunk: usize, workers: usize, reg
     let slots: Vec<Vec<Slot>> = std::thread::scope(|s| {
         let handles: Vec<_> = (1..workers).map(|w| s.spawn(move || worker(w))).collect();
         let mine = worker(0);
-        std::iter::once(mine).chain(handles.into_iter().map(|h| h.join().unwrap())).collect()
+        std::iter::once(mine)
+            .chain(handles.into_iter().map(|h| h.join().unwrap()))
+            .collect()
     });
-    let counts: Vec<[u64; 256]> = owners.into_iter().map(|own| own.into_inner().unwrap().counts).collect();
-    let distinct = (0..slots[0].len()).map(|g| counts.iter().map(|c| c[g]).sum()).collect();
-    Pass2 { slots, distinct, exact: exact.load(Ordering::Relaxed) }
+    let counts: Vec<[u64; 256]> = owners
+        .into_iter()
+        .map(|own| own.into_inner().unwrap().counts)
+        .collect();
+    let distinct = (0..slots[0].len())
+        .map(|g| counts.iter().map(|c| c[g]).sum())
+        .collect();
+    Pass2 {
+        slots,
+        distinct,
+        exact: exact.load(Ordering::Relaxed),
+    }
 }

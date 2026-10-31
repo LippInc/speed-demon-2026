@@ -32,12 +32,6 @@ const MEDIUM: u64 = 1 << 55;
 const EXACT: u64 = 1 << 63;
 const TAIL: u64 = MEDIUM | EXACT;
 
-/// 64 x 64 -> 128-bit multiply, folded to 64 bits (wyhash's mum).
-fn mum(a: u64, b: u64) -> u64 {
-    let x = a as u128 * b as u128;
-    x as u64 ^ (x >> 64) as u64
-}
-
 /// The key's word `k` (bytes 8k..8k+8) with the bytes past the key cleared: BMI2's bzhi keeps the
 /// low `8 * len - 64 * k` bits (all 64 from a count of 64 to 255, none at 0), so no branch on the
 /// length. bzhi reads only the count's low byte, so a word is right while the count is under 256:
@@ -47,7 +41,12 @@ fn mum(a: u64, b: u64) -> u64 {
 /// The 8 bytes at `p + at + 8k` must lie inside the padded mapping.
 #[inline(always)]
 unsafe fn key_word(p: *const u8, at: usize, len: usize, k: usize) -> u64 {
-    unsafe { _bzhi_u64(load::<u64>(p, at + 8 * k), (8 * len).saturating_sub(64 * k) as u32) }
+    unsafe {
+        _bzhi_u64(
+            load::<u64>(p, at + 8 * k),
+            (8 * len).saturating_sub(64 * k) as u32,
+        )
+    }
 }
 
 /// An exact name's hash: one multiply per 8-byte word of `p[at..at + len]`, read from the mapping.
@@ -58,7 +57,11 @@ fn exact_hash(p: *const u8, at: usize, len: usize) -> u32 {
     // Word k of the whole key is word 0 of the key from 8k on, at most 8 bytes of it (count <= 64).
     // SAFETY: the name lies inside the mapping, and the guard covers the last word's 8-byte load.
     let word = |k: usize| unsafe { key_word(p, at + 8 * k, (len - 8 * k).min(8), 0) };
-    ((0..len.div_ceil(8)).fold(len as u64, |h, k| mum(h ^ word(k), 0x8ebc_6af0_9c88_c6e3)) >> 32) as u32
+    // 64 x 64 -> 128-bit multiplies, each folded to 64 bits (wyhash's mum).
+    ((0..len.div_ceil(8)).fold(len as u64, |h, k| {
+        let x = (h ^ word(k)) as u128 * 0x8ebc_6af0_9c88_c6e3 as u128;
+        x as u64 ^ (x >> 64) as u64
+    }) >> 32) as u32
 }
 
 /// A short or medium key's 32-bit hash: crc32c of its words, one instruction each. The sender picks
@@ -89,7 +92,10 @@ impl Name {
         let last = unsafe { *p.add(at + len - 1) } != 0;
         if len <= 16 && (w0 | w1) & HIGH == 0 && last {
             // The group in word 0's bit-7 positions: groups are at most 256 (regions.rs).
-            return Name::One(crc(&[w0, w1]), [w0 | unsafe { _pdep_u64(g as u64, HIGH) }, w1]);
+            return Name::One(
+                crc(&[w0, w1]),
+                [w0 | unsafe { _pdep_u64(g as u64, HIGH) }, w1],
+            );
         }
         unsafe { Name::long(p, at, len, last, g) }
     }
@@ -98,21 +104,27 @@ impl Name {
     #[inline(never)]
     unsafe fn long(p: *const u8, at: usize, len: usize, last: bool, g: usize) -> Name {
         // key_word's count, clamped: at 32 bytes word 0's would be 256, which bzhi reads as 0.
-        let w = [0, 1, 2, 3].map(|k| unsafe { _bzhi_u64(load::<u64>(p, at + 8 * k), (8 * len).saturating_sub(64 * k).min(64) as u32) });
+        let w = [0, 1, 2, 3].map(|k| unsafe {
+            _bzhi_u64(
+                load::<u64>(p, at + 8 * k),
+                (8 * len).saturating_sub(64 * k).min(64) as u32,
+            )
+        });
         if len <= 32 && (w[0] | w[1] | w[2] | w[3]) & HIGH == 0 && last {
             let (w1, w3) = (w[1] | MEDIUM, w[3] | TAIL);
-            return Name::Two(crc(&[w[0], w1, w[2], w3]), [w[0] | unsafe { _pdep_u64(g as u64, HIGH) }, w1], [w[2], w3]);
+            return Name::Two(
+                crc(&[w[0], w1, w[2], w3]),
+                [w[0] | unsafe { _pdep_u64(g as u64, HIGH) }, w1],
+                [w[2], w3],
+            );
         }
         // An exact name's group goes in its offset's top byte: offsets stay under 2^47 (x86-64's
         // user address space bounds every mapping), lengths under 2^63.
-        Name::One(exact_hash(p, at, len), [at as u64 | (g as u64) << 56, len as u64 | EXACT])
+        Name::One(
+            exact_hash(p, at, len),
+            [at as u64 | (g as u64) << 56, len as u64 | EXACT],
+        )
     }
-}
-
-/// The sender's owner for a hash: multiply-shift over the hash's 32 bits.
-#[inline(always)]
-pub fn owner(h: u32, workers: usize) -> usize {
-    (h as u64 * workers as u64 >> 32) as usize
 }
 
 /// One cache line of a table's index: eight entries `tag << 32 | id`, filled in order. A tag is the
@@ -121,25 +133,24 @@ pub fn owner(h: u32, workers: usize) -> usize {
 #[repr(align(64))]
 struct Bucket([u64; 8]);
 
-/// A name's key and its groups: bit g set once group g has seen the name (256 bits, regions.rs's limit).
-struct Rec<K> {
-    key: K,
-    groups: [u64; 4],
-}
-
-/// One owner's names of one kind of key: an index of 8-entry buckets over a dense array of records.
-/// Lookups start at the hash's home bucket and walk on to the next only past a full one; entries are
-/// never moved or deleted, so a key that is there sits before the first free entry of its walk.
-/// The index starts at one bucket and doubles past 3/4 full, rehashing from the tags alone; a record
-/// keeps its id, so no input size or count ever sizes it (rule 31), and every run grows it.
+/// One owner's names of one kind of key: an index of 8-entry buckets over a dense array of records
+/// `(key, groups)`, bit g of the groups set once group g has seen the name (256 bits, regions.rs's
+/// limit). Lookups start at the hash's home bucket and walk on to the next only past a full one;
+/// entries are never moved or deleted, so a key that is there sits before the first free entry of
+/// its walk. The index starts at one bucket and doubles past 3/4 full, rehashing from the tags
+/// alone; a record keeps its id, so no input size or count ever sizes it (rule 31), and every run
+/// grows it.
 struct Table<K> {
     index: Box<[Bucket]>,
-    recs: Vec<Rec<K>>,
+    recs: Vec<(K, [u64; 4])>,
 }
 
 impl<K: Copy> Table<K> {
     fn new() -> Self {
-        Table { index: Box::new([Bucket([0; 8])]), recs: Vec::new() }
+        Table {
+            index: Box::new([Bucket([0; 8])]),
+            recs: Vec::new(),
+        }
     }
 
     #[inline(always)]
@@ -167,16 +178,18 @@ impl<K: Copy> Table<K> {
                 let line = self.index.as_ptr().add(at) as *const __m256i;
                 let (lo, hi) = (_mm256_load_si256(line), _mm256_load_si256(line.add(1)));
                 // One bit per 32-bit half; an entry's tag is its upper half, the odd bits.
-                let eq = |v| _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(v, tags))) as u32;
+                let eq =
+                    |v| _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(v, tags))) as u32;
                 let mut hits = (eq(lo) | eq(hi) << 8) & 0xAAAA;
                 while hits != 0 {
                     let id = self.index[at].0[hits.trailing_zeros() as usize / 2] as u32 as usize;
-                    if same(&self.recs.get_unchecked(id).key) {
-                        return &mut self.recs.get_unchecked_mut(id).groups;
+                    if same(&self.recs.get_unchecked(id).0) {
+                        return &mut self.recs.get_unchecked_mut(id).1;
                     }
                     hits &= hits - 1;
                 }
-                let used = _mm256_movemask_pd(_mm256_castsi256_pd(lo)) | _mm256_movemask_pd(_mm256_castsi256_pd(hi)) << 4;
+                let used = _mm256_movemask_pd(_mm256_castsi256_pd(lo))
+                    | _mm256_movemask_pd(_mm256_castsi256_pd(hi)) << 4;
                 if used != 0xFF {
                     return self.insert(at, used.count_ones() as usize, tag, key);
                 }
@@ -195,8 +208,8 @@ impl<K: Copy> Table<K> {
             (at, lane) = self.free(tag);
         }
         self.index[at].0[lane] = (tag as u64) << 32 | id as u64;
-        self.recs.push(Rec { key, groups: [0; 4] });
-        &mut self.recs[id].groups
+        self.recs.push((key, [0; 4]));
+        &mut self.recs[id].1
     }
 
     /// The first free entry on a tag's walk, as (bucket, lane).
@@ -213,7 +226,8 @@ impl<K: Copy> Table<K> {
     /// Doubles the index and refiles every entry by its tag, whose low bits are the hash's.
     fn grow(&mut self) {
         // SAFETY: an all-zero bucket is valid: every entry free.
-        let bigger = unsafe { Box::<[Bucket]>::new_zeroed_slice(2 * self.index.len()).assume_init() };
+        let bigger =
+            unsafe { Box::<[Bucket]>::new_zeroed_slice(2 * self.index.len()).assume_init() };
         let old = std::mem::replace(&mut self.index, bigger);
         for &e in old.iter().flat_map(|b| &b.0).filter(|&&e| e != 0) {
             let (at, lane) = self.free((e >> 32) as u32);
@@ -233,26 +247,45 @@ pub struct Owner {
 
 impl Owner {
     pub fn new() -> Self {
-        Owner { short: Table::new(), medium: Table::new(), exact: Table::new(), counts: [0; 256] }
+        Owner {
+            short: Table::new(),
+            medium: Table::new(),
+            exact: Table::new(),
+            counts: [0; 256],
+        }
     }
 
     /// Files a bucket of messages (`b` is the padded mapping, read only for exact names). Each name's
     /// home bucket is prefetched 16 messages ahead (c-50 b6's distance).
     pub fn file(&mut self, msgs: &[Msg], b: &[u8]) {
-        let Owner { short, medium, exact, counts } = self;
+        let Owner {
+            short,
+            medium,
+            exact,
+            counts,
+        } = self;
         let mut j = 0;
         while j < msgs.len() {
             if let Some(&[f0, f1]) = msgs.get(j + 16) {
                 match f1 & TAIL {
                     0 => short.prefetch(crc(&[f0 & !HIGH, f1])),
                     // SAFETY: a medium name's two slots always travel in one bucket (pass2.rs).
-                    MEDIUM => medium.prefetch(crc(&[f0 & !HIGH, f1, unsafe { msgs.get_unchecked(j + 17) }[0], unsafe { msgs.get_unchecked(j + 17) }[1]])),
+                    MEDIUM => medium.prefetch(crc(&[
+                        f0 & !HIGH,
+                        f1,
+                        unsafe { msgs.get_unchecked(j + 17) }[0],
+                        unsafe { msgs.get_unchecked(j + 17) }[1],
+                    ])),
                     _ => {}
                 }
             }
             let [m0, m1] = msgs[j];
             // SAFETY: BMI2 is on at compile time (x86-64-v3).
-            let (key0, g) = if m1 & EXACT == 0 { (m0 & !HIGH, unsafe { _pext_u64(m0, HIGH) }) } else { (m0 << 8 >> 8, m0 >> 56) };
+            let (key0, g) = if m1 & EXACT == 0 {
+                (m0 & !HIGH, unsafe { _pext_u64(m0, HIGH) })
+            } else {
+                (m0 << 8 >> 8, m0 >> 56)
+            };
             let groups = match m1 & TAIL {
                 0 => {
                     let k = [key0, m1];
@@ -267,8 +300,14 @@ impl Owner {
                 }
                 _ => {
                     let (at, len) = (key0 as usize, (m1 & !EXACT) as usize);
-                    let same = |r: &[u64; 2]| r[1] as usize == len && b[r[0] as usize..][..len] == b[at..][..len];
-                    exact.groups(exact_hash(b.as_ptr(), at, len), [at as u64, len as u64], same)
+                    let same = |r: &[u64; 2]| {
+                        r[1] as usize == len && b[r[0] as usize..][..len] == b[at..][..len]
+                    };
+                    exact.groups(
+                        exact_hash(b.as_ptr(), at, len),
+                        [at as u64, len as u64],
+                        same,
+                    )
                 }
             };
             let (word, bit) = (&mut groups[g as usize / 64], 1 << (g % 64));
