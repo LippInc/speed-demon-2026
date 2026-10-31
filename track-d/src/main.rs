@@ -1,24 +1,21 @@
-//! Track D (Traverse): shortest directed path lengths for every query in /data/queries.txt. Build:
-//! two parallel passes over the mmapped graph.txt go straight into a forward and a reverse CSR
-//! without atomics (build_graph, place; d-2, d-8), then a claim-BFS relabel renumbers the nodes
-//! for locality (relabel; d-13). Queries: cheap answers first, then a bidirectional early-exit
-//! Dijkstra on a worker thread per query: radix heaps (RadixHeap; d-5), a small L2 label table
-//! with a large overflow or direct-mapped slots (Scratch; d-6, d-15b), six-byte CSR entries
-//! (Edge; d-12b), prefetch of the next pops' rows (d-10a), queries in relabelled order (d-15a).
+//! Track D (Traverse): shortest directed path lengths for every query in /data/queries.txt.
+//!
+//! Build: two parallel passes over the mmapped graph.txt go straight into a forward and a reverse
+//! CSR (pass 1 counts degrees, pass 2 places each edge at an atomic cursor), with no edge buffer
+//! and no copy of the input. Queries: cheap answers first (s == t, a target with no in-edges, a
+//! source with no out-edges), then a bidirectional Dijkstra per query on a worker thread, with
+//! per-thread scratch sized by the search, not by n.
 
 use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
-use std::ffi::c_void;
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
 unsafe extern "C" {
-    fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
+    fn mmap(a: *mut u8, l: usize, p: i32, f: i32, d: i32, o: i64) -> *mut u8;
     fn mallopt(param: i32, value: i32) -> i32;
 }
-const PROT_READ: i32 = 1;
-const MAP_PRIVATE: i32 = 2;
 
 /// "Unreachable": no distance reaches it, since every answer is below 2^63 (spec section 3).
 const INF: u64 = u64::MAX;
@@ -30,19 +27,11 @@ fn map_file(path: &str) -> &'static [u8] {
     if len == 0 {
         return &[];
     }
-    let ptr = unsafe { mmap(std::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, file.as_raw_fd(), 0) };
+    // prot 1 is PROT_READ, flags 2 is MAP_PRIVATE.
+    let ptr = unsafe { mmap(std::ptr::null_mut(), len, 1, 2, file.as_raw_fd(), 0) };
     assert!(ptr as isize != -1, "mmap {path} failed");
     // The mapping outlives the fd and is never unmapped: it lives until the process exits.
     unsafe { std::slice::from_raw_parts(ptr as *const u8, len) }
-}
-
-/// Worker count: available_parallelism. SD_WORKERS is rule 30's test-only override (the hash runs
-/// force 1, 4, 12 and 24 workers); the board never sets it.
-fn workers() -> usize {
-    match std::env::var("SD_WORKERS") {
-        Ok(s) => s.trim().parse::<usize>().ok().filter(|&n| n > 0).expect("SD_WORKERS must be a positive integer"),
-        Err(_) => std::thread::available_parallelism().map_or(1, |n| n.get()),
-    }
 }
 
 /// Reads one unsigned decimal ending in a space or LF (both sort below '0') and steps past the separator.
@@ -137,10 +126,6 @@ impl Csr {
 /// One edge on its way into a CSR: (row, head, weight). 12 bytes.
 type Record = (u32, u32, u32);
 
-/// Node-range partitions per worker (a design constant): enough that threads taking partitions from
-/// a counter finish together, few enough that each thread's per-partition buckets stay large.
-const PARTS_PER_WORKER: usize = 4;
-
 /// Runs job(0..threads) on scoped threads and returns their results in order.
 fn on_threads<T: Send>(threads: usize, job: impl Fn(usize) -> T + Sync) -> Vec<T> {
     std::thread::scope(|s| {
@@ -159,7 +144,7 @@ type Phases = Vec<(&'static str, Instant)>;
 /// The reverse CSR is built in this many slabs of consecutive partitions (a design constant), so
 /// only half the edges sit in records next to both CSRs: build peak below the query phase's.
 /// Re-filing the parse records by head instead (no second read of fwd) measured 176 MB of anon
-/// peak locally at 12 workers against 134 MB this way, so the slabs stay (d-8).
+/// peak locally at 12 workers against 134 MB this way, so the slabs stay.
 const REV_SLABS: usize = 2;
 
 /// Writes the rows of partitions first.. of g from the records filed for them (buckets[thread][k]
@@ -168,7 +153,6 @@ const REV_SLABS: usize = 2;
 /// into its own slices of g.end and g.edges. No atomics; each thread first-touches its own pages.
 /// Partitions before `first` must already be placed.
 fn place(buckets: &[Vec<Vec<Record>>], first: usize, shift: u32, g: &mut Csr, threads: usize) {
-    let n = g.end.len();
     let mut first_slot = vec![g.start(first << shift) as u32];
     for p in 0..buckets[0].len() {
         first_slot.push(first_slot[p] + buckets.iter().map(|b| b[p].len() as u32).sum::<u32>());
@@ -184,7 +168,7 @@ fn place(buckets: &[Vec<Vec<Record>>], first: usize, shift: u32, g: &mut Csr, th
             }
             let lo = (first + p) << shift;
             cursor.clear();
-            cursor.resize(n.min(lo + (1 << shift)) - lo, 0u32);
+            cursor.resize(g.end.len().min(lo + (1 << shift)) - lo, 0u32);
             let records = || buckets.iter().flat_map(|b| &b[p]);
             records().for_each(|r| cursor[r.0 as usize - lo] += 1);
             let mut at = first_slot[p];
@@ -208,14 +192,15 @@ fn place(buckets: &[Vec<Vec<Record>>], first: usize, shift: u32, g: &mut Csr, th
 
 /// Root ids a relabel worker takes from the shared counter at a time (a design constant). One
 /// contended fetch_add per root candidate (about n of them once the regions close in) made the
-/// claim BFS 225-230 ms locally; in chunks it is 58-83 ms (d-13).
+/// claim BFS 225-230 ms locally; in chunks it is 58-83 ms.
 const ROOT_CHUNK: usize = 4096;
 
 /// Renumbers the nodes so that nodes close in the graph get close ids: worker k runs a BFS over
 /// out-edges from node k * n / workers (node ids are a random relabelling, spec section 2, so these
 /// are random seeds: a fixed rule, not a chosen node), claiming each node once through an atomic
 /// flag; a worker whose frontier is blocked takes new roots from a shared counter. New ids are the
-/// workers' BFS orders one after the other. The forward CSR is then copied row by row into the new
+/// workers' BFS orders one after the other, and each worker then writes the new ids and row ends of
+/// its own block of that order. The forward CSR is then copied row by row into the new
 /// ids (heads mapped): each worker reads its range of old rows in old-id order, a stream, and
 /// scatters the writes to the new rows; the old CSR comes back for the rev build to reuse.
 /// Which worker claims a node depends on thread timing, so the ids differ from run to run; no answer
@@ -228,34 +213,47 @@ const ROOT_CHUNK: usize = 4096;
 /// Returns the new CSR, the old one and new_id[old id].
 fn relabel(old: Csr, threads: usize) -> (Csr, Csr, Vec<u32>) {
     let n = old.end.len();
-    let claimed: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(false)).collect();
-    let claim = |v: usize| !claimed[v].load(Ordering::Relaxed) && !claimed[v].swap(true, Ordering::Relaxed);
+    let flags: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(false)).collect();
+    // The load keeps already-claimed nodes on the read path; only a free node pays the swap.
+    let free = |v: u32| !flags[v as usize].load(Ordering::Relaxed);
+    let claim = |v: u32| (free(v) && !flags[v as usize].swap(true, Ordering::Relaxed)).then_some(v);
     let next_root = AtomicUsize::new(0);
-    let old_of: Vec<u32> = on_threads(threads, |k| {
-        let (mut order, mut head, mut roots) = (Vec::new(), 0, k * n / threads..k * n / threads + 1);
+    let old_of: Vec<(Vec<u32>, u32)> = on_threads(threads, |k| {
+        let (mut order, mut head, mut roots, mut degs) = (vec![], 0, k * n / threads..k * n / threads + 1, 0u32);
         while !roots.is_empty() {
             for root in roots {
-                order.extend(claim(root).then_some(root as u32));
+                order.extend(claim(root as u32));
                 while let Some(&u) = order.get(head) {
                     if let Some(&ahead) = order.get(head + PREFETCH_AHEAD) {
                         old.prefetch(ahead as usize);
                     }
                     head += 1;
-                    order.extend(old.row(u as usize).filter_map(|(v, _)| claim(v as usize).then_some(v)));
+                    degs += old.degree(u as usize);
+                    order.extend(old.row(u as usize).filter_map(|(v, _)| claim(v)));
                 }
             }
             let lo = next_root.fetch_add(ROOT_CHUNK, Ordering::Relaxed).min(n);
             roots = lo..n.min(lo + ROOT_CHUNK);
         }
-        order
-    })
-    .concat();
-    let (mut new_id, mut g, mut at) = (vec![0u32; n], Csr::new(n, old.edges.len()), 0);
-    for (x, &o) in old_of.iter().enumerate() {
-        new_id[o as usize] = x as u32;
-        at += old.degree(o as usize);
-        g.end[x] = at;
+        (order, degs)
+    });
+    // The serial walk over the concatenated orders was ~23 ms of the relabel's ~55 ms on one thread
+    // on the box (d-25 probe); each worker now fills its own block of new ids and row ends.
+    let (mut x0, mut e0) = (vec![0usize; threads + 1], vec![0u32; threads + 1]);
+    for (k, (order, degs)) in old_of.iter().enumerate() {
+        (x0[k + 1], e0[k + 1]) = (x0[k] + order.len(), e0[k] + degs);
     }
+    let (mut new_id, mut g) = (vec![0u32; n], Csr::new(n, old.edges.len()));
+    let (ids, end) = (Slots(new_id.as_mut_ptr()), Slots(g.end.as_mut_ptr()));
+    on_threads(threads, |k| {
+        let mut at = e0[k];
+        for (i, &o) in old_of[k].0.iter().enumerate() {
+            at += old.degree(o as usize);
+            // SAFETY: the orders partition the nodes, so slot o of new_id is written by this worker
+            // only, and end only inside this worker's own block x0[k]..x0[k + 1].
+            unsafe { ids.put(o as usize, (x0[k] + i) as u32); end.put(x0[k] + i, at) };
+        }
+    });
     let edges = Slots(g.edges.as_mut_ptr());
     let heavy = on_threads(threads, |k| {
         let mut heavy = Vec::new();
@@ -285,9 +283,10 @@ fn relabel(old: Csr, threads: usize) -> (Csr, Csr, Vec<u32>) {
 /// (d-7, 8a68049): build 104.6 -> 85 ms; locally (full seed 1, interleaved with the atomic two-pass
 /// build) 590-640 ms -> 185-200 ms at 12 workers.
 /// Partitions are the smallest power-of-two node range that splits this input's n nodes into at
-/// most PARTS_PER_WORKER * threads ranges.
+/// most 4 * threads ranges (a design constant: enough that threads taking partitions from a counter
+/// finish together, few enough that each thread's per-partition buckets stay large).
 fn build_graph(graph: &[u8], body: usize, n: usize, threads: usize, t: &mut Phases) -> Graph {
-    let shift = (0..).find(|&s| (n.max(1) - 1) >> s < PARTS_PER_WORKER * threads).unwrap();
+    let shift = (0..).find(|&s| (n.max(1) - 1) >> s < 4 * threads).unwrap();
     let parts = ((n.max(1) - 1) >> shift) + 1;
     let cuts = cut_at_lf(graph, body, threads);
     let by_tail = on_threads(threads, |k| {
@@ -351,7 +350,7 @@ struct Entry {
 /// width. Valid because Dijkstra only pushes keys >= the key it just popped. An entry moves only to
 /// lower buckets, at most 64 times, instead of paying log(len) compares per pop like a binary heap.
 /// Measured (local, full seed 1, interleaved with the floor's BinaryHeap): queries phase 1.09-1.10 s
-/// -> 0.85-0.87 s at 12 workers, 1.00-1.08 s -> 0.87-0.95 s at 4 (d-5).
+/// -> 0.85-0.87 s at 12 workers, 1.00-1.08 s -> 0.87-0.95 s at 4.
 struct RadixHeap {
     buckets: [Vec<Entry>; 65],
     last: u64,
@@ -369,10 +368,6 @@ impl RadixHeap {
         self.len = 0;
     }
 
-    fn len(&self) -> usize {
-        self.len
-    }
-
     #[inline(always)]
     fn bucket(&self, key: u64) -> usize {
         64 - (key ^ self.last).leading_zeros() as usize
@@ -380,7 +375,7 @@ impl RadixHeap {
 
     #[inline(always)]
     fn push(&mut self, key: u64, node: u32) {
-        debug_assert!(key >= self.last, "radix heap keys must not go below the last minimum");
+        debug_assert!(key >= self.last, "keys must not go below the last minimum");
         let b = self.bucket(key);
         self.buckets[b].push(Entry { key, node });
         self.len += 1;
@@ -503,14 +498,14 @@ impl Table {
 /// its size for later queries; it grows with the largest search, never to n. One heap per direction.
 /// Measured locally (4-core VM, full seed 1, interleaved with the single growing table): 10.6 % of
 /// queries outgrow the small table; queries phase 837-998 ms vs 865-1045 ms at 4 workers, 889-986 ms
-/// vs 803-861 ms at 12 (three threads share each core's L2 here); M 108.9 vs about 121 MiB (d-6).
+/// vs 803-861 ms at 12 (three threads share each core's L2 here); M 108.9 vs about 121 MiB.
 /// Slots of each thread's direct-mapped label table (a design constant, 2^16 x 20 B = 1.3 MB). After
 /// the relabel a query's nodes sit in a few runs of nearby ids, so node & (DIRECT_SLOTS - 1) puts them
 /// in nearby slots: neighbours' labels share cache lines, where a hash scatters them; a node whose
 /// slot another node holds goes to the hashed tables. Measured locally (full seed 1, interleaved with
 /// d-15a): queries at 12 workers 2^12 / 2^14 / 2^16 / 2^17 slots 362-382 / 318-378 / 261-297 /
 /// 237-261 ms vs 321-384 ms; cgroup M at 12 workers 2^16 118.6-119.3 MiB, 2^17 130.5-130.9, vs
-/// 124.1-125.3 (fewer queries grow the large table; d-15b).
+/// 124.1-125.3 (fewer queries grow the large table).
 const DIRECT_SLOTS: usize = 1 << 16;
 /// Flags a slot index into the hashed tables.
 const OVERFLOW: usize = 1 << 31;
@@ -535,12 +530,8 @@ impl Scratch {
     }
 
     fn reset(&mut self) {
-        self.direct.clear();
-        self.small.clear();
-        self.large.clear();
-        self.in_large = false;
-        self.heaps[0].clear();
-        self.heaps[1].clear();
+        (self.direct.clear(), self.small.clear(), self.large.clear(), self.in_large = false);
+        self.heaps.iter_mut().for_each(RadixHeap::clear);
     }
 
     #[inline(always)]
@@ -594,7 +585,7 @@ impl Scratch {
 /// (5,000,000 x 6 B edges + 1,740,512 x 4 B ends), both about 74 MB, three times the box's 24 MB L3,
 /// so a settle's edge row is a DRAM miss; the next pops of this side sit at the end of radix bucket 0,
 /// so their rows can load while u is relaxed. Measured locally (full seed 1, interleaved with d-8,
-/// query phase medians): 875 -> 564 ms at 12 workers, 795 -> 490 ms at 4 (d-10a).
+/// query phase medians): 875 -> 564 ms at 12 workers, 795 -> 490 ms at 4.
 /// Distances 4 / 8 / 16 gave 569 / 564 / 565 ms at 12; prefetching only end[next] gave 725-739 ms,
 /// and prefetching each neighbour's label slot as well bought under 2 %, so neither is here.
 const PREFETCH_AHEAD: usize = 8;
@@ -607,13 +598,10 @@ fn bidirectional(g: [&Csr; 2], sc: &mut Scratch, s: u32, t: u32) -> (u64, u64) {
     sc.reset();
     for (side, root) in [(0, s), (1, t)] {
         let i = sc.slot(root);
-        let mut dist = sc.label(i).dist;
-        dist[side] = 0;
-        sc.label(i).dist = dist;
+        sc.label(i).dist[side] = 0;
         sc.heaps[side].push(0, root);
     }
-    let mut mu = INF;
-    let mut settles = 0;
+    let (mut mu, mut settles) = (INF, 0);
     loop {
         // Each top is the side's exact minimum key (RadixHeap::top), so the stop test is the floor's.
         let (Some(top_f), Some(top_b)) = (sc.heaps[0].top(), sc.heaps[1].top()) else {
@@ -626,7 +614,7 @@ fn bidirectional(g: [&Csr; 2], sc: &mut Scratch, s: u32, t: u32) -> (u64, u64) {
         // Expand the side with fewer queued entries. Choosing by the lower top key instead lets a
         // backward search sweep the whole main body while a forward search from an island waits
         // behind its near-2^32 spur weights (local A/B: twice the settles, 3x the query time).
-        let side = if sc.heaps[0].len() <= sc.heaps[1].len() { 0 } else { 1 };
+        let side = (sc.heaps[1].len < sc.heaps[0].len) as usize;
         let (d, u) = sc.heaps[side].pop().unwrap();
         let iu = sc.slot(u);
         if d > { sc.label(iu).dist }[side] {
@@ -659,11 +647,8 @@ fn bidirectional(g: [&Csr; 2], sc: &mut Scratch, s: u32, t: u32) -> (u64, u64) {
 /// The answer to one query (INF means unreachable), the settles it took, and whether its labels
 /// outgrew the small table.
 fn answer(fwd: &Csr, rev: &Csr, sc: &mut Scratch, s: u32, t: u32) -> (u64, u64, bool) {
-    if s == t {
-        return (0, 0, false);
-    }
-    if rev.degree(t as usize) == 0 || fwd.degree(s as usize) == 0 {
-        return (INF, 0, false);
+    if s == t || rev.degree(t as usize) == 0 || fwd.degree(s as usize) == 0 {
+        return (if s == t { 0 } else { INF }, 0, false);
     }
     let (d, settles) = bidirectional([fwd, rev], sc, s, t);
     (d, settles, sc.in_large)
@@ -678,7 +663,11 @@ fn main() {
     unsafe { mallopt(-3, 1 << 18) }; // -3: M_MMAP_THRESHOLD
     let graph = map_file("/data/graph.txt");
     let queries = map_file("/data/queries.txt");
-    let threads = workers();
+    // Worker count: available_parallelism. SD_WORKERS is rule 30's test-only override (the hash runs
+    // force 1, 4, 12 and 24 workers); the board never sets it, and a bad value falls back.
+    let sd = std::env::var("SD_WORKERS").ok();
+    let sd = sd.and_then(|s| s.trim().parse().ok()).filter(|&n| n > 0);
+    let threads = sd.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
 
     let mut i = 0;
     let n = read_num(graph, &mut i) as usize; // header "n m" (spec section 2); m is recounted in pass 1
@@ -688,7 +677,8 @@ fn main() {
     let mut pairs = Vec::new();
     let mut i = 0;
     while i < queries.len() {
-        pairs.push((new_id[read_num(queries, &mut i) as usize], new_id[read_num(queries, &mut i) as usize]));
+        let (a, b) = (read_num(queries, &mut i), read_num(queries, &mut i));
+        pairs.push((new_id[a as usize], new_id[b as usize]));
     }
 
     // Queries run in order of their relabelled (s, t), answers still land by input index: after the
@@ -700,26 +690,19 @@ fn main() {
     let mut answers = vec![(0u64, 0u64, false); pairs.len()];
     let results = on_threads(threads, |_| {
         let (mut sc, mut done) = (Scratch::new(), Vec::new());
-        loop {
-            let Some(&q) = order.get(next.fetch_add(1, Ordering::Relaxed)) else { return done };
-            let (src, dst) = pairs[q];
-            done.push((q, answer(&fwd, &rev, &mut sc, src, dst)));
+        while let Some(&q) = order.get(next.fetch_add(1, Ordering::Relaxed)) {
+            done.push((q, answer(&fwd, &rev, &mut sc, pairs[q].0, pairs[q].1)));
         }
+        done
     });
     for (q, a) in results.into_iter().flatten() {
         answers[q] = a;
     }
     t.push(("queries", Instant::now()));
 
-    let mut out = String::with_capacity(answers.len() * 12);
-    for &(d, _, _) in &answers {
-        if d == INF {
-            out.push_str("-1\n");
-        } else {
-            out.push_str(&d.to_string());
-            out.push('\n');
-        }
-    }
+    // INF is u64::MAX, so `as i64` prints it as -1; real distances stay far below 2^63.
+    let fmt = |a: &(u64, u64, bool)| format!("{}\n", a.0 as i64);
+    let out = answers.iter().map(fmt).collect::<String>();
     std::fs::write("/out/distances.txt", out).expect("write /out/distances.txt");
     t.push(("write", Instant::now()));
 

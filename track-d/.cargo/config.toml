@@ -1,5 +1,5 @@
 # x86-64-v3 (AVX2): the scoring CPU's level, and the same binary on every builder.
 # +crt-static links the C runtime statically, so the process starts without the dynamic loader
-# resolving libc (d-14: M -1.3 MB on box 2, T unchanged).
+# resolving libc (lead-AB measured +2 % K on A, about +0.3 % on B; this commit is D's probe).
 [build]
 rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "target-feature=+crt-static"]
