@@ -1,10 +1,10 @@
-//! Track D (Traverse): shortest directed path lengths for every query in /data/queries.txt.
-//!
-//! Build: two parallel passes over the mmapped graph.txt go straight into a forward and a reverse
-//! CSR (pass 1 counts degrees, pass 2 places each edge at an atomic cursor), with no edge buffer
-//! and no copy of the input. Queries: cheap answers first (s == t, a target with no in-edges, a
-//! source with no out-edges), then a bidirectional Dijkstra per query on a worker thread, with
-//! per-thread scratch sized by the search, not by n.
+//! Track D (Traverse): shortest directed path lengths for every query in /data/queries.txt. Build:
+//! two parallel passes over the mmapped graph.txt go straight into a forward and a reverse CSR
+//! without atomics (build_graph, place; d-2, d-8), then a claim-BFS relabel renumbers the nodes
+//! for locality (relabel; d-13). Queries: cheap answers first, then a bidirectional early-exit
+//! Dijkstra on a worker thread per query: radix heaps (RadixHeap; d-5), a small L2 label table
+//! with a large overflow or direct-mapped slots (Scratch; d-6, d-15b), six-byte CSR entries
+//! (Edge; d-12b), prefetch of the next pops' rows (d-10a), queries in relabelled order (d-15a).
 
 use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
 use std::ffi::c_void;
@@ -159,7 +159,7 @@ type Phases = Vec<(&'static str, Instant)>;
 /// The reverse CSR is built in this many slabs of consecutive partitions (a design constant), so
 /// only half the edges sit in records next to both CSRs: build peak below the query phase's.
 /// Re-filing the parse records by head instead (no second read of fwd) measured 176 MB of anon
-/// peak locally at 12 workers against 134 MB this way, so the slabs stay.
+/// peak locally at 12 workers against 134 MB this way, so the slabs stay (d-8).
 const REV_SLABS: usize = 2;
 
 /// Writes the rows of partitions first.. of g from the records filed for them (buckets[thread][k]
@@ -208,7 +208,7 @@ fn place(buckets: &[Vec<Vec<Record>>], first: usize, shift: u32, g: &mut Csr, th
 
 /// Root ids a relabel worker takes from the shared counter at a time (a design constant). One
 /// contended fetch_add per root candidate (about n of them once the regions close in) made the
-/// claim BFS 225-230 ms locally; in chunks it is 58-83 ms.
+/// claim BFS 225-230 ms locally; in chunks it is 58-83 ms (d-13).
 const ROOT_CHUNK: usize = 4096;
 
 /// Renumbers the nodes so that nodes close in the graph get close ids: worker k runs a BFS over
@@ -351,7 +351,7 @@ struct Entry {
 /// width. Valid because Dijkstra only pushes keys >= the key it just popped. An entry moves only to
 /// lower buckets, at most 64 times, instead of paying log(len) compares per pop like a binary heap.
 /// Measured (local, full seed 1, interleaved with the floor's BinaryHeap): queries phase 1.09-1.10 s
-/// -> 0.85-0.87 s at 12 workers, 1.00-1.08 s -> 0.87-0.95 s at 4.
+/// -> 0.85-0.87 s at 12 workers, 1.00-1.08 s -> 0.87-0.95 s at 4 (d-5).
 struct RadixHeap {
     buckets: [Vec<Entry>; 65],
     last: u64,
@@ -503,14 +503,14 @@ impl Table {
 /// its size for later queries; it grows with the largest search, never to n. One heap per direction.
 /// Measured locally (4-core VM, full seed 1, interleaved with the single growing table): 10.6 % of
 /// queries outgrow the small table; queries phase 837-998 ms vs 865-1045 ms at 4 workers, 889-986 ms
-/// vs 803-861 ms at 12 (three threads share each core's L2 here); M 108.9 vs about 121 MiB.
+/// vs 803-861 ms at 12 (three threads share each core's L2 here); M 108.9 vs about 121 MiB (d-6).
 /// Slots of each thread's direct-mapped label table (a design constant, 2^16 x 20 B = 1.3 MB). After
 /// the relabel a query's nodes sit in a few runs of nearby ids, so node & (DIRECT_SLOTS - 1) puts them
 /// in nearby slots: neighbours' labels share cache lines, where a hash scatters them; a node whose
 /// slot another node holds goes to the hashed tables. Measured locally (full seed 1, interleaved with
 /// d-15a): queries at 12 workers 2^12 / 2^14 / 2^16 / 2^17 slots 362-382 / 318-378 / 261-297 /
 /// 237-261 ms vs 321-384 ms; cgroup M at 12 workers 2^16 118.6-119.3 MiB, 2^17 130.5-130.9, vs
-/// 124.1-125.3 (fewer queries grow the large table).
+/// 124.1-125.3 (fewer queries grow the large table; d-15b).
 const DIRECT_SLOTS: usize = 1 << 16;
 /// Flags a slot index into the hashed tables.
 const OVERFLOW: usize = 1 << 31;
@@ -594,7 +594,7 @@ impl Scratch {
 /// (5,000,000 x 6 B edges + 1,740,512 x 4 B ends), both about 74 MB, three times the box's 24 MB L3,
 /// so a settle's edge row is a DRAM miss; the next pops of this side sit at the end of radix bucket 0,
 /// so their rows can load while u is relaxed. Measured locally (full seed 1, interleaved with d-8,
-/// query phase medians): 875 -> 564 ms at 12 workers, 795 -> 490 ms at 4.
+/// query phase medians): 875 -> 564 ms at 12 workers, 795 -> 490 ms at 4 (d-10a).
 /// Distances 4 / 8 / 16 gave 569 / 564 / 565 ms at 12; prefetching only end[next] gave 725-739 ms,
 /// and prefetching each neighbour's label slot as well bought under 2 %, so neither is here.
 const PREFETCH_AHEAD: usize = 8;
