@@ -1,6 +1,7 @@
 //! Track A: per (hour, endpoint) request count, nearest-rank p50/p95/p99 latency and 5xx rate.
 //! One pass over an mmap of /data/requests.log, split into byte ranges, one private table per thread;
 //! the merge, percentile selection and formatting then run in parallel, one hour per task.
+//! Main tricks: line_fields (a-5), parse_latency (a-13), Table (a-10, a-17), Hour (a-29), percentiles (a-20), release_range (a-12).
 
 use std::sync::{Mutex, atomic::AtomicUsize, atomic::Ordering::Relaxed, mpsc};
 use std::{fs::File, io::Write, os::fd::AsRawFd, thread};
@@ -19,14 +20,13 @@ unsafe extern "C" {
 /// Drops the page-table entries of data[start..end] once its scan is done, so the exit has fewer to tear down.
 /// The mapping is private and never written: a later read of these bytes (an endpoint the tail prints)
 /// faults the same bytes back in from the page cache. Only whole pages inside the range are released.
-/// Measured on this VM (seed 1 full, 20 runs): output closed -> process reaped 1.9-2.0 -> 0.8-1.3 ms at 1, 4
+/// Measured on this VM (seed 1 full, 20 runs; a-12): output closed -> process reaped 1.9-2.0 -> 0.8-1.3 ms at 1, 4
 /// and 12 workers; the work before it unchanged within noise.
 fn release_range(data: &[u8], start: usize, end: usize) {
     let (lo, hi) = (start.div_ceil(4096) * 4096, end / 4096 * 4096);
-    if lo < hi {
-        // Safety: [lo, hi) lies inside the mapping, which nothing writes. 4 is MADV_DONTNEED.
-        unsafe { madvise(data.as_ptr().add(lo), hi - lo, 4) };
-    }
+    // Safety: [lo, hi) lies inside the mapping, which nothing writes. 4 is MADV_DONTNEED. A range
+    // shorter than one page gives length 0, a no-op; wrapping_add covers lo past the input's end.
+    unsafe { madvise(data.as_ptr().wrapping_add(lo), hi.saturating_sub(lo), 4) };
 }
 
 /// The first `byte` at or after `from`, or the input's end.
@@ -37,11 +37,11 @@ fn find(data: &[u8], from: usize, byte: u8) -> usize {
 
 /// Splits data into `parts` ranges whose starts are line starts; a line belongs to the range holding its first byte.
 fn line_ranges(data: &[u8], parts: usize) -> Vec<(usize, usize)> {
-    // Range i starts at the first line start at or after len / parts * i: 0 or a position right after an LF.
+    // Range i starts at the first line start at or after len / parts * i: 0 (i = 0 or a very short
+    // input) or a position right after an LF; i = parts is the input's end.
     let start = |i: usize| match data.len() / parts * i {
         _ if i == parts => data.len(),
-        0 => 0,
-        n => (find(data, n - 1, b'\n') + 1).min(data.len()),
+        n => (find(data, n.saturating_sub(1), b'\n') + 1).min(data.len()) * (n != 0) as usize,
     };
     (0..parts).map(|i| (start(i), start(i + 1))).collect()
 }
@@ -49,7 +49,7 @@ fn line_ranges(data: &[u8], parts: usize) -> Vec<(usize, usize)> {
 /// "YYYY-MM-DDTHH" as the decimal number YYYYMMDDHH: fits u32 and sorts like the text.
 fn parse_hour(p: &[u8]) -> u32 {
     let n = |r: std::ops::Range<usize>| r.fold(0, |acc, i| acc * 10 + (p[i] - b'0') as u32);
-    ((n(0..4) * 100 + n(5..7)) * 100 + n(8..10)) * 100 + n(11..13)
+    n(0..4) * 1_000_000 + n(5..7) * 10_000 + n(8..10) * 100 + n(11..13)
 }
 
 /// Byte mask of `byte` in data[i..i + 32], one bit per byte.
@@ -63,7 +63,7 @@ fn mask32(data: &[u8], i: usize, byte: u8) -> u32 {
 
 /// The endpoint's first byte and the LF of the line starting at p. The method holds no '/', so the first '/'
 /// from byte 32 opens the endpoint; one 32-byte load finds it and, for most lines, the LF too.
-/// Measured on this VM (seed 1 full, 4 workers): scan 108 -> 79 ns per line against byte-by-byte searches
+/// Measured on this VM (seed 1 full, 4 workers; a-5): scan 108 -> 79 ns per line against byte-by-byte searches
 /// (an AVX2 LF search alone gave 95, adding a SWAR '/' search 86).
 fn line_fields(data: &[u8], p: usize) -> (usize, usize) {
     let mut i = p + ENDPOINT_MIN;
@@ -90,7 +90,7 @@ fn line_fields(data: &[u8], p: usize) -> (usize, usize) {
 /// highest space in it precedes the latency's 1 to 10 digits (spec 2). Lanes left of the digits are zeroed,
 /// so the digits sit right-aligned in 16 lanes, and two multiply-add steps fold them into four 4-digit groups.
 /// Spec 2 rules out the malformed cases (no space, over 10 digits, a non-digit, a value over u32), so none is checked.
-/// Measured on this VM (cachegrind, seed 7 sample, 1 worker): conditional mispredicts 6.86 -> 5.32 per line,
+/// Measured on this VM (cachegrind, seed 7 sample, 1 worker; a-13): conditional mispredicts 6.86 -> 5.32 per line,
 /// instructions 726 -> 693 per line, against walking back to the space and a per-digit checked loop.
 fn parse_latency(data: &[u8], lf: usize) -> (usize, u32) {
     use std::arch::x86_64::*;
@@ -137,8 +137,8 @@ fn key_hash(ep: &[u8]) -> u64 {
 /// A record is one u32 per input line: the thread-local endpoint id in the low ID_BITS bits, the latency above
 /// them. Spec 2 fixes 1,842 endpoints per seed, so ids stay below ID_ESC; a line whose id is ID_ESC or more, or whose
 /// latency is LAT_ESC (2^21 us) or more, takes three words instead: ID_ESC, the id, the latency, so every input
-/// stays exact. It replaces a 16-byte group per (thread, hour, endpoint) with 3-byte latency slots in chunk chains
-/// (a-29): the scan keeps no per-group state.
+/// stays exact. These records (a-29) replace a 16-byte group per (thread, hour, endpoint) whose latencies sat in
+/// 3-byte slots in chunk chains (a-4, a-11): the scan keeps no per-group state.
 const ID_BITS: u32 = 11;
 const ID_ESC: u32 = (1 << ID_BITS) - 1;
 const LAT_ESC: u32 = 1 << (32 - ID_BITS);
@@ -166,7 +166,7 @@ struct Table {
     // Each distinct endpoint's bytes, copied here when first seen. Everything after the scan reads endpoints from
     // this pool, never from the mapping, whose page-table entries are released once its range is scanned: read
     // from the mapping, the global merge and the output refault those pages. Measured on this VM with the
-    // per-endpoint merge below: merge 0.69 -> 0.27 ms at 4 workers, 2.27 -> 1.62 ms at 12.
+    // per-endpoint merge below: merge 0.69 -> 0.27 ms at 4 workers, 2.27 -> 1.62 ms at 12 (a-17).
     pool: Vec<u8>,
     hours: Vec<Hour>,
 }
@@ -176,13 +176,13 @@ impl Table {
         if let Some(i) = self.hours.iter().position(|h| h.hour == hour) {
             return i;
         }
-        self.hours.push(Hour { hour, ..Hour::default() });
+        self.hours.push(Default::default());
+        self.hours.last_mut().unwrap().hour = hour;
         self.hours.len() - 1
     }
 
     fn ep(&self, id: u32) -> &[u8] {
-        let (off, len) = self.eps[id as usize];
-        &self.pool[off as usize..][..len as usize]
+        &self.pool[self.eps[id as usize].0 as usize..][..self.eps[id as usize].1 as usize]
     }
 
     /// The local id of an endpoint, interning it on first sight; the table doubles once it is half full.
@@ -208,12 +208,12 @@ impl Table {
     }
 
     fn grow(&mut self) {
-        let n = self.slots.len() * 2;
-        let old = std::mem::replace(&mut self.slots, vec![(0, 0); n]);
+        let n = self.slots.len();
+        let old = std::mem::replace(&mut self.slots, vec![(0, 0); n * 2]);
         for (tag, id) in old.into_iter().filter(|s| s.1 != 0) {
-            let mut i = key_hash(self.ep(id - 1)) as usize & (n - 1);
+            let mut i = key_hash(self.ep(id - 1)) as usize & (self.slots.len() - 1);
             while self.slots[i].1 != 0 {
-                i = (i + 1) & (n - 1);
+                i = (i + 1) & (self.slots.len() - 1);
             }
             self.slots[i] = (tag, id);
         }
@@ -278,7 +278,7 @@ fn push_u64(out: &mut Vec<u8>, mut v: u64) {
 }
 
 /// A group of at most this many latencies is sorted outright: below it a sort is cheaper than three selects. The
-/// cut depends only on the group's own count. Measured on this VM (seed 1 full, select time summed over threads):
+/// cut depends only on the group's own count. Measured on this VM (seed 1 full, select time summed over threads; a-20):
 /// 16 lost at 4 and 12 workers; 32 and 64 measured alike, and 32 is kept.
 const SORT_MAX: usize = 32;
 
@@ -307,9 +307,7 @@ fn percentiles(lat: &mut [u32]) -> [u32; 3] {
 /// An endpoint's first 16 bytes as a big-endian integer, zero-padded: integer order equals byte order on
 /// those bytes, and a shorter endpoint (spec 2: no zero bytes) sorts first, as spec 4 requires.
 fn prefix_key(ep: &[u8]) -> u128 {
-    let (mut b, n) = ([0u8; 16], ep.len().min(16));
-    b[..n].copy_from_slice(&ep[..n]);
-    u128::from_be_bytes(b)
+    u128::from_be_bytes(std::array::from_fn(|i| *ep.get(i).unwrap_or(&0)))
 }
 
 /// One global endpoint order: every thread's distinct endpoints merged by bytes (spec 4), giving the
@@ -318,7 +316,7 @@ fn prefix_key(ep: &[u8]) -> u128 {
 /// smallest endpoint among the heads with that prefix (bytes compared only there), and advances every head
 /// holding that endpoint at once: one step per distinct endpoint, not per (thread, endpoint).
 /// It replaces the per-thread sort of every group by (hour, endpoint bytes) and the tail's byte sort.
-/// Measured on this VM (seed 1 full, with the endpoint pool), the merge against one that picked one head per step
+/// Measured on this VM (seed 1 full, with the endpoint pool; a-17), the merge against one that picked one head per step
 /// by comparing (prefix, bytes) across all heads: 1.38 -> 0.27 ms at 4 workers, 8.19 -> 1.62 ms at 12; the serial
 /// window from the last scan end to the first tail job 2.56 -> 1.32 ms and 9.06 -> 2.31 ms.
 /// It takes the sorted lists and drops them on return, so they are not held through the tail.
@@ -343,7 +341,7 @@ fn global_ranks(tables: &[Table], sorted: Vec<Vec<(u128, u32)>>) -> (Vec<&[u8]>,
 fn main() {
     // Pin glibc's mmap threshold (M_MMAP_THRESHOLD, -3) at its 128 KiB default. Left dynamic, freeing the first
     // large record buffer raises it to 1 MiB, so the tail's output buffers come from the heap and their freed pages
-    // stay charged while the output file grows. Measured (this VM, 12 workers, peak of RssAnon + output size):
+    // stay charged while the output file grows. Measured (this VM, 12 workers, peak of RssAnon + output size; a-11):
     // 22.4 -> 19.8 MB median.
     unsafe { mallopt(-3, 128 * 1024) };
     let file = File::open("/data/requests.log").expect("open input");
@@ -406,8 +404,7 @@ fn main() {
     // counting sort by global endpoint rank (counts summed per rank, prefix sums, one pass placing each latency)
     // puts each group's latencies side by side in `scratch`, with no comparison sort and no byte compares.
     let format_hour = |i: usize, scratch: &mut Vec<u32>| {
-        let parts = std::mem::take(&mut *jobs[i].lock().unwrap());
-        let n = all.len();
+        let (parts, n) = (std::mem::take(&mut *jobs[i].lock().unwrap()), all.len());
         let (mut start, mut errors) = (vec![0u32; n + 1], vec![0u64; n]);
         for (t, x) in parts.iter().enumerate() {
             for (e, &c) in x.counts.iter().enumerate().filter(|&(_, &c)| c > 0) {
@@ -419,7 +416,7 @@ fn main() {
         for r in 1..=n {
             start[r] += start[r - 1]; // start[r] is now where rank r's latencies begin
         }
-        scratch.clear();
+        // resize keeps the scratch capacity across hours; every slot below start[n] is written by the placement.
         scratch.resize(start[n] as usize, 0);
         let mut next = start.clone();
         for (t, x) in parts.iter().enumerate() {
@@ -436,9 +433,8 @@ fn main() {
             }
         }
         drop(parts); // every latency is placed: the records' pages go back before the formatting
-        let h = hours[i].to_string(); // YYYYMMDDHH
+        let (h, mut buf) = (hours[i].to_string(), Vec::new()); // h: YYYYMMDDHH
         let text = format!("{}-{}-{}T{}:00:00Z ", &h[..4], &h[4..6], &h[6..8], &h[8..]);
-        let mut buf = Vec::new();
         for r in (0..n).filter(|&r| start[r] < start[r + 1]) {
             let lat = &mut scratch[start[r] as usize..start[r + 1] as usize];
             let count = lat.len() as u64;

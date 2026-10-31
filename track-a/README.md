@@ -2,12 +2,24 @@
 
 Reads 3,100,000 HTTP request log lines and, for every hour and endpoint that saw traffic, writes the request count, the nearest-rank p50, p95 and p99 latency, and the number and rate of 5xx responses.
 
-K 38.29 (box `sd-bench/A`, fresh, the lower reading; official 38.55): T 0.030 s, M 23.1 MB, S 367, D 1,
-sha 5/5+5/5 (a-29, commit d00aac9). Latest board run: run-ac92f2fd600e, K 32.28, for the previous tip (a-21 + a-26);
-this tip's own board run lands with the next push.
-Reproduce with `sdrig run --track-dir track-a --track A --data <seed-1 full dir> --expected-sha <hash> --runs 5`.
+Rust, standard library only. K 38.14 (box `sd-bench/A`, commit 727bdac, a-35; official, the lower reading; fresh 38.65): T 0.031 s, M 23.3 MB, S 356, D 1. The board's best run of this design: run-0c2ed3d6fdec, K 38.98, T 0.0299 s (a-29, the same hot loop before a-35's cold-code line cuts).
 
-The task, the input files and the exact output format are in the [spec](https://github.com/hackathon-raptors/speed-demon-2026/blob/main/specs/a-ingest.md).
+Reproduce with seed 1's full data in `<data>`, then compare the hash with the full seed-1 output hash in the [spec](https://github.com/hackathon-raptors/speed-demon-2026/blob/main/specs/a-ingest.md):
+`docker build -t a track-a && docker run --rm --network=none -v <data>:/data:ro -v <out>:/out a && sha256sum <out>/summary.txt`
+
+| Trick | Where | PERF |
+|---|---|---|
+| One read-only mapping, one line-aligned byte range per thread, private tables | [`line_ranges`](src/main.rs#L39), [`scan`](src/main.rs#L241) | a-1 |
+| The endpoint's `/` and the line end from one 32-byte AVX2 load | [`line_fields`](src/main.rs#L68) | a-5 |
+| Latency digits from one 16-byte load and SIMD multiply-adds | [`parse_latency`](src/main.rs#L95) | a-6, a-13 |
+| Endpoints interned to small ids per thread, copied to a pool, one global rank | [`Table`](src/main.rs#L163), [`global_ranks`](src/main.rs#L323) | a-10, a-17 |
+| One 4-byte record per line in its hour's buffer, merged per hour by a counting sort | [`Hour`](src/main.rs#L149) | a-29 |
+| Percentiles: up to 32 latencies sorted, larger groups selected | [`percentiles`](src/main.rs#L292) | a-20 |
+| Each range's page-table entries dropped after its scan; glibc's mmap threshold pinned | [`release_range`](src/main.rs#L25), [`main`](src/main.rs#L341) | a-11, a-12 |
+
+Every measurement, failed experiments included, with its board run ID: [PERF.md](PERF.md). Receipts: `reports/a/` at the repository root, one `harness-<commit>.txt` per measured submission commit, from the board's runs of that commit; each names the commit it measured, and the commit after a measured push only adds its receipt.
+
+Limit: the scan and the join take about 20 ms of the 30 ms and the tail about 7.5 ms (a-33); six rewrites of the scan's lookup and line walk read level or slower on the box (a-7, a-8, a-16, a-22, a-31, a-34).
 
 ## Approach
 
@@ -48,4 +60,4 @@ None.
 
 ## With another 24 hours
 
-Cut the line count: S is 367 lines here, and K moves about as S^-0.15, so 300 lines would be about 3 % more K. Two rewrites of the endpoint lookup (a-22, a-31) and a line walk from 64-byte LF bitmasks (a-34) read level or lower on the box, so neither the lookup nor the LF search is where the scan waits.
+Cut the line count further: S is 356 lines here (a-35 cut 11 from cold code), and K moves about as S^-0.15, so 300 lines would be about 2.6 % more K. Two rewrites of the endpoint lookup (a-22, a-31) and a line walk from 64-byte LF bitmasks (a-34) read level or lower on the box, so neither the lookup nor the LF search is where the scan waits.
