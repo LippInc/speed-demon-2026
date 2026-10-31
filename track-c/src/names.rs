@@ -16,7 +16,7 @@ fn word(b: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(w)
 }
 
-/// 64 x 64 -> 128-bit multiply, folded to 64 bits (wyhash's mum).
+/// 64 x 64 -> 128-bit multiply, folded to 64 bits (wyhash's mum, c-11).
 fn mum(a: u64, b: u64) -> u64 {
     let x = a as u128 * b as u128;
     x as u64 ^ (x >> 64) as u64
@@ -26,7 +26,7 @@ fn mum(a: u64, b: u64) -> u64 {
 /// bytes; overlapping words for 8-16 bytes), its length, and its middle words when it is longer, folded
 /// with one 128-bit multiply per word (wyhash's constants). It replaces FxHash over every word plus
 /// murmur3's fmix64, a chain of dependent multiplies. Measured (this VM, 12 workers, full seed 1,
-/// interleaved medians of 9): pass2+names 252 -> 224 ms; probes per lookup 1.320 -> 1.324 on average,
+/// interleaved medians of 9): pass2+names 252 -> 224 ms (c-11); probes per lookup 1.320 -> 1.324 on average,
 /// 23 -> 26 at most (seed 7331: 1.322 -> 1.325, 31 -> 23). Returns the hash and the two words, which
 /// the record compare reuses (`Arena::matches`).
 pub fn hash(b: &[u8], start: usize, len: usize) -> (u64, u64, u64) {
@@ -43,9 +43,9 @@ pub fn hash(b: &[u8], start: usize, len: usize) -> (u64, u64, u64) {
 /// One slot: 0 while empty, else `(16 hash bits) << 48 | the record's address`, the record being the
 /// name's entry in the arena (`Arena`; x86-64 user addresses fit in 48 bits, checked on insert). 8
 /// bytes, where c-6's slot was 16 (meta plus a name pointer): measured (sdrig, this VM) M 19.5 ->
-/// 15.6 MiB, T unchanged. Holding the address rather than an arena offset (c-7 to c-11) spares a hit
+/// 15.6 MiB, T unchanged (c-7). Holding the address rather than an arena offset (c-7 to c-11) spares a hit
 /// the offset's block arithmetic and directory load before the record; this VM could not resolve it
-/// (interleaved medians of pass2+names: +9 % in one run, -7 % in the next), so the box decides. The hash bits
+/// (interleaved medians of pass2+names: +9 % in one run, -7 % in the next), so the box decides (c-12.1). The hash bits
 /// filter probes before the compare; growth finds a name's home slot again by rehashing its record.
 struct Slots {
     mask: usize,
@@ -60,23 +60,36 @@ impl Slots {
         })
     }
 
-    /// Probes for `key` from its home slot. Returns its id, or the index of the empty slot that
-    /// ends the probe. A slot is published (record written, then the slot stored with Release) before
-    /// it is seen non-zero here (Acquire), so the record it names is complete.
     fn find(&self, key: (&[u8], u64, u64), h: u64) -> Result<u32, usize> {
-        let mut pos = h as usize & self.mask;
-        loop {
-            let slot = self.slots[pos].load(Ordering::Acquire);
-            if slot == 0 {
-                return Err(pos);
-            }
-            // SAFETY: a published slot names a complete record in an arena block that lives,
-            // unmoved, as long as the Intern does.
-            if slot >> 48 == h >> 32 & 0xFFFF && let Some(id) = unsafe { matches(record(slot), key) } {
-                return Ok(id);
-            }
-            pos = (pos + 1) & self.mask;
+        find(&self.slots, key, h)
+    }
+
+    /// The word readers load to reach this generation: the slot array's address, and log2 of its
+    /// length in the top byte (user addresses fit in 48 bits), so a lookup needs no load of `Slots`.
+    fn packed(&self) -> u64 {
+        let addr = self.slots.as_ptr().expose_provenance() as u64;
+        assert!(addr >> 48 == 0, "a slot array above 48 bits");
+        addr | (self.slots.len().trailing_zeros() as u64) << 56
+    }
+}
+
+/// Probes `slots` (a power of two of them) for `key` from its home slot. Returns its id, or the index
+/// of the empty slot that ends the probe. A slot is published (record written, then the slot stored
+/// with Release) before it is seen non-zero here (Acquire), so the record it names is complete.
+fn find(slots: &[AtomicU64], key: (&[u8], u64, u64), h: u64) -> Result<u32, usize> {
+    let mask = slots.len() - 1;
+    let mut pos = h as usize & mask;
+    loop {
+        let slot = slots[pos].load(Ordering::Acquire);
+        if slot == 0 {
+            return Err(pos);
         }
+        // SAFETY: a published slot names a complete record in an arena block that lives,
+        // unmoved, as long as the Intern does.
+        if slot >> 48 == h >> 32 & 0xFFFF && let Some(id) = unsafe { matches(record(slot), key) } {
+            return Ok(id);
+        }
+        pos = (pos + 1) & mask;
     }
 }
 
@@ -90,7 +103,7 @@ fn record(slot: u64) -> *const u8 {
 /// (zero-padded to 8 bytes, so the masked word of a short name compares whole), and a byte compare
 /// only for longer names: no length-dependent compare loop for nearly every name. Measured (this
 /// VM, 12 workers, full seed 1, interleaved medians): pass2+names 240 -> 234 ms in one A/B of 9,
-/// 219 -> 219 ms in a second of 11, so at most a small gain.
+/// 219 -> 219 ms in a second of 11, so at most a small gain (c-11).
 ///
 /// # Safety
 /// `p` must come from a slot published after its record was written (`Writer::store`).
@@ -190,8 +203,8 @@ impl Arena {
 /// What only the inserting thread touches, under the shard's lock.
 #[derive(Default)]
 struct Writer {
-    /// Every generation of slots, the current one last. Older ones are kept until the next quiescent
-    /// point (`free_retired`), because a lock-free reader may still be probing one.
+    /// The current generation of slots, alone: a grown-out one moves to `Intern::retired`, because a
+    /// lock-free reader may still be probing it.
     generations: Vec<Box<Slots>>,
     names: usize,
     /// The shard's current arena reservation: records go at `next`, up to `end`.
@@ -229,7 +242,7 @@ impl Writer {
     /// Doubles the slots: copies every published slot into a new generation (only this thread
     /// writes slots, so plain loads suffice) and publishes it; readers still on the old generation
     /// find every name it held, and a miss there sends them to the locked re-check.
-    fn grow(&mut self, current: &AtomicPtr<Slots>) {
+    fn grow(&mut self, current: &AtomicU64) {
         let old = self.generations.last().unwrap();
         let new = Slots::new(old.slots.len() * 2);
         for entry in old.slots.iter().filter(|s| s.load(Ordering::Relaxed) != 0) {
@@ -245,7 +258,7 @@ impl Writer {
             new.slots[pos].store(slot, Ordering::Relaxed);
         }
         // Release: a reader that loads this pointer (Acquire) sees every slot copied above.
-        current.store(&*new as *const Slots as *mut Slots, Ordering::Release);
+        current.store(new.packed(), Ordering::Release);
         self.generations.push(new);
     }
 }
@@ -258,7 +271,8 @@ const SHARD_BITS: u32 = 8;
 /// seed 1), so the lock and its cache-line traffic leave the common path.
 #[repr(align(64))]
 struct Shard {
-    current: AtomicPtr<Slots>,
+    /// The current generation, as `Slots::packed`.
+    current: AtomicU64,
     writer: Mutex<Writer>,
 }
 
@@ -269,6 +283,9 @@ pub struct Intern {
     shards: Vec<Shard>,
     arena: Arena,
     next_id: AtomicU32,
+    /// Retired slot generations, each with the era it was retired in, freed by `quiesce`.
+    retired: Mutex<Vec<(u64, Box<Slots>)>>,
+    era: AtomicU64,
 }
 
 impl Intern {
@@ -279,7 +296,7 @@ impl Intern {
             .map(|_| {
                 let first = Slots::new(len);
                 Shard {
-                    current: AtomicPtr::new(&*first as *const Slots as *mut Slots),
+                    current: AtomicU64::new(first.packed()),
                     writer: Mutex::new(Writer { generations: vec![first], ..Default::default() }),
                 }
             })
@@ -291,30 +308,36 @@ impl Intern {
                 writer: ArenaWriter(Mutex::new(ArenaBlocks::default())),
             },
             next_id: AtomicU32::new(0),
+            retired: Mutex::default(),
+            era: AtomicU64::new(0),
         }
     }
 
-    /// Frees every shard's retired slot generations, keeping only the current one.
-    ///
-    /// # Safety
-    /// No `id` call may be in flight on any thread, and none may start until this returns: a lookup
-    /// can hold a pointer to any generation it loaded from `current`, but only until it returns.
-    pub unsafe fn free_retired(&self) {
-        for shard in &self.shards {
-            let mut w = shard.writer.lock().unwrap();
-            let keep = w.generations.len() - 1;
-            w.generations.drain(..keep);
-        }
+    /// Worker `me` is between chunks, holding no slot generation (a lookup holds one only until it
+    /// returns): it records the era it has reached (`u64::MAX` once `done`), then frees every retired
+    /// generation older than the era all workers have reached. Safe because growth publishes the new
+    /// generation (Release) before taking a retirement era (SeqCst), so a worker that has seen that
+    /// era at a boundary starts every later lookup from the new generation and finished every earlier
+    /// one. Freed per chunk instead of at the end, as pass 2 has no barrier: sdrig M 15.8 -> 15.2 MiB
+    /// on this VM (c-19a2 -> c-19a3), box in the commit log.
+    pub fn quiesce(&self, seen: &[AtomicU64], me: usize, done: bool) {
+        seen[me].store(if done { u64::MAX } else { self.era.load(Ordering::SeqCst) }, Ordering::SeqCst);
+        let safe = seen.iter().map(|s| s.load(Ordering::SeqCst)).min().unwrap_or(u64::MAX);
+        self.retired.lock().unwrap().retain(|&(era, _)| era >= safe);
     }
 
-    /// The id of `b[start..start + len]`, inserting it if it is new.
+        /// The id of `b[start..start + len]`, inserting it if it is new.
     pub fn id(&self, b: &[u8], start: usize, len: usize) -> u32 {
         let (h, lo, hi) = hash(b, start, len);
         let key = (&b[start..start + len], lo, hi);
         let shard = &self.shards[(h >> (64 - SHARD_BITS)) as usize];
-        // SAFETY: `current` always points at a generation owned by the shard's writer; a generation
-        // this lookup can reach is freed only at a quiescent point, when no lookup is in flight.
-        if let Ok(id) = unsafe { &*shard.current.load(Ordering::Acquire) }.find(key, h) {
+        let c = shard.current.load(Ordering::Acquire);
+        let base = std::ptr::with_exposed_provenance::<AtomicU64>(c as usize & ((1 << 56) - 1));
+        // SAFETY: `current` always holds a generation owned by the shard's writer or retired to
+        // `Intern::retired`, and one is freed only by `quiesce`, after every worker has passed a chunk
+        // boundary since its retirement, so not while this lookup can hold it. Reaching the slots from
+        // this one word instead of through `Slots` measured on box 2: T 0.064 -> 0.061-0.062 s (c-20a).
+        if let Ok(id) = find(unsafe { std::slice::from_raw_parts(base, 1 << (c >> 56)) }, key, h) {
             return id;
         }
         // Miss: take the lock, re-check the current generation (another worker may have inserted
@@ -331,6 +354,8 @@ impl Intern {
         // stress runs at SD_INTERN_SLOTS=2.
         if (w.names + 1) * 2 > last.slots.len() {
             w.grow(&shard.current);
+            let old = w.generations.remove(0);
+            self.retired.lock().unwrap().push((self.era.fetch_add(1, Ordering::SeqCst), old));
             last = w.generations.last().unwrap();
             pos = last.find(key, h).expect_err("name absent before the grow");
         }

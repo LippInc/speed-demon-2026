@@ -37,7 +37,7 @@ impl Slot {
 /// Index of the first `c` at or after `i`. Compares 32 bytes a step (AVX2 compare, movemask, trailing
 /// zeros) instead of one byte a step; the last 31 bytes of the mapping go byte by byte, so nothing is
 /// read past its end. Measured (this VM, 12 workers, full seed 1, interleaved medians): pass2+names
-/// 294 -> 244 ms.
+/// 294 -> 244 ms (c-10).
 fn find(b: &[u8], mut i: usize, c: u8) -> usize {
     #[cfg(target_feature = "avx2")]
     while i + 32 <= b.len() {
@@ -119,7 +119,7 @@ pub fn parse_range<L: Lookup + ?Sized>(
         // Terminator: CRLF or LF (c-join.md:21), skipped without a branch: one byte, plus one for a CR.
         // At the end of a file without a final terminator this is one past the end, which ends the
         // range all the same. Measured (this VM, 12 workers, full seed 1, interleaved medians of 9):
-        // pass2+names 259 -> 255 ms, inside the noise; it is kept for being four lines shorter.
+        // pass2+names 259 -> 255 ms (c-10), inside the noise; it is kept for being four lines shorter.
         *i = next + 1 + (b.get(next) == Some(&b'\r')) as usize;
         // A record that ran past the end of the file is garbage from a range cut inside a quoted
         // field (c-join.md 2.1 allows LF + digit there): it is dropped and `*i` is past `end`, so
@@ -149,36 +149,21 @@ pub fn parse_range<L: Lookup + ?Sized>(
     }
 }
 
-// Record-start cuts for N workers: records.csv is split into N equal byte ranges, and each range
-// after the first starts at its first record start, found by a short forward search — no parallel
-// scan of the file.
-
-/// Record starts for `workers` ranges: `starts[k]..starts[k + 1]` holds the records worker k parses,
-/// and `starts[workers]` is the end of the file. `first` is where the first record starts (past the
-/// header, which holds no quotes); a range with no record start gets no records.
+/// The first record start at or after `from` (`from` itself excluded unless it follows an LF), or the
+/// end of the file: where a chunk of pass 2 begins (and its predecessor ends).
 ///
 /// e1: by the grammar (c-join.md:17-36) a record opens with a digit (the id) or a BOM right after
 /// its terminator (CRLF or LF, both ending in LF). The generator's files (c-join.md 2.2) never hold
 /// an LF followed by a digit or BOM inside a quoted field (names hold no LF at all, notes are
 /// lowercase words), so LF + digit/BOM marks a record start and each start is one short search from
-/// the range's offset instead of pass 1's full quote-parity scan of every byte. The grammar alone
-/// (2.1) allows one inside quotes; then the cut is wrong, the previous worker does not stop exactly
+/// the chunk's offset instead of pass 1's full quote-parity scan of every byte. The grammar alone
+/// (2.1) allows one inside quotes; then the cut is wrong, the previous chunk does not stop exactly
 /// on it, and main reruns the whole file on one worker, so a wrong cut can never change the answer
-/// (parse_range drops a garbage record that runs past the end of the file instead of aborting). Measured (this VM, full data, 12 workers, interleaved medians of 11, warm page cache):
-/// pass1 7.3 -> 0.1 ms, total 112.6 -> 109.4 ms.
-pub fn record_starts(b: &[u8], first: usize, workers: usize) -> Vec<usize> {
-    // Equal byte ranges: len / workers each (rounded up), the last one shorter.
-    let chunk = b.len().div_ceil(workers).max(1);
-    let mut starts = vec![b.len(); workers + 1];
-    starts[0] = first;
-    for k in 1..workers {
-        starts[k] = ((k * chunk).min(b.len())..b.len())
-            .find(|&p| b[p - 1] == b'\n' && (b[p].is_ascii_digit() || b[p..].starts_with(BOM)))
-            .unwrap_or(b.len());
-    }
-    // A range with no record start begins where the next one does.
-    for k in (0..workers).rev() {
-        starts[k] = starts[k].min(starts[k + 1]);
-    }
-    starts
+/// (parse_range drops a garbage record that runs past the end of the file instead of aborting).
+/// Measured (this VM, full data, 12 workers, interleaved medians of 11, warm page cache): pass1 7.3
+/// -> 0.1 ms, total 112.6 -> 109.4 ms.
+pub fn record_start(b: &[u8], from: usize) -> usize {
+    (from.max(1)..b.len())
+        .find(|&p| b[p - 1] == b'\n' && (b[p].is_ascii_digit() || b[p..].starts_with(BOM)))
+        .unwrap_or(b.len())
 }

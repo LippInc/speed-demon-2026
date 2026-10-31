@@ -63,23 +63,21 @@ fn main() {
     let bom = if b.starts_with(BOM) { BOM.len() } else { 0 };
     let lf = b[bom..].iter().position(|&c| c == b'\n');
     let first = lf.map_or(b.len(), |p| p + bom + 1);
-    let starts = records::record_starts(b, first, workers);
-
-    let run = |starts: &[usize], intern: &Intern| match &regions.table {
-        RegionTable::Narrow(t) => pass2::run(b, starts, t.as_slice(), groups, intern),
-        RegionTable::Wide(t) => pass2::run(b, starts, t.as_slice(), groups, intern),
+    let run = |workers: usize, chunk: usize, intern: &Intern| match &regions.table {
+        RegionTable::Narrow(t) => pass2::run(b, first, chunk, workers, t.as_slice(), groups, intern),
+        RegionTable::Wide(t) => pass2::run(b, first, chunk, workers, t.as_slice(), groups, intern),
     };
     // Starting slots per intern shard (256 shards, so 16K slots, 128 KiB, before any growth).
     // SD_INTERN_SLOTS is a test-only override: forcing a tiny table (e.g. 2) runs the growth path
     // on every shard and must give the same hash. The board never sets it.
     let mut intern = Intern::new(env_num("SD_INTERN_SLOTS").unwrap_or(64));
-    let mut pass2 = run(&starts, &intern);
+    let mut pass2 = run(workers, pass2::CHUNK, &intern);
     if !pass2.exact {
         // e1: a cut was not a record start, so the parse is untrustworthy and the intern holds
         // names from wrong records; rerun on one worker over the whole file, where the start
         // (`first`) is always right.
         intern = Intern::new(env_num("SD_INTERN_SLOTS").unwrap_or(64));
-        pass2 = run(&[first, b.len()], &intern);
+        pass2 = run(1, b.len(), &intern);
     }
 
     let mut totals = vec![Slot::default(); groups];

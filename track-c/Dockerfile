@@ -1,5 +1,5 @@
 # std-only Rust for x86-64-v3, copied into a slim runtime stage. Legacy-builder syntax only (the timing box has no BuildKit).
-# +crt-static: the C runtime is linked statically, so the process starts without the dynamic loader (c-16 probe).
+# +crt-static: the C runtime is linked statically, so the process starts without the dynamic loader (c-16: M -0.3 MB on box 2, T unchanged).
 FROM rust:1-slim-trixie@sha256:1a939748a7cbab172de91a014e3804a97af1394a8c844faa67fce9401c4e40fb AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./

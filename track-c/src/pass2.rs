@@ -1,15 +1,28 @@
-//! Pass 2: every worker parses its own records into its own per-group slots and interns each name
-//! in the shared table. Each group's name bitset belongs to one worker (group % workers), which
-//! alone writes it, in bounded rounds: a worker files each (group, id) pair into one bucket per
-//! owner until any bucket is full, all workers meet at a barrier, each sets the bits of the groups
-//! it owns from the buckets addressed to it, they meet again, and the next round starts with empty
-//! buckets. Name memory is the intern table, the bitsets and workers x ROUND_PAIRS pairs, never a
-//! function of the record count.
+//! Pass 2: workers claim chunks of records.csv from a shared counter, parse each chunk's records into
+//! their own per-group slots and intern each name in the shared table. Each group's name bitset
+//! belongs to one worker (group % workers), which alone writes it: a worker files each (group, id)
+//! pair into a small bucket per owner, hands a full bucket to that owner's inbox and takes an empty one
+//! from a shared pool, and drains its own inbox after every chunk. No rounds and no barriers: a slow
+//! CPU delays only the chunks it holds and its own inbox. The rounds made every worker wait for the
+//! slowest at 27 barriers, so one doubly loaded CPU stretched the whole run by 38 % (c-18 probe w13,
+//! box 0.071 -> 0.098 s), the size of the board's swings. Shared bits set by atomic OR instead of
+//! owners measured 219 -> 494 ms on this VM (every OR fetches a line another core last wrote).
+//! Measured (this VM, 12 workers, full seed 1, interleaved medians of 9): 232 -> 180 ms wall; M about
+//! +2.5 MiB (sdrig), as retired intern generations now live to the end (no quiescent point).
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Barrier, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
-use crate::{names::Intern, names::NameSet, records::parse_range, records::Slot, regions::Lookup};
+use crate::{names::Intern, names::NameSet, records::parse_range, records::record_start, records::Slot, regions::Lookup};
+
+/// Bytes per chunk: a design constant, about 800 chunks for the 202 MB file, so the last chunks to
+/// finish are short whoever holds them. An owner drains its inbox once per chunk, so the pairs
+/// waiting for it scale with the chunk: 1 MiB chunks and 512-pair buckets measured box M 17.8 MB
+/// (c-19a); 256 KiB and 256 pairs: sdrig M 16.2 -> 15.8 MiB on this VM, box in the commit log.
+pub const CHUNK: usize = 1 << 18;
+
+/// Pairs per bucket (2 KiB): a full bucket is one hand-off to its owner.
+const BUCKET: usize = 256;
 
 /// What pass 2 returns.
 pub struct Pass2 {
@@ -17,101 +30,88 @@ pub struct Pass2 {
     pub slots: Vec<Vec<Slot>>,
     /// names_distinct per group.
     pub distinct: Vec<u64>,
-    /// False when some worker did not stop exactly on its cut, i.e. some start was not a record
-    /// start (e1); the caller must then rerun on safe cuts.
+    /// False when some chunk did not stop exactly on the next chunk's start (e1), i.e. a cut was not
+    /// a record start; the caller must then rerun on one worker with one chunk.
     pub exact: bool,
 }
 
-/// One worker's result.
-struct Worker {
-    slots: Vec<Slot>,
-    owned: Vec<NameSet>,
-}
-
-/// Runs pass 2 on one worker per `starts` window: worker k parses the records starting in
-/// `starts[k]..starts[k + 1]`.
-pub fn run<L: Lookup + ?Sized + Sync>(b: &[u8], starts: &[usize], lookup: &L, groups: usize, intern: &Intern) -> Pass2 {
-    let workers = starts.len() - 1;
+/// Runs pass 2 on `workers` threads over the records from `first` to the end, cut into `chunk`-byte
+/// pieces at record starts.
+pub fn run<L: Lookup + ?Sized + Sync>(
+    b: &[u8],
+    first: usize,
+    chunk: usize,
+    workers: usize,
+    lookup: &L,
+    groups: usize,
+    intern: &Intern,
+) -> Pass2 {
+    let chunks = (b.len() - first).div_ceil(chunk);
+    let start = |k: usize| if k == 0 { first } else { record_start(b, (first + k * chunk).min(b.len())) };
     // Group -> (owner, index among the owner's groups), so the hot loop needs no `%` or division.
-    let route: Vec<(usize, usize)> = (0..groups).map(|g| (g % workers, g / workers)).collect();
-    // Per worker, one bucket per owner of (owner-local group, id). Each owner reads only the buckets
-    // addressed to it, short contiguous runs, where it used to filter every worker's whole buffer:
-    // the noowner probe (7632abe) put that step at about 24 ms of the box's T. Measured (this VM, 12
-    // workers, full seed 1, interleaved medians of 7): pass2+names 325 -> 273 ms; 27 rounds instead of
-    // 18, since skew fills the busiest owner's bucket first; M unchanged (sdrig, about 14.5 MB a run).
-    // Pairs one worker buffers per round (8 B each, so 128 KiB a worker), split evenly over its
-    // per-owner buckets.
-    let cap = (16 * 1024 / workers).max(1);
-    let buckets: Vec<RwLock<Vec<Vec<(u32, u32)>>>> =
-        (0..workers).map(|_| RwLock::new((0..workers).map(|_| Vec::with_capacity(cap)).collect())).collect();
-    let barrier = Barrier::new(workers);
-    let finished = AtomicUsize::new(0);
-    let exact = AtomicBool::new(true);
+    let route: Vec<(usize, u32)> = (0..groups).map(|g| (g % workers, (g / workers) as u32)).collect();
+    let inbox: Vec<Mutex<Vec<Vec<(u32, u32)>>>> = (0..workers).map(|_| Mutex::default()).collect();
+    let pool: Mutex<Vec<Vec<(u32, u32)>>> = Mutex::default();
+    let take = || pool.lock().unwrap().pop().unwrap_or_else(|| Vec::with_capacity(BUCKET));
+    let (next, flushed, exact) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicBool::new(true));
+    // Per worker, the intern era it last reached between chunks (`Intern::quiesce`).
+    let seen: Vec<AtomicU64> = (0..workers).map(|_| AtomicU64::new(0)).collect();
 
-    let results: Vec<Worker> = std::thread::scope(|s| {
+    let results: Vec<(Vec<Slot>, Vec<NameSet>)> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..workers)
             .map(|w| {
-                let (buckets, route, barrier, finished, exact) =
-                    (&buckets, &route, &barrier, &finished, &exact);
+                let (route, inbox, pool, take, next, flushed, exact, seen) =
+                    (&route, &inbox, &pool, &take, &next, &flushed, &exact, &seen);
                 s.spawn(move || {
-                    let mut me = Worker {
-                        slots: vec![Slot::default(); groups],
-                        owned: (w..groups).step_by(workers).map(|_| NameSet::default()).collect(),
+                    let mut slots = vec![Slot::default(); groups];
+                    let mut owned: Vec<NameSet> = (w..groups).step_by(workers).map(|_| NameSet::default()).collect();
+                    // Sets the bits of every bucket in this worker's inbox, and returns the buckets to the pool.
+                    let drain = |owned: &mut Vec<NameSet>| {
+                        for mut bucket in std::mem::take(&mut *inbox[w].lock().unwrap()) {
+                            bucket.iter().for_each(|&(local, id)| owned[local as usize].insert(id));
+                            bucket.clear();
+                            pool.lock().unwrap().push(bucket);
+                        }
                     };
-                    let (mut i, end, mut done) = (starts[w], starts[w + 1], false);
+                    let mut out: Vec<Vec<(u32, u32)>> = (0..workers).map(|_| take()).collect();
                     loop {
-                        // Between the previous round's second barrier and this round's first, only
-                        // the writer touches its buckets; `mine` is dropped before the barrier.
-                        let mut mine = buckets[w].write().unwrap();
-                        mine.iter_mut().for_each(Vec::clear);
-                        parse_range(b, &mut i, end, lookup, &mut me.slots, |g, start, len| {
+                        let k = next.fetch_add(1, Ordering::Relaxed);
+                        intern.quiesce(seen, w, k >= chunks);
+                        if k >= chunks {
+                            break;
+                        }
+                        let (mut i, end) = (start(k), start(k + 1));
+                        parse_range(b, &mut i, end, lookup, &mut slots, |g, at, len| {
                             let (owner, local) = route[g];
-                            mine[owner].push((local as u32, intern.id(b, start, len)));
-                            // The round ends when any bucket is full.
-                            mine[owner].len() < cap
-                        });
-                        if i >= end && !done {
-                            done = true;
-                            finished.fetch_add(1, Ordering::Relaxed);
-                            // Pairwise end check (e1): the parse must stop exactly on the cut.
-                            exact.fetch_and(i == end, Ordering::Relaxed);
-                        }
-                        drop(mine);
-                        barrier.wait();
-                        // Every worker that finishes did so before this barrier, and none can
-                        // finish again before the next one, so all workers read the same value.
-                        let all_done = finished.load(Ordering::Relaxed) == workers;
-                        for theirs in buckets {
-                            for &(local, id) in &theirs.read().unwrap()[w] {
-                                me.owned[local as usize].insert(id);
+                            out[owner].push((local, intern.id(b, at, len)));
+                            if out[owner].len() == BUCKET {
+                                let full = std::mem::replace(&mut out[owner], take());
+                                inbox[owner].lock().unwrap().push(full);
                             }
-                        }
-                        if w == 0 {
-                            // Retired slot generations would otherwise live to the end of the run.
-                            // Between the two barriers no worker is inside a lookup: every lookup ran
-                            // in parse_range before the first one. Measured (sdrig, this VM): M 20.3 ->
-                            // 19.5 MiB, T unchanged; most growth happens in round 1, before the first
-                            // free, so those retired generations still overlap the peak.
-                            // SAFETY: the two barriers bracket this call, and lookups happen only
-                            // outside that window, so none is in flight or can start before it returns.
-                            unsafe { intern.free_retired() };
-                        }
-                        barrier.wait();
-                        if all_done {
-                            break me;
-                        }
+                            true
+                        });
+                        // Pairwise end check (e1): the parse must stop exactly on the next chunk's start.
+                        exact.fetch_and(i == end, Ordering::Relaxed);
+                        drain(&mut owned);
                     }
+                    for (owner, bucket) in out.into_iter().enumerate() {
+                        inbox[owner].lock().unwrap().push(bucket);
+                    }
+                    // Once every worker has flushed (each flush is under the inbox locks, before its
+                    // count), no bucket can arrive any more: one last drain empties this inbox for good.
+                    flushed.fetch_add(1, Ordering::Release);
+                    while flushed.load(Ordering::Acquire) < workers {
+                        drain(&mut owned);
+                        std::thread::yield_now();
+                    }
+                    drain(&mut owned);
+                    (slots, owned)
                 })
             })
             .collect();
         handles.into_iter().map(|h| h.join().expect("parse worker panicked")).collect()
     });
 
-    let owned = |g: usize| results[g % workers].owned[g / workers].len();
-    let distinct = (0..groups).map(owned).collect();
-    Pass2 {
-        slots: results.into_iter().map(|r| r.slots).collect(),
-        distinct,
-        exact: exact.load(Ordering::Relaxed),
-    }
+    let distinct = (0..groups).map(|g| results[g % workers].1[g / workers].len()).collect();
+    Pass2 { slots: results.into_iter().map(|r| r.0).collect(), distinct, exact: exact.load(Ordering::Relaxed) }
 }
