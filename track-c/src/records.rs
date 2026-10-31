@@ -20,20 +20,17 @@ pub struct Slot {
 impl Slot {
     /// Folds another worker's slot for the same group into this one.
     pub fn merge(&mut self, other: &Slot) {
-        if other.count == 0 {
-            return;
-        }
         if self.count == 0 {
             *self = other.clone();
-            return;
-        }
-        self.count += other.count;
+        } else if other.count > 0 {
+            self.count += other.count;
         self.id_sum += other.id_sum;
         self.amount_sum += other.amount_sum;
         self.amount_min = self.amount_min.min(other.amount_min);
         self.amount_max = self.amount_max.max(other.amount_max);
         self.name_bytes += other.name_bytes;
         self.note_bytes += other.note_bytes;
+        }
     }
 }
 
@@ -56,7 +53,8 @@ fn find(b: &[u8], mut i: usize, c: u8) -> usize {
         i += 32;
     }
     // Not found (only in a range cut inside a quoted field): the end of the mapping.
-    b.get(i..).and_then(|r| r.iter().position(|&x| x == c)).map_or(b.len(), |p| i + p)
+    let found = b.get(i..).and_then(|r| r.iter().position(|&x| x == c));
+    found.map_or(b.len(), |p| i + p)
 }
 
 /// One text field (name or note) starting at `i`, which is followed by a comma.
@@ -95,7 +93,7 @@ fn uint_until(b: &[u8], mut i: usize, stop: u8) -> (u64, usize) {
 /// Parses the records that start in `*i..end` (`*i` is a record start; the last record may run past
 /// `end`) into `slots`, indexed by the lookup's group, and calls `on_name(group, raw_start, raw_len)`
 /// with each record's raw name. Stops after a record whose `on_name` returns false, leaving `*i` at
-/// the next record start, so the caller can resume. Returns the records parsed.
+/// the next record start, so the caller can resume.
 pub fn parse_range<L: Lookup + ?Sized>(
     b: &[u8],
     i: &mut usize,
@@ -103,8 +101,7 @@ pub fn parse_range<L: Lookup + ?Sized>(
     lookup: &L,
     slots: &mut [Slot],
     mut on_name: impl FnMut(usize, usize, usize) -> bool,
-) -> u64 {
-    let mut records = 0;
+) {
     while *i < end {
         // A BOM directly after a terminator is skipped (c-join.md:36).
         let at = if b[*i..].starts_with(BOM) { *i + 3 } else { *i };
@@ -115,7 +112,8 @@ pub fn parse_range<L: Lookup + ?Sized>(
         // `-?[0-9]+\.[0-9]{2}` as integer cents (c-join.md:24, 37).
         let negative = b.get(next) == Some(&b'-');
         let (whole, next) = uint_until(b, next + negative as usize, b'.');
-        let frac = b.get(next..next + 2).map_or(0, |d| (d[0] - b'0') * 10 + (d[1] - b'0'));
+        let digits = b.get(next..next + 2);
+        let frac = digits.map_or(0, |d| (d[0] - b'0') * 10 + (d[1] - b'0'));
         let cents = whole as i64 * 100 + frac as i64;
         let (cents, next) = (if negative { -cents } else { cents }, next + 2);
         // Terminator: CRLF or LF (c-join.md:21), skipped without a branch: one byte, plus one for a CR.
@@ -138,16 +136,17 @@ pub fn parse_range<L: Lookup + ?Sized>(
         s.count += 1;
         s.id_sum += id;
         s.amount_sum += cents;
-        s.amount_min = if first { cents } else { s.amount_min.min(cents) };
-        s.amount_max = if first { cents } else { s.amount_max.max(cents) };
+        (s.amount_min, s.amount_max) = if first {
+            (cents, cents)
+        } else {
+            (cents.min(s.amount_min), cents.max(s.amount_max))
+        };
         s.name_bytes += name_len;
         s.note_bytes += note_len;
-        records += 1;
         if !on_name(group, name_start, name_raw_len) {
             break;
         }
     }
-    records
 }
 
 // Record-start cuts for N workers: records.csv is split into N equal byte ranges, and each range

@@ -8,7 +8,6 @@
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Barrier, RwLock};
-use std::time::{Duration, Instant};
 
 use crate::{names::Intern, names::NameSet, records::parse_range, records::Slot, regions::Lookup};
 
@@ -18,23 +17,15 @@ pub struct Pass2 {
     pub slots: Vec<Vec<Slot>>,
     /// names_distinct per group.
     pub distinct: Vec<u64>,
-    pub records: u64,
-    /// Per worker, the time until its range was parsed.
-    pub times: Vec<Duration>,
-    pub rounds: usize,
     /// False when some worker did not stop exactly on its cut, i.e. some start was not a record
     /// start (e1); the caller must then rerun on safe cuts.
     pub exact: bool,
 }
 
 /// One worker's result.
-#[derive(Default)]
 struct Worker {
     slots: Vec<Slot>,
     owned: Vec<NameSet>,
-    records: u64,
-    time: Duration,
-    rounds: usize,
 }
 
 /// Runs pass 2 on one worker per `starts` window: worker k parses the records starting in
@@ -63,35 +54,29 @@ pub fn run<L: Lookup + ?Sized + Sync>(b: &[u8], starts: &[usize], lookup: &L, gr
                 let (buckets, route, barrier, finished, exact) =
                     (&buckets, &route, &barrier, &finished, &exact);
                 s.spawn(move || {
-                    let t = Instant::now();
                     let mut me = Worker {
                         slots: vec![Slot::default(); groups],
-                        owned: (w..groups).step_by(workers).map(|_| Default::default()).collect(),
-                        ..Default::default()
+                        owned: (w..groups).step_by(workers).map(|_| NameSet::default()).collect(),
                     };
                     let (mut i, end, mut done) = (starts[w], starts[w + 1], false);
                     loop {
                         // Between the previous round's second barrier and this round's first, only
-                        // the writer touches its buckets.
-                        {
-                            let mut mine = buckets[w].write().unwrap();
-                            mine.iter_mut().for_each(Vec::clear);
-                            if i < end {
-                                me.records += parse_range(b, &mut i, end, lookup, &mut me.slots, |g, start, len| {
-                                    let (owner, local) = route[g];
-                                    mine[owner].push((local as u32, intern.id(b, start, len)));
-                                    // The round ends when any bucket is full.
-                                    mine[owner].len() < cap
-                                });
-                            }
-                            if i >= end && !done {
-                                done = true;
-                                me.time = t.elapsed();
-                                finished.fetch_add(1, Ordering::Relaxed);
-                                // Pairwise end check (e1): the parse must stop exactly on the cut.
-                                exact.fetch_and(i == end, Ordering::Relaxed);
-                            }
+                        // the writer touches its buckets; `mine` is dropped before the barrier.
+                        let mut mine = buckets[w].write().unwrap();
+                        mine.iter_mut().for_each(Vec::clear);
+                        parse_range(b, &mut i, end, lookup, &mut me.slots, |g, start, len| {
+                            let (owner, local) = route[g];
+                            mine[owner].push((local as u32, intern.id(b, start, len)));
+                            // The round ends when any bucket is full.
+                            mine[owner].len() < cap
+                        });
+                        if i >= end && !done {
+                            done = true;
+                            finished.fetch_add(1, Ordering::Relaxed);
+                            // Pairwise end check (e1): the parse must stop exactly on the cut.
+                            exact.fetch_and(i == end, Ordering::Relaxed);
                         }
+                        drop(mine);
                         barrier.wait();
                         // Every worker that finishes did so before this barrier, and none can
                         // finish again before the next one, so all workers read the same value.
@@ -111,7 +96,6 @@ pub fn run<L: Lookup + ?Sized + Sync>(b: &[u8], starts: &[usize], lookup: &L, gr
                             // outside that window, so none is in flight or can start before it returns.
                             unsafe { intern.free_retired() };
                         }
-                        me.rounds += 1;
                         barrier.wait();
                         if all_done {
                             break me;
@@ -126,9 +110,6 @@ pub fn run<L: Lookup + ?Sized + Sync>(b: &[u8], starts: &[usize], lookup: &L, gr
     let owned = |g: usize| results[g % workers].owned[g / workers].len();
     let distinct = (0..groups).map(owned).collect();
     Pass2 {
-        records: results.iter().map(|r| r.records).sum(),
-        times: results.iter().map(|r| r.time).collect(),
-        rounds: results[0].rounds,
         slots: results.into_iter().map(|r| r.slots).collect(),
         distinct,
         exact: exact.load(Ordering::Relaxed),

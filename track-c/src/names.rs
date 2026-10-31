@@ -8,11 +8,12 @@ use std::{cell::UnsafeCell, mem::MaybeUninit, ptr, sync::Mutex};
 /// One little-endian word of the mapping at `at`; bytes past its end read as 0, so nothing is read
 /// beyond it.
 fn word(b: &[u8], at: usize) -> u64 {
-    b.get(at..at + 8).map_or_else(|| {
-        let mut w = [0u8; 8];
-        w[..b.len() - at].copy_from_slice(&b[at..]);
-        u64::from_le_bytes(w)
-    }, |w| u64::from_le_bytes(w.try_into().unwrap()))
+    if let Some(w) = b.get(at..at + 8) {
+        return u64::from_le_bytes(w.try_into().unwrap());
+    }
+    let mut w = [0u8; 8];
+    w[..b.len() - at].copy_from_slice(&b[at..]);
+    u64::from_le_bytes(w)
 }
 
 /// 64 x 64 -> 128-bit multiply, folded to 64 bits (wyhash's mum).
@@ -29,12 +30,14 @@ fn mum(a: u64, b: u64) -> u64 {
 /// 23 -> 26 at most (seed 7331: 1.322 -> 1.325, 31 -> 23). Returns the hash and the two words, which
 /// the record compare reuses (`Arena::matches`).
 pub fn hash(b: &[u8], start: usize, len: usize) -> (u64, u64, u64) {
-    let (lo, hi) = if len >= 8 { (word(b, start), word(b, start + len - 8)) } else { (word(b, start) & ((1 << (8 * len)) - 1), 0) };
+    let lo = word(b, start) & if len >= 8 { !0 } else { (1 << 8 * len) - 1 };
+    let hi = if len < 8 { 0 } else { word(b, start + len - 8) };
     let mut acc = 0x8ebc_6af0_9c88_c6e3 ^ len as u64;
     for at in (start + 8..(start + len).saturating_sub(8)).step_by(8) {
         acc = mum(acc ^ word(b, at), 0x8ebc_6af0_9c88_c6e3);
     }
-    (mum(lo ^ acc ^ 0xa076_1d64_78bd_642f, hi ^ 0xe703_7ed1_a0b4_28db), lo, hi)
+    let sig = mum(lo ^ acc ^ 0xa076_1d64_78bd_642f, hi ^ 0xe703_7ed1_a0b4_28db);
+    (sig, lo, hi)
 }
 
 /// One slot: 0 while empty, else `(16 hash bits) << 48 | the record's address`, the record being the
@@ -44,23 +47,26 @@ pub fn hash(b: &[u8], start: usize, len: usize) -> (u64, u64, u64) {
 /// the offset's block arithmetic and directory load before the record; this VM could not resolve it
 /// (interleaved medians of pass2+names: +9 % in one run, -7 % in the next), so the box decides. The hash bits
 /// filter probes before the compare; growth finds a name's home slot again by rehashing its record.
-type Slot = AtomicU64;
-
-/// One generation of a shard's slots, as (mask, slots); a power of two of them.
-struct Slots(usize, Box<[Slot]>);
+struct Slots {
+    mask: usize,
+    slots: Box<[AtomicU64]>,
+}
 
 impl Slots {
     fn new(len: usize) -> Box<Slots> {
-        Box::new(Slots(len - 1, (0..len).map(|_| AtomicU64::new(0)).collect()))
+        Box::new(Slots {
+            mask: len - 1,
+            slots: (0..len).map(|_| AtomicU64::new(0)).collect(),
+        })
     }
 
     /// Probes for `key` from its home slot. Returns its id, or the index of the empty slot that
     /// ends the probe. A slot is published (record written, then the slot stored with Release) before
     /// it is seen non-zero here (Acquire), so the record it names is complete.
     fn find(&self, key: (&[u8], u64, u64), h: u64) -> Result<u32, usize> {
-        let mut pos = h as usize & self.0;
+        let mut pos = h as usize & self.mask;
         loop {
-            let slot = self.1[pos].load(Ordering::Acquire);
+            let slot = self.slots[pos].load(Ordering::Acquire);
             if slot == 0 {
                 return Err(pos);
             }
@@ -69,7 +75,7 @@ impl Slots {
             if slot >> 48 == h >> 32 & 0xFFFF && let Some(id) = unsafe { matches(record(slot), key) } {
                 return Ok(id);
             }
-            pos = (pos + 1) & self.0;
+            pos = (pos + 1) & self.mask;
         }
     }
 }
@@ -136,7 +142,10 @@ struct ArenaWriter(Mutex<ArenaBlocks>);
 /// the writer appends behind them: the writer only writes bytes no published record covers, through
 /// raw pointers. They start uninitialised: nothing reads a byte before a record is written over it.
 #[derive(Default)]
-struct ArenaBlocks(Vec<Box<[MaybeUninit<UnsafeCell<u8>>]>>, usize);
+struct ArenaBlocks {
+    blocks: Vec<Box<[MaybeUninit<UnsafeCell<u8>>]>>,
+    used: usize,
+}
 
 /// The first arena block's size; block k is this times 2^k.
 const ARENA_BLOCK: usize = 4 << 10;
@@ -157,11 +166,11 @@ impl Arena {
     fn reserve(&self, len: usize) -> usize {
         let mut a = self.writer.0.lock().unwrap();
         // Skip to the first block whose remainder holds the reservation (blocks double, so this ends).
-        while a.1 + len > block_start(block_of(a.1) + 1) {
-            a.1 = block_start(block_of(a.1) + 1);
+        while a.used + len > block_start(block_of(a.used) + 1) {
+            a.used = block_start(block_of(a.used) + 1);
         }
-        assert!(a.1 + len < u32::MAX as usize, "names over 4 GiB");
-        let k = block_of(a.1);
+        assert!(a.used + len < u32::MAX as usize, "names over 4 GiB");
+        let k = block_of(a.used);
         // A block is allocated when a reservation first lands in it, decided by block k's own
         // directory pointer. The skip above can pass over several blocks (a reservation longer than
         // the next block, e.g. a name of 4 KiB or more, c-join.md:50), so testing `blocks.len() <= k`
@@ -171,21 +180,15 @@ impl Arena {
         if self.blocks[k].load(Ordering::Relaxed).is_null() {
             let block = Box::<[UnsafeCell<u8>]>::new_uninit_slice(ARENA_BLOCK << k);
             self.blocks[k].store(block.as_ptr() as *mut u8, Ordering::Relaxed);
-            a.0.push(block);
+            a.blocks.push(block);
         }
-        a.1 += len;
-        a.1 - len
-    }
-
-    /// Where offset `offset` is, for the shard that reserved it to write a record there.
-    fn at(&self, offset: usize) -> *mut u8 {
-        // Relaxed: the block was allocated under the arena lock before this offset was reserved.
-        let p = self.blocks[block_of(offset)].load(Ordering::Relaxed);
-        unsafe { p.add(offset - block_start(block_of(offset))) }
+        a.used += len;
+        a.used - len
     }
 }
 
 /// What only the inserting thread touches, under the shard's lock.
+#[derive(Default)]
 struct Writer {
     /// Every generation of slots, the current one last. Older ones are kept until the next quiescent
     /// point (`free_retired`), because a lock-free reader may still be probing one.
@@ -207,7 +210,9 @@ impl Writer {
             self.next = arena.reserve(len);
             self.end = self.next + len;
         }
-        let at = arena.at(self.next);
+        // Relaxed: the block was allocated under the arena lock before this offset was reserved.
+        let p = arena.blocks[block_of(self.next)].load(Ordering::Relaxed);
+        let at = unsafe { p.add(self.next - block_start(block_of(self.next))) };
         // The record's 8-byte head `[len: u32 LE][id: u32 LE]`, written below as one word.
         let head = ((id as u64) << 32 | key.len() as u64).to_le_bytes();
         // SAFETY: the record lies inside this shard's reservation, which only this shard writes,
@@ -226,18 +231,18 @@ impl Writer {
     /// find every name it held, and a miss there sends them to the locked re-check.
     fn grow(&mut self, current: &AtomicPtr<Slots>) {
         let old = self.generations.last().unwrap();
-        let new = Slots::new(old.1.len() * 2);
-        for entry in old.1.iter().filter(|s| s.load(Ordering::Relaxed) != 0) {
+        let new = Slots::new(old.slots.len() * 2);
+        for entry in old.slots.iter().filter(|s| s.load(Ordering::Relaxed) != 0) {
             let slot = entry.load(Ordering::Relaxed);
             // SAFETY: a published slot names a complete record (`Writer::store`).
             let p = record(slot);
             let len = u32::from_le_bytes(unsafe { *(p as *const [u8; 4]) }) as usize;
             let name = unsafe { std::slice::from_raw_parts(p.add(8), len) };
-            let mut pos = hash(name, 0, name.len()).0 as usize & new.0;
-            while new.1[pos].load(Ordering::Relaxed) != 0 {
-                pos = (pos + 1) & new.0;
+            let mut pos = hash(name, 0, name.len()).0 as usize & new.mask;
+            while new.slots[pos].load(Ordering::Relaxed) != 0 {
+                pos = (pos + 1) & new.mask;
             }
-            new.1[pos].store(slot, Ordering::Relaxed);
+            new.slots[pos].store(slot, Ordering::Relaxed);
         }
         // Release: a reader that loads this pointer (Acquire) sees every slot copied above.
         current.store(&*new as *const Slots as *mut Slots, Ordering::Release);
@@ -275,7 +280,7 @@ impl Intern {
                 let first = Slots::new(len);
                 Shard {
                     current: AtomicPtr::new(&*first as *const Slots as *mut Slots),
-                    writer: Mutex::new(Writer { generations: vec![first], names: 0, next: 0, end: 0 }),
+                    writer: Mutex::new(Writer { generations: vec![first], ..Default::default() }),
                 }
             })
             .collect();
@@ -302,11 +307,6 @@ impl Intern {
         }
     }
 
-    /// Distinct names interned so far; ids are 0..count.
-    pub fn count(&self) -> u32 {
-        self.next_id.load(Ordering::Relaxed)
-    }
-
     /// The id of `b[start..start + len]`, inserting it if it is new.
     pub fn id(&self, b: &[u8], start: usize, len: usize) -> u32 {
         let (h, lo, hi) = hash(b, start, len);
@@ -314,8 +314,7 @@ impl Intern {
         let shard = &self.shards[(h >> (64 - SHARD_BITS)) as usize];
         // SAFETY: `current` always points at a generation owned by the shard's writer; a generation
         // this lookup can reach is freed only at a quiescent point, when no lookup is in flight.
-        let slots = unsafe { &*shard.current.load(Ordering::Acquire) };
-        if let Ok(id) = slots.find(key, h) {
+        if let Ok(id) = unsafe { &*shard.current.load(Ordering::Acquire) }.find(key, h) {
             return id;
         }
         // Miss: take the lock, re-check the current generation (another worker may have inserted
@@ -330,7 +329,7 @@ impl Intern {
         // reach then keeps an empty slot, which is what ends a lock-free probe for a name it lacks: a
         // full retired generation (2 slots, both used) made such a probe spin forever, found by the
         // stress runs at SD_INTERN_SLOTS=2.
-        if (w.names + 1) * 2 > last.1.len() {
+        if (w.names + 1) * 2 > last.slots.len() {
             w.grow(&shard.current);
             last = w.generations.last().unwrap();
             pos = last.find(key, h).expect_err("name absent before the grow");
@@ -341,7 +340,8 @@ impl Intern {
         let addr = w.store(&self.arena, key.0, id).expose_provenance() as u64;
         assert!(addr >> 48 == 0, "a record address above 48 bits");
         // Release: a reader that sees this slot (Acquire) sees the record and its block pointer.
-        w.generations.last().unwrap().1[pos].store((h >> 32 & 0xFFFF) << 48 | addr, Ordering::Release);
+        let last = w.generations.last().unwrap();
+        last.slots[pos].store((h >> 32 & 0xFFFF) << 48 | addr, Ordering::Release);
         w.names += 1;
         id
     }
