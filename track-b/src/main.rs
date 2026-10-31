@@ -3,7 +3,8 @@
 //! Queries are read first, so only their terms are looked up. One parallel pass over the memory-mapped corpus
 //! tokenizes every document and decides every BOOL query 64 documents at a time and every
 //! PHRASE pattern (by anchor checks) for it; nothing is indexed.
-//! Main tricks: `fold_window` (b-28, b-33a), `PhrasePlan` (b-8), `TermTable` (b-36a), `Window` (b-4, b-35a), `estimate_df` (b-11).
+//! Main tricks: `fold_window` (b-28, b-33a), `PhrasePlan` (b-8), `TermTable` (b-36a),
+//! `Window` (b-4, b-35a), `estimate_df` (b-11).
 
 use std::arch::x86_64::*;
 use std::fs::File;
@@ -106,8 +107,8 @@ fn hash32(t: &[u8; MAX_TERM]) -> u32 {
     (h >> 32) as u32 ^ h as u32
 }
 
-/// The query terms: interned into it while queries.txt is parsed, then probed for every token of the pass. A slot
-/// holds the term's hash and id + 1 in one u64, so a miss reads one cache line; a hash match is then confirmed
+/// The query terms: interned into it while queries.txt is parsed, then probed for every token of the pass. A 4-byte
+/// slot holds the hash's top 2 bits and id + 1, so a miss reads one cache line; a hash match is then confirmed
 /// against the term's bytes, stored inline and zero-padded to 32 B (one more line). b-4 probed slots sized from
 /// every term occurrence (4 MB), a separate hash array, and a slice into queries.txt per term.
 struct TermTable {
@@ -174,7 +175,7 @@ impl TermTable {
 
     /// The tag only filters; the bytes decide. Token and entry are both zero-padded to 32 bytes, so one 32-byte
     /// compare settles the bytes and the length (it replaced a memcmp call and a length test per hash match).
-    /// (b-31c) Official T fell from 0.330s (0.329-0.332, b-31b) to 0.318s (0.318-0.319), K 21.35 to 21.75. Kept, final code.
+    /// (b-31c) Measured on the box: official T 0.330 s → 0.318 s, K 21.35 → 21.75.
     #[inline]
     fn find(&self, token: &[u8; MAX_TERM], h: u32) -> Option<u32> {
         let mut i = self.slot(h);
@@ -193,39 +194,10 @@ impl TermTable {
         }
     }
 
-    /// Tokenizes the doc text from `i` to its LF (spec 2.2), calling `on_token` with the term id of each token that is
-    /// a query term and None for any other token; returns the index just past the LF. The text is classified 32 bytes
-    /// at a time (`Chunk`), and tokens are cut where the token-byte mask changes, so no branch is taken per byte: the
-    /// byte loop's two branches (separator skip, token end) were 71 M of the run's 161 M mispredicts (cachegrind,
-    /// 1 worker, seed 1). (b-31a, b-31b, b-31c)
+    /// `walk` without the start offsets, for the df sample. (b-59)
     #[inline(always)]
-    fn tokenize(&self, data: &[u8], mut i: usize, mut on_token: impl FnMut(Option<u32>)) -> usize {
-        let mut start = NIL as usize; // the token in progress, if any
-        loop {
-            let chunk = Chunk::load(data, i);
-            let (lf, tok) = (chunk.lf(data, i), chunk.token_mask());
-            let tok = tok & lf.wrapping_sub(1) & !lf; // only the bytes before the doc's LF
-            let in_token = (start != NIL as usize) as u32;
-            let mut edges = tok ^ (tok << 1 | in_token); // bit k: a token starts or ends at byte i + k
-            while edges != 0 {
-                let k = i + edges.trailing_zeros() as usize;
-                if start == NIL as usize {
-                    start = k;
-                } else {
-                    on_token(self.lookup(data, start, k));
-                    start = NIL as usize;
-                }
-                edges &= edges - 1;
-            }
-            if lf != 0 {
-                let end = i + lf.trailing_zeros() as usize;
-                if start != NIL as usize {
-                    on_token(self.lookup(data, start, end));
-                }
-                return end + 1;
-            }
-            i += 32;
-        }
+    fn tokenize(&self, data: &[u8], i: usize, mut on_token: impl FnMut(Option<u32>)) -> usize {
+        self.walk(data, i, |_, t| on_token(t))
     }
 
     /// The term id of the token data[from..to], if it is a query term. Its bytes are loaded once, lower-cased by
@@ -238,6 +210,45 @@ impl TermTable {
         }
         let token = Chunk::load(data, from).folded(n);
         self.find(&token, hash32(&token))
+    }
+
+    /// `tokenize` with each token's start offset passed to `f` too: the phrase anchors need it (b-56). The text is
+    /// classified 32 bytes at a time (`Chunk`), and tokens are cut where the token-byte mask changes, so no branch is
+    /// taken per byte: the byte loop's two branches (separator skip, token end) were 71 M of the run's 161 M
+    /// mispredicts (cachegrind, 1 worker, seed 1). (b-31a, b-31b, b-31c)
+    /// Starts and ends are two masks, the i-th end closing the i-th start, so no branch decides per edge. (b-55)
+    #[inline(always)]
+    fn walk(&self, data: &[u8], mut i: usize, mut f: impl FnMut(usize, Option<u32>)) -> usize {
+        let mut start = NIL as usize; // the token in progress, if any
+        loop {
+            let chunk = Chunk::load(data, i);
+            let (lf, tok) = (chunk.lf(data, i), chunk.token_mask());
+            let tok = tok & lf.wrapping_sub(1) & !lf; // only the bytes before the doc's LF
+            let prev = tok << 1 | (start != NIL as usize) as u32; // bit k: byte i + k - 1 is a token byte
+            let mut starts = tok & !prev; // bit k: a token starts at byte i + k
+            let mut ends = !tok & prev; // bit k: a token ends just before byte i + k
+            if start != NIL as usize && ends != 0 {
+                // the token carried in from the previous chunk ends at the first end bit
+                f(start, self.lookup(data, start, i + ends.trailing_zeros() as usize));
+                ends &= ends - 1;
+                start = NIL as usize;
+            }
+            while ends != 0 {
+                // every remaining end closes the earliest open start in this chunk
+                let (s, e) = (starts.trailing_zeros() as usize, ends.trailing_zeros() as usize);
+                f(i + s, self.lookup(data, i + s, i + e));
+                starts &= starts - 1;
+                ends &= ends - 1;
+            }
+            if starts != 0 {
+                start = i + starts.trailing_zeros() as usize; // the last token runs into the next chunk
+            }
+            // The LF is no token byte, so a token that runs up to it has ended in the loop above.
+            if lf != 0 {
+                return i + lf.trailing_zeros() as usize + 1;
+            }
+            i += 32;
+        }
     }
 }
 
@@ -262,49 +273,59 @@ fn by_term<T: Copy + Default>(n_terms: usize, items: &[(u32, T)]) -> (Vec<u32>, 
 
 /// PHRASE matching by anchor checks (b-8). Each PHRASE line is one pattern and gets one anchor: its term with the
 /// lowest estimated df (the df sample only picks the anchor; a term in no doc has df 0, so a phrase with an absent
-/// term is never even checked). Each doc records its token sequence as term ids (NIL for a token that is no query
-/// term, which no phrase can match across); every occurrence of an anchor term at position i is a candidate start
-/// i - j for each pattern anchored there at offset j, confirmed by comparing the pattern's ids with the doc's.
+/// term is never even checked). The pass records only a doc's anchor occurrences, each with its byte offset; at the
+/// doc's end each one is a candidate for every pattern anchored there at offset j, confirmed by reading the
+/// pattern's other terms off the doc's bytes around it (b-56).
 /// It replaces an Aho-Corasick automaton whose edge probes, fail walks and output checks were the pass's largest
 /// part (about 0.9-1.1 s of 4.0-4.3 s at 1 worker on seed 1).
 struct PhrasePlan {
-    pattern_start: Vec<u32>, // pattern p is terms[pattern_start[p]..pattern_start[p + 1]]
     terms: Vec<u32>,
-    anchor_bits: Vec<u64>, // by term id: the term anchors at least one pattern (tested for every token)
+    anchor_bits: Vec<u64>, // by term id: the term anchors at least one pattern (tested for every hit)
     anchor_start: Vec<u32>, // by term id, into anchors (CSR)
-    anchors: Vec<(u32, u32)>, // (pattern, offset of the anchor in it)
+    anchors: Vec<(u32, u32, u32, u32)>, // (pattern, offset of the anchor in it, its terms' range in `terms`)
 }
 
 impl PhrasePlan {
     fn new(patterns: &[Vec<u32>], n_terms: usize, df: &[u32]) -> Self {
-        let mut pattern_start = vec![0];
         let mut anchor_bits = vec![0u64; n_terms.div_ceil(64)];
-        let mut anchors = Vec::new();
+        let (mut anchors, mut lo) = (Vec::new(), 0);
         for (pi, p) in patterns.iter().enumerate() {
-            pattern_start.push(pattern_start[pi] + p.len() as u32);
             let j = (0..p.len()).min_by_key(|&j| df[p[j] as usize]).unwrap();
             anchor_bits[p[j] as usize / 64] |= 1 << (p[j] % 64);
-            anchors.push((p[j], (pi as u32, j as u32)));
+            anchors.push((p[j], (pi as u32, j as u32, lo, lo + p.len() as u32)));
+            lo += p.len() as u32;
         }
         let (anchor_start, anchors) = by_term(n_terms, &anchors);
         let terms = patterns.concat();
-        PhrasePlan { pattern_start, terms, anchor_bits, anchor_start, anchors }
+        PhrasePlan { terms, anchor_bits, anchor_start, anchors }
     }
 
-    /// Calls `found(p)` for each pattern that starts at a candidate position of `seq`; `anchored` lists the
-    /// positions of anchor terms.
+    /// Calls `f(p)` for each pattern with an anchor occurrence in `hits` (term, byte offset in `doc`) at its anchor
+    /// offset and its other terms around it. `doc` is the doc's text without its LF.
+    ///
+    /// (b-56) Why the bytes decide what the doc's full token sequence did: a token is a maximal run of a-z, A-Z and
+    /// 0-9 and every other byte separates (the TAB before `doc`, the LF after it, bytes from 0x80), so the
+    /// non-empty pieces of doc[at..] split at separators are the doc's own tokens from the anchor on, and those
+    /// of doc[..at] split from the right are the tokens before it in reverse; no phrase spans two docs. A term
+    /// equals a token when its bytes equal the token's up to ASCII case and end there (the term table's own
+    /// test). The per-token sequence push is gone: 36.3 M pushes on seed 1 for 1.1 M anchor hits.
     #[inline]
-    fn check(&self, seq: &[u32], anchored: &[u32], mut found: impl FnMut(u32)) {
-        for &i in anchored {
-            let t = seq[i as usize] as usize;
-            let (from, to) = (self.anchor_start[t], self.anchor_start[t + 1]);
-            for &(p, j) in &self.anchors[from as usize..to as usize] {
-                let from = self.pattern_start[p as usize] as usize;
-                let terms = &self.terms[from..self.pattern_start[p as usize + 1] as usize];
-                if let Some(start) = (i as usize).checked_sub(j as usize) {
-                    if seq.get(start..start + terms.len()) == Some(terms) {
-                        found(p);
-                    }
+    fn check(&self, dt: &TermTable, doc: &[u8], hits: &[(usize, usize)], mut f: impl FnMut(u32)) {
+        let sep = |b: &u8| !b.is_ascii_alphanumeric();
+        let is_term = |token: Option<&[u8]>, t: u32| {
+            token.is_some_and(|tk| {
+                let term = &dt.bytes[t as usize].0;
+                tk.len() <= MAX_TERM && term[..tk.len()].eq_ignore_ascii_case(tk) && term.get(tk.len()).unwrap_or(&0) == &0
+            })
+        };
+        for &(t, at) in hits {
+            let (from, to) = (self.anchor_start[t] as usize, self.anchor_start[t + 1] as usize);
+            for &(p, j, lo, hi) in &self.anchors[from..to] {
+                let (before, after) = self.terms[lo as usize..hi as usize].split_at(j as usize);
+                let mut fwd = doc[at..].split(sep).filter(|t| !t.is_empty());
+                let mut bwd = doc[..at].rsplit(sep).filter(|t| !t.is_empty());
+                if after.iter().all(|&t| is_term(fwd.next(), t)) && before.iter().rev().all(|&t| is_term(bwd.next(), t)) {
+                    f(p);
                 }
             }
         }
@@ -466,7 +487,8 @@ fn fold_window(code: &[u32; MAX_BOOL_TERMS], words: &[u64]) -> u64 {
     };
     // Two fixed steps (OP_KEEP pads codes of 1 or 2 terms), then a tail that only codes of 4 to 6 terms enter, so
     // the loop exit is not a per-fold guess between lengths 1, 2 and 3: the length test was 13.7 M of the flush's
-    // mispredicts (cachegrind, 1 worker, seed 1). (b-33a) The flush's mispredicts fell from 41.5 M to 32.9 M, and its Ir from 2.56 G to 2.45 G.
+    // mispredicts (cachegrind, 1 worker, seed 1). (b-33a) The flush's mispredicts fell from 41.5 M to 32.9 M,
+    // and its Ir from 2.56 G to 2.45 G.
     let r = step(step(words[code[0] as usize], code[1]), code[2]);
     code[3..].iter().take_while(|&&w| w != NIL).fold(r, |r, &w| step(r, w))
 }
@@ -577,26 +599,21 @@ fn scan(data: &[u8], dict: &TermTable, phrases: &PhrasePlan, plan: &BoolPlan) ->
     let words = vec![0u64; plan.trigger_start.len() - 1]; // by BOOL term id
     let touched = vec![(0, 0, 0); words.len() + 1];
     let mut window = Window { base: 0, words, touched, n_touched: 0 };
-    // The doc's tokens as term ids (NIL for any other token) and the positions in `seq` of anchor terms; per
-    // pattern the last doc id + 1 it was reported for.
-    let (mut seq, mut anchored) = (Vec::new(), Vec::new());
-    let mut pattern_last = vec![0u32; phrases.anchors.len()];
+    // The doc's anchor occurrences as (term, byte offset); per pattern the last doc id + 1 it was reported for.
+    let (mut hits, mut pattern_last) = (Vec::new(), vec![0u32; phrases.anchors.len()]);
     let mut i = 0;
     while i < data.len() {
         let (id, text) = parse_id(data, i);
+        // Ids are dense and ascending through docs.txt (specs/b-index.md), so a window, once left, never returns.
         if id / 64 * 64 != window.base {
             window.flush(plan, &mut acc);
             window.base = id / 64 * 64;
         }
-        i = dict.tokenize(data, text, |hit| {
-            let Some(t) = hit else {
-                seq.push(NIL);
-                return;
-            };
+        i = dict.walk(data, text, |start, hit| {
+            let Some(t) = hit else { return };
             if phrases.anchor_bits[t as usize / 64] >> (t % 64) & 1 != 0 {
-                anchored.push(seq.len() as u32);
+                hits.push((t as usize, start - text));
             }
-            seq.push(t);
             let Some(word) = window.words.get_mut(t as usize) else {
                 return; // a phrase-only term
             };
@@ -607,15 +624,15 @@ fn scan(data: &[u8], dict: &TermTable, phrases: &PhrasePlan, plan: &BoolPlan) ->
             window.n_touched += (*word == 0) as usize;
             *word |= 1 << (id % 64);
         });
-        // A phrase never spans two documents: seq holds this doc only.
-        phrases.check(&seq, &anchored, |p| {
+        // `i - 1` is the doc's LF, so the check reads this doc's text only; clamped for out-of-spec TAB-less lines.
+        let end = (i - 1).min(data.len());
+        phrases.check(dict, &data[text.min(end)..end], &hits, |p| {
             if pattern_last[p as usize] != id + 1 {
                 pattern_last[p as usize] = id + 1;
                 matches.push((p, id));
             }
         });
-        seq.clear();
-        anchored.clear();
+        hits.clear();
     }
     window.flush(plan, &mut acc);
     (acc, matches)
