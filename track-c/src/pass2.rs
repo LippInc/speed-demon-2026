@@ -42,22 +42,21 @@ struct Mailbox {
 /// Vec length or capacity work per message, c-49 b2: 22.47 ms of pass against 23.54 with Vec pushes).
 struct Worker<'a> {
     w: usize,
-    b: &'a [u8],
     boxes: &'a [Mutex<Mailbox>],
     /// Each owner's names; its own worker files them, a sender only to clear a backlog (LAG).
     owners: &'a [Mutex<Owner>],
     out: Vec<Vec<Msg>>,
     cur: Vec<*mut Msg>,
-    /// Where each bucket is handed over: one slot short of BUCKET, so a two-slot name always fits.
+    /// Where each bucket is handed over: its end, BUCKET slots, one per name.
     lim: Vec<*mut Msg>,
 }
 
 impl<'a> Worker<'a> {
-    fn new(w: usize, b: &'a [u8], boxes: &'a [Mutex<Mailbox>], owners: &'a [Mutex<Owner>]) -> Self {
+    fn new(w: usize, boxes: &'a [Mutex<Mailbox>], owners: &'a [Mutex<Owner>]) -> Self {
         let n = boxes.len();
         let none = std::ptr::null_mut();
         let (out, cur, lim) = (vec![Vec::new(); n], vec![none; n], vec![none; n]);
-        let mut me = Worker { w, b, boxes, owners, out, cur, lim };
+        let mut me = Worker { w, boxes, owners, out, cur, lim };
         (0..n).for_each(|o| me.refill(o, None));
         me
     }
@@ -67,7 +66,7 @@ impl<'a> Worker<'a> {
         self.out[o] = bucket.unwrap_or_else(|| Vec::with_capacity(BUCKET));
         self.cur[o] = self.out[o].as_mut_ptr();
         // SAFETY: each bucket has room for BUCKET slots.
-        self.lim[o] = unsafe { self.cur[o].add(BUCKET - 1) };
+        self.lim[o] = unsafe { self.cur[o].add(BUCKET) };
     }
 
     /// Files every bucket in owner `o`'s mailbox and returns them emptied, unless another worker is
@@ -85,7 +84,7 @@ impl<'a> Worker<'a> {
             return;
         }
         for bucket in &mut buckets {
-            own.file(bucket, self.b);
+            own.file(bucket);
             bucket.clear();
         }
         self.boxes[o].lock().unwrap().empty.append(&mut buckets);
@@ -97,23 +96,13 @@ impl<'a> Worker<'a> {
     fn send(&mut self, name: Name) {
         let workers = self.out.len();
         // SAFETY: owner < workers; its cursor is below its limit (hand_over runs once it gets there),
-        // so both slots land inside the bucket's capacity.
+        // so the slot lands inside the bucket's capacity.
         unsafe {
-            let (o, c) = match name {
-                Name::One(h, m) => {
-                    let o = (h as u64 * workers as u64 >> 32) as usize;
-                    let c = *self.cur.get_unchecked(o);
-                    c.write(m);
-                    (o, c.add(1))
-                }
-                Name::Two(h, m, tail) => {
-                    let o = (h as u64 * workers as u64 >> 32) as usize;
-                    let c = *self.cur.get_unchecked(o);
-                    c.write(m);
-                    c.add(1).write(tail);
-                    (o, c.add(2))
-                }
-            };
+            let Name(h, m) = name;
+            let o = (h as u64 * workers as u64 >> 32) as usize;
+            let c = *self.cur.get_unchecked(o);
+            c.write(m);
+            let c = c.add(1);
             *self.cur.get_unchecked_mut(o) = c;
             if c >= *self.lim.get_unchecked(o) {
                 self.hand_over(o);
@@ -181,7 +170,7 @@ fn pass(b: &[u8], chunk: usize, workers: usize, regions: &Build) -> (Totals, boo
     let worker = |w: usize| {
         let table = regions.ready();
         let mut slots = vec![Slot::new(); 256];
-        let mut me = Worker::new(w, b, &boxes, &owners);
+        let mut me = Worker::new(w, &boxes, &owners);
         while let k = next.fetch_add(1, Relaxed)
             && k < chunks
         {
@@ -199,7 +188,7 @@ fn pass(b: &[u8], chunk: usize, workers: usize, regions: &Build) -> (Totals, boo
         }
         // The mapping's page-table entries (about 50k for the 202 MB file) were torn down at exit on
         // one CPU; each worker drops its share now (c-37f). A page touched again (a neighbour's last
-        // record, a rerun, an exact name's compare) faults back in from the page cache. The last
+        // record, a rerun) faults back in from the page cache. The last
         // partial page is kept: it holds the guard (main.rs), a private copy MADV_DONTNEED would discard.
         let pages = b.len() & !4095;
         let share = pages.div_ceil(workers).next_multiple_of(4096);

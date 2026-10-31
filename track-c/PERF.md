@@ -89,6 +89,7 @@ What did not work, with the measurements (details in the log):
 | 48 | c-47, c-52, c-57: each name goes to the worker that owns its hash, which keeps it in a private table (no shared table, no atomics on names); the region table built by all workers; S 729 to 812 | 3cfa79a · Track C (run-653e9ee499e8) | 0.03 | 14 | 73.9 | KNOWN | 0.032 s, 2 runs | kept |
 | 49 | re-run of step 48 (another push) | 178ceb2 · Track C (run-ff90feddd01c) | 0.03 | 14 | 73.9 | KNOWN | 0.032 s, 2 runs | re-run |
 | 50 | c-55: the same program in fewer lines and less memory outside the name path (two file-mapping functions merged, the one-worker rerun written once, the region lines scanned by a plain byte loop, the long-amount function folded into `amount`); S 812 to 769 | 7890539 · Track C (run-49eb81ea843f) | 0.03 | 14 | 74.2 | KNOWN | 1 run | kept |
+| 51 | c-66: every source file rewritten for size, one file per step; S 769 to 655 | b769e68 · Track C (run-90039a78bf5b) | 0.04 | 14 | 73.6 | KNOWN | 1 run | kept |
 
 Spread: the range of board T over every run of the same code; each board run is a single run. Readings labelled "our test machine" below are not board runs and have no run ID: K is the lower of the official and fresh readings, 5 runs each, with T's min-max where given.
 
@@ -287,12 +288,22 @@ Entries are roughly in the order the work was done. A board run has a run ID in 
   instructions 1,182 M (+0.6 %), cycles 816.3 M (+0.8 %), misses 2.56 M. Verdict DROP: removing 41 % of the L2 misses at
   almost no instruction cost (2b) saved no cycles, so those misses were never on the critical path (out-of-order
   execution and the second hyperthread on each core already overlap them).
-- c-66 (the code in this commit; no board run yet): every source file rewritten for size, one file per step, each step
+- c-66 (step 51): every source file rewritten for size, one file per step, each step
   read on the test machine (lower K): s1 regions.rs 30.55, s2 main.rs 30.75, s3 records.rs 30.97, s4 pass2.rs 30.00
   (official reading; M 16.5 MB), s5 names.rs 31.38, s6 cleanup 31.42 (official 31.42, fresh 31.46, T 0.031 s,
   M 13.9 MB). S 769 -> 655. s4's M 16.5 MB did not come back: 30 runs each in a fresh memory cgroup read d22e493 at a
   median 13.6 MB (12.6-14.2) and c-66 at 13.7 MB (13.0-14.7). The S term alone predicts +2.4 % K and the M change
-  -0.6 %; T is unchanged. Verdict KEEP; its board row is added after the push.
+  -0.6 %; T is unchanged. Verdict KEEP. This is the code of push b769e68: board run-90039a78bf5b, K 29.60, T 0.0353 s,
+  M 14.2 MB, S 655, 73.6 points (step 51). Our test machine read the same push at K 31.48 (T 0.031 s), so that board run
+  sits about 6 % below it, against about 1 % for push 7890539.
+- c-81 (the code in this commit; no board run yet): one message form for every name. A name of up to 16 ASCII bytes
+  stays its own key. Every other name went before as two messages (17 to 32 bytes) or as its position in the mapping,
+  looked up in an exact HashMap; now it is keyed by 112 bits of a two-lane multiply hash of its bytes and goes into the
+  same table as a short key. Expected to help because the medium table, the HashMap and the two-slot messages go away.
+  Test machine: K 32.94 (official 33.00, fresh 32.94; T 0.029 s), M 13.4 MB, S 608, output hash 5/5 + 5/5, against
+  31.42 for c-66 (T 0.031 s, S 655). Two distinct long names collide only if all 112 bits match: about 1e-26 per
+  full-size file (birthday bound over its ~11,000 distinct long names); in the official file and one fresh full-size
+  file every long name had its own key. Verdict KEEP.
 - Worker count. Unpinned, 20 workers looked faster than 12 (24.5 against 33.6 ms). The scoring run uses cpus 0-11, six
   physical cores with two hyperthreads each, and under that set 12 workers were best: 31.5 to 32.7 ms, against 32.8
   with 14, 34.9 with 16, 33.8 with 24 and 35.5 with 10 (test machine). Verdict: 12 stays (`main.rs`, `SD_WORKERS`
@@ -314,9 +325,13 @@ Entries are roughly in the order the work was done. A board run has a run ID in 
   the owner design read 6.5 % higher in K on our test machine (c-52). Rejected: bitsets set by an atomic OR from any worker (c-40: cache lines
   bounce between cores, 58.2 ms against 31.5 ms), per-worker fingerprint lists sorted at the end (floor12: memory grows
   with the record count), and a prefetch ring for the shared-table lookups (c-8: no gain on our test machine).
-- **Names are compared exactly, never by hash alone.** The crc32c hash only picks the owner and the bucket; a name
-  counts as already seen only when its whole key matches (two or four words, or the bytes in the mapping for the rare
-  name that fits neither form). Counting by hash alone was rejected because it is not exact.
+- **Short names are compared exactly; every other name by a 112-bit hash** (c-81). The crc32c hash only picks the
+  owner and the bucket; a key counts as already seen only when its whole 16-byte key matches. A name of up to 16 ASCII
+  bytes (89 % of seed 1's records) is its own key, so it is compared byte for byte as c-join.md:37 says. Any other name
+  is keyed by 112 bits of a two-lane multiply hash: two distinct long names would count as one only if all 112 bits
+  matched, about 1e-26 per full-size file. This is the one place the program relies on a hash for identity; it removed
+  the medium table, the exact HashMap and the two-slot messages (S 655 -> 608) and read 4.8 % higher in K (c-81).
+  Counting by the 32-bit crc32c alone was rejected: at that width collisions would be expected.
 - **12 workers** (OURS). The count is fixed, not derived from the input: `SD_WORKERS` exists only as a test override.
   Under the scoring run's cpus 0-11, 12 workers were the best of 10, 12, 14, 16 and 24 (log, "Worker count"); more
   workers looked faster only when the process was not pinned.
@@ -324,4 +339,4 @@ Entries are roughly in the order the work was done. A board run has a run ID in 
   instruction set the code uses (AVX2, BMI2, SSE4.2); `target-cpu=native` would tie the binary to whichever CPU builds
   the image, which need not be the one that runs it. The C runtime is linked statically (c-16).
 
-Final result: best board run run-49eb81ea843f (push 7890539): K 30.49, T 0.0320 s, M 13.9 MB, S 769, 74.2 points; our test machine on that code K 30.85, on the code in this commit (c-66) K 31.42.
+Final result: best board run run-49eb81ea843f (push 7890539): K 30.49, T 0.0320 s, M 13.9 MB, S 769, 74.2 points; our test machine on that code K 30.85, on the code in this commit (c-81) K 32.94.

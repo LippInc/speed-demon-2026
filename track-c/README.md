@@ -8,9 +8,10 @@ Best board run: `run-49eb81ea843f`, K 30.49 (T 0.032 s, M 13.9 MB, S 769), 74.2 
 [PERF.md](PERF.md).
 
 On our test machine (same CPU model and settings as the scoring machine; 5 runs per dataset, the lower K counts) the
-code in this commit reads K 31.42 (the lower of official 31.42 and fresh 31.46; T 0.031 s), M 13.9 MB, S 655, output
+code in this commit reads K 32.94 (the lower of official 33.00 and fresh 32.94; T 0.029 s), M 13.4 MB, S 608, output
 hash correct in 5/5 + 5/5 runs. The board run above is the code of push 7890539, which read K 30.85, M 13.5 MB, S 769
-on the same machine; the difference is the lines cut afterwards (S 769 -> 655, PERF.md c-66).
+on the same machine; the difference is the lines cut afterwards (S 769 -> 655, PERF.md c-66) and one message form for every
+name (S 655 -> 608 and T 0.031 -> 0.029 s, PERF.md c-81).
 
 Reproduce from the repository root: `python3 check.py c --data data/c --expected d8088b1cd42ba1338b1345b107b55db7b96ef1f5066f3ff64fd26a8912a0f536`
 (full seed 1; the expected hash is c-join.md:212).
@@ -26,19 +27,19 @@ experiment in [PERF.md](PERF.md) that measured it (IDs such as c-52 are entries 
 | What the code does | Where | PERF.md |
 |---|---|---|
 | Both files are mapped, never copied. Each mapping is followed by 96 guard bytes (`"`, `,`, LF repeated), so every scan stops at the guard and the parse has no bounds checks | `src/main.rs:38`, `src/main.rs:40`, `src/main.rs:43` | Decisions; floor1; c-35 to c-42 |
-| records.csv is cut into 256 KiB chunks claimed from a shared counter; a chunk starts at the first LF followed by a digit or BOM; each chunk must stop exactly where the next starts, else the whole file is parsed again on one worker | `src/pass2.rs:21`, `src/pass2.rs:185`, `src/records.rs:251`, `src/pass2.rs:197`, `src/pass2.rs:166` | e1, c-19a2 |
+| records.csv is cut into 256 KiB chunks claimed from a shared counter; a chunk starts at the first LF followed by a digit or BOM; each chunk must stop exactly where the next starts, else the whole file is parsed again on one worker | `src/pass2.rs:21`, `src/pass2.rs:174`, `src/records.rs:251`, `src/pass2.rs:186`, `src/pass2.rs:155` | e1, c-19a2 |
 | Commas and quotes are found 32 bytes at a time (AVX2 compare and movemask) | `src/records.rs:72` | c-10 |
 | Digit runs (id, region id, amount) are read as one 8-byte load and folded into a number by SSE multiply-adds; a BOM is tested only on the id's slow path | `src/records.rs:119`, `src/records.rs:137`, `src/records.rs:153` | c-35 to c-42 (step 46) |
 | CR-or-LF terminator skipped without a branch; amount sign applied without a branch | `src/records.rs:220`, `src/records.rs:184` | c-10 |
-| Region id to country: one byte per region id. All workers build it together from 64 KiB pieces of regions.csv before they parse records; a lookup clamps the id with `min` instead of a bounds check | `src/regions.rs:92`, `src/regions.rs:96`, `src/pass2.rs:182`, `src/regions.rs:14` | floor1, c-47 |
-| A record's name becomes a 16-byte message (a name of up to 16 ASCII bytes, with its country packed into spare bits), two messages (17 to 32 bytes), or its offset and length in the mapping (anything else) | `src/names.rs:85`, `src/names.rs:99`, `src/names.rs:107` | c-51, c-52 |
-| The name is hashed with crc32c (one instruction per 8 bytes) and sent to the worker that owns the hash: owner = high bits of the hash times the worker count | `src/names.rs:64`, `src/pass2.rs:104` | c-52 |
-| Messages are written to one 4 KiB bucket per owner through raw cursors; a full bucket is handed to the owner's mailbox | `src/pass2.rs:97`, `src/pass2.rs:129` | c-49 |
-| The owner keeps each name once in its own table (64-byte buckets of 8 tagged entries, one AVX2 compare per half bucket, then an exact key compare) with one bit per country | `src/names.rs:151`, `src/names.rs:167`, `src/names.rs:285` | c-50, c-52 |
-| The owner prefetches the home bucket of the message 16 message slots ahead | `src/names.rs:250` | c-50, c-63 |
-| distinct names of a country = the sum over owners of their new (name, country) bits | `src/names.rs:285`, `src/pass2.rs:225` | c-52 |
-| A sender tries to file a lagging owner's mailbox itself only once more than 16 full buckets wait there | `src/pass2.rs:29`, `src/pass2.rs:136` | c-52 |
-| Each worker drops its share of the mapping's page-table entries before it finishes; the process exits without freeing | `src/pass2.rs:208`, `src/main.rs:76` | c-37 (step 46) |
+| Region id to country: one byte per region id. All workers build it together from 64 KiB pieces of regions.csv before they parse records; a lookup clamps the id with `min` instead of a bounds check | `src/regions.rs:92`, `src/regions.rs:96`, `src/pass2.rs:171`, `src/regions.rs:14` | floor1, c-47 |
+| A record's name becomes one 16-byte message with its country packed into spare bits: a name of up to 16 ASCII bytes is its own key; any other name is keyed by 112 bits of a two-lane multiply hash of its bytes, marked so that it never equals a raw key | `src/names.rs:98`, `src/names.rs:102`, `src/names.rs:63` | c-51, c-52, c-81 |
+| The name is hashed with crc32c (one instruction per 8 bytes) and sent to the worker that owns the hash: owner = high bits of the hash times the worker count | `src/names.rs:84`, `src/pass2.rs:102` | c-52 |
+| Messages are written to one 4 KiB bucket per owner through raw cursors; a full bucket is handed to the owner's mailbox | `src/pass2.rs:96`, `src/pass2.rs:118` | c-49 |
+| The owner keeps each key once in its own table (64-byte buckets of 8 tagged entries, one AVX2 compare per half bucket, then a compare of the whole 16-byte key) with one bit per country | `src/names.rs:150`, `src/names.rs:166`, `src/names.rs:244` | c-50, c-52, c-81 |
+| The owner prefetches the home bucket of the message 16 message slots ahead | `src/names.rs:235` | c-50, c-63 |
+| distinct names of a country = the sum over owners of their new (name, country) bits | `src/names.rs:244`, `src/pass2.rs:214` | c-52 |
+| A sender tries to file a lagging owner's mailbox itself only once more than 16 full buckets wait there | `src/pass2.rs:29`, `src/pass2.rs:125` | c-52 |
+| Each worker drops its share of the mapping's page-table entries before it finishes; the process exits without freeing | `src/pass2.rs:197`, `src/main.rs:76` | c-37 (step 46) |
 
 ## Approach
 
@@ -46,7 +47,7 @@ The design is: workers parse chunks, and each record's name is sent to the one w
 table that two workers update, and no atomic operation on names.
 
 **Setup.** `main` maps both files (`src/main.rs:57`, `src/main.rs:58`) and starts 12 workers (`src/main.rs:54`; a test-only
-environment variable can change the count; the main thread is worker 0, `src/pass2.rs:234`). Before any worker starts, it only reads regions.csv's header and its last
+environment variable can change the count; the main thread is worker 0, `src/pass2.rs:223`). Before any worker starts, it only reads regions.csv's header and its last
 line to size the region table (`src/regions.rs:68`); it parses no region lines.
 
 **Regions.** The table maps a region id to a country index, one byte per id (c-join.md:59: ids ascend, codes are
@@ -56,7 +57,7 @@ line whose LF falls in its piece, that line's country index at its region id (`s
 that has no index yet; the output is sorted by key, so the numbering never shows. A worker then waits until every
 piece is done (`src/regions.rs:96`). Group 0 is `_UNMATCHED`: ids with no line, or above the largest id, read as 0.
 
-**Records.** records.csv is cut into 256 KiB chunks, claimed from a shared counter (`src/pass2.rs:185`). A chunk starts
+**Records.** records.csv is cut into 256 KiB chunks, claimed from a shared counter (`src/pass2.rs:174`). A chunk starts
 at the first LF followed by a digit or a BOM, the only way a record can start (c-join.md:21, 36). The generator never
 puts that pair inside a quoted field (c-join.md:50-51). A worker parses its chunk field by field: commas and quotes are
 found with 32-byte AVX2 compares, `""` escapes are counted, a BOM before a record is skipped (c-join.md:36), and money
@@ -65,27 +66,31 @@ into that worker's own per-country slot: count, id sum, amount sum, min and max,
 (`src/records.rs:222`-`src/records.rs:230`). The parse then hands the name's position and length to the sender.
 
 **Names.** For each record the worker builds a message from the name's raw bytes (between the quotes, escapes kept, which
-is one to one with the value, c-join.md:27-28; up to the comma if unquoted) and the record's country (`src/names.rs:81`).
-It hashes the key (crc32c; a fixed hasher for the rare names that fit neither message form) and writes the message
-into the bucket for the worker that owns that hash (`src/pass2.rs:97`). A bucket holds 256 message slots (4 KiB) and
+is one to one with the value, c-join.md:27-28; up to the comma if unquoted) and the record's country (`src/names.rs:98`).
+A name of up to 16 ASCII bytes whose last byte is not 0 is its own key: two zero-padded words (`src/names.rs:102`).
+Any other name (longer, a byte of 0x80 or more, or a trailing 0 byte) is keyed by 112 bits of a two-lane multiply hash
+of its bytes, with a mark bit that a raw key never has (`src/names.rs:63`). It hashes the key (crc32c) and writes the message
+into the bucket for the worker that owns that hash (`src/pass2.rs:96`). A bucket holds 256 message slots (4 KiB) and
 goes to the owner's mailbox when full; each worker files the buckets waiting in its own mailbox at every
-hand-over and after every chunk (`src/pass2.rs:129`, `src/pass2.rs:198`). Filing means the owner looks the name up in its
-own table, comparing the full key on every hash match (a name that fits neither message form goes through a plain
-HashMap of the bytes it reads from the mapping), and sets the bit for the message's country in that name's 256-bit set.
-If the bit was clear, the owner's count for that country goes up by one (`src/names.rs:285`). A country's number of
+hand-over and after every chunk (`src/pass2.rs:118`, `src/pass2.rs:187`). Filing means the owner looks the key up in its
+own table, comparing the whole 16-byte key on every tag match, and sets the bit for the message's country in that key's
+256-bit set. Short names are therefore compared byte for byte, as c-join.md:37 says. A hashed name is compared by its
+112-bit key: two distinct long names would count as one only if all 112 bits matched, about 1e-26 per full-size file
+for its ~11,000 distinct long names (birthday bound; in both full files we checked, every long name had its own key).
+If the bit was clear, the owner's count for that country goes up by one (`src/names.rs:244`). A country's number of
 distinct names is the sum of these counts over all owners: a name always goes to the same owner, so it is counted once
 per country. No two workers write the same table at the same time (each table is behind a lock). In a normal run only
 the owner writes to it; the one exception is a sender that finds more than 16 full buckets waiting at an owner and
-tries to file them itself (`src/pass2.rs:136`).
+tries to file them itself (`src/pass2.rs:125`).
 
-**Finish.** After its last chunk each worker drops its share of the mapping's page-table entries (`src/pass2.rs:208`),
+**Finish.** After its last chunk each worker drops its share of the mapping's page-table entries (`src/pass2.rs:197`),
 hands over its partly filled buckets, and keeps filing its mailbox until every worker has handed over everything
-(`src/pass2.rs:216`), then merges its slots and its owner's counts into the shared totals. `main` sorts the countries
+(`src/pass2.rs:205`), then merges its slots and its owner's counts into the shared totals. `main` sorts the countries
 bytewise (c-join.md:127-129), writes the file once (`src/main.rs:73`) and exits without freeing (`src/main.rs:76`).
 
 **If a cut was wrong.** Each chunk checks that its parse stopped exactly where the next chunk begins
-(`src/pass2.rs:197`). If any did not, the owners hold names from wrong records, so everything from that pass is
-discarded and the whole file is parsed again on one worker (`src/pass2.rs:166`). The answer therefore never depends on the
+(`src/pass2.rs:186`). If any did not, the owners hold names from wrong records, so everything from that pass is
+discarded and the whole file is parsed again on one worker (`src/pass2.rs:155`). The answer therefore never depends on the
 rule that picks chunk starts.
 
 ## Limits
@@ -98,6 +103,8 @@ rule that picks chunk starts.
   trades the cache-line traffic of a shared table with atomic bit updates (PERF.md c-40) for this message traffic. The
   split was measured on the code before c-66; c-66 rewrote the files for size and kept the hot path (callgrind, one
   worker: 1,179.7 M -> 1,165.4 M instructions).
+- Peak memory varies from run to run: in 30 runs of this code on our test machine the median was 13.2 MB and 2 runs
+  peaked at 14.4 MB.
 - It needs a CPU with the x86-64-v3 instruction set (AVX2, BMI2, SSE4.2); it is built with `-C target-cpu=x86-64-v3`
   (`Dockerfile`).
 - The region table supports at most 255 countries plus `_UNMATCHED`; more aborts (`src/regions.rs:89`). The spec has 240.
