@@ -8,7 +8,9 @@
 
 use std::arch::x86_64::*;
 
-use crate::regions::Lookup;
+use std::sync::atomic::AtomicU8;
+
+use crate::regions::group;
 
 pub(crate) const BOM: &[u8] = b"\xEF\xBB\xBF";
 
@@ -112,7 +114,7 @@ unsafe fn digits(p: *const u8, i: usize) -> (u64, u32) {
 /// those (x100 + 1), then the two 4-digit halves (x10000 + 1). Six vector instructions where the
 /// scalar fold (three multiplies, shifts and masks) took about 13 and three 64-bit constants.
 #[inline(always)]
-fn fold(x: u64, len: u32) -> u64 {
+pub(crate) fn fold(x: u64, len: u32) -> u64 {
     // SAFETY: SSE4.1 and SSSE3 are on at compile time (x86-64-v3).
     unsafe {
         let v = _mm_cvtsi64_si128(((x << 1) << (63 - 8 * len)) as i64);
@@ -191,20 +193,18 @@ unsafe fn amount_long(p: *const u8, at: usize) -> (u64, usize) {
 }
 
 /// Parses the records that start in `i..end` (`i` is a record start, the last record may run past
-/// `end`) of the file `b[..len]` into `slots`. Each record's raw name goes to `on_name(start, raw
-/// length)` as soon as it is parsed (to start its lookup), and that call's result to
-/// `on_record(group, it)` once the record is done. Returns where it stopped: the next record start,
-/// or `usize::MAX` when a record ran past the end of the file (garbage from a wrong cut, so the
-/// caller's end check fails and main reruns on one worker). Both hooks are closures inlined here.
-pub fn parse_chunk<L: Lookup, K>(
+/// `end`) of the file `b[..len]` into `slots`, and calls `on_record(group, name start, raw name
+/// length)` once each record is done (a closure inlined here). Returns where it stopped: the next
+/// record start, or `usize::MAX` when a record ran past the end of the file (garbage from a wrong
+/// cut, so the caller's end check fails and main reruns on one worker).
+pub fn parse_chunk(
     b: &[u8],
     len: usize,
     mut i: usize,
     end: usize,
-    lookup: &L,
+    regions: &[AtomicU8],
     slots: &mut [Slot],
-    mut on_name: impl FnMut(usize, usize) -> K,
-    mut on_record: impl FnMut(usize, K),
+    mut on_record: impl FnMut(usize, usize, usize),
 ) -> usize {
     assert!(b.len() >= len + GUARD && end <= len);
     let p = b.as_ptr();
@@ -213,7 +213,6 @@ pub fn parse_chunk<L: Lookup, K>(
         while i < end {
             let (id, next) = uint(p, i, b',', id_long);
             let (name_start, name_raw, name_len, next) = text(p, next);
-            let name = on_name(name_start, name_raw);
             let (_, _, note_len, next) = text(p, next);
             let (region, next) = uint(p, next, b',', uint_long);
             let (cents, after) = amount(p, next);
@@ -226,7 +225,7 @@ pub fn parse_chunk<L: Lookup, K>(
             // Terminator: CRLF or LF (c-join.md:21), one byte plus one for a CR, no branch.
             i = after + 1 + (*p.add(after) == b'\r') as usize;
 
-            let group = lookup.group(region);
+            let group = group(regions, region);
             let s = slots.get_unchecked_mut(group);
             s.count += 1;
             s.id_sum += id;
@@ -235,7 +234,7 @@ pub fn parse_chunk<L: Lookup, K>(
             s.amount_max = s.amount_max.max(cents);
             s.name_bytes += name_len;
             s.note_bytes += note_len;
-            on_record(group, name);
+            on_record(group, name_start, name_raw);
         }
     }
     // A last record without a terminator ends at the file's end (c-join.md:21): its terminator skip

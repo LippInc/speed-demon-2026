@@ -8,9 +8,9 @@ mod regions;
 
 use std::{fs::File, io::Write, os::fd::AsRawFd};
 
-use crate::{names::Table, records::BOM, records::GUARD, records::Slot, regions::RegionTable};
+use crate::{records::BOM, records::GUARD, records::Slot};
 
-/// A test-only integer env override (SD_WORKERS, SD_INTERN_SLOTS): set to a number, else absent.
+/// A test-only integer env override (SD_WORKERS): set to a number, else absent.
 fn env_num(name: &str) -> Option<usize> {
     std::env::var(name).ok().and_then(|v| v.parse().ok())
 }
@@ -28,16 +28,14 @@ unsafe extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
 }
 
-/// Maps a whole file read-only; with `populate` the kernel maps every page at once (regions.csv,
-/// read whole by one thread). The mapping lives until exit, so it is never unmapped.
-fn map_file(path: &str, populate: bool) -> &'static [u8] {
+/// Maps a whole file read-only (regions.csv). The mapping lives until exit, so it is never unmapped.
+fn map_file(path: &str) -> &'static [u8] {
     let file = File::open(path).unwrap_or_else(|e| panic!("open {path}: {e}"));
     let len = file.metadata().expect("stat").len() as usize;
     // SAFETY: a fresh read-only private mapping of an input file nobody writes during the run.
     let map = (len != 0).then(|| unsafe {
-        // prot 1 = PROT_READ, flags 2 = MAP_PRIVATE | 0x8000 = MAP_POPULATE (mmap(2)); -1 (all bits
-        // set) is MAP_FAILED.
-        let ptr = mmap(std::ptr::null_mut(), len, 1, 2 | 0x8000 * populate as i32, file.as_raw_fd(), 0);
+        // prot 1 = PROT_READ, flags 2 = MAP_PRIVATE (mmap(2)); -1 (all bits set) is MAP_FAILED.
+        let ptr = mmap(std::ptr::null_mut(), len, 1, 2, file.as_raw_fd(), 0);
         assert!(ptr as usize != usize::MAX, "mmap {path} failed");
         std::slice::from_raw_parts(ptr, len)
     });
@@ -77,11 +75,9 @@ fn main() {
     // the board never sets it, so the scored run uses 12, the scoring box's hardware threads.
     let workers = env_num("SD_WORKERS").filter(|&n| n > 0).unwrap_or(12);
 
-    // regions.csv is read whole by one thread before any worker starts, page fault by page fault: 2.5
-    // ms on box 2, mostly faults and zeroing, not parse work (c-37 timeline probes). Populated, its
-    // pages are mapped in one call.
-    let regions = regions::parse(map_file(&format!("{data}/regions.csv"), true));
-    let groups = regions.keys.len();
+    // regions.csv was parsed by one thread before any worker started: about 4.2 ms on box 2, 79 % of
+    // it user code (c-47 F0 perf). The workers now parse it together at their start (regions::Build).
+    let regions = regions::Build::new(map_file(&format!("{data}/regions.csv")));
 
     let (b, len) = map_padded(&format!("{data}/records.csv"));
     // Index just past the header: a BOM may start the file, and the header holds no quotes and ends
@@ -90,32 +86,20 @@ fn main() {
     let bom = if file.starts_with(BOM) { BOM.len() } else { 0 };
     let lf = file[bom..].iter().position(|&c| c == b'\n');
     let first = lf.map_or(len, |p| p + bom + 1);
-    let run = |workers: usize, chunk: usize, table: &Table| match &regions.table {
-        RegionTable::Narrow(t) => pass2::run(b, len, first, chunk, workers, t, groups, table),
-        RegionTable::Wide(t) => pass2::run(b, len, first, chunk, workers, t, groups, table),
-    };
-    // The name table's starting size, in 4-entry buckets: 32K buckets hold seed scale's 100.5k
-    // distinct names (c-join.md 2.2) under the 7/8 overflow line; any input with more reruns larger
-    // (below), so the constant only sets speed and M, never the answer. SD_INTERN_SLOTS (entries) is
-    // a test-only override: a tiny table (e.g. 2) forces the overflow reruns. The board never sets it.
-    let mut buckets = env_num("SD_INTERN_SLOTS").map_or(1 << 15, |slots| slots.div_ceil(4));
     let (mut pass_workers, mut chunk) = (workers, pass2::CHUNK);
     let pass2 = loop {
-        let table = Table::new(buckets);
-        let pass2 = run(pass_workers, chunk, &table);
-        if table.overflowed() {
-            // The table passed 7/8 full and the pass stopped early: rerun with 4x the buckets.
-            buckets = table.buckets() * 4;
-        } else if !pass2.exact {
-            // e1: a cut was not a record start, so the parse is untrustworthy and the table holds
-            // names from wrong records; rerun on one worker over the whole file, where the start
-            // (`first`) is always right.
-            (pass_workers, chunk) = (1, len);
-        } else {
+        let pass2 = pass2::run(b, len, first, chunk, pass_workers, &regions);
+        if pass2.exact {
             break pass2;
         }
+        // e1: a cut was not a record start, so the parse is untrustworthy and the owners hold names
+        // from wrong records; rerun on one worker over the whole file, where the start (`first`) is
+        // always right.
+        (pass_workers, chunk) = (1, len);
     };
 
+    let keys = regions.keys();
+    let groups = keys.len();
     let mut totals = vec![Slot::new(); groups];
     for slots in &pass2.slots {
         for (total, slot) in totals.iter_mut().zip(slots) {
@@ -124,11 +108,11 @@ fn main() {
     }
     // One line per group with records, sorted by key bytewise (c-join.md:127-129).
     let mut lines: Vec<usize> = (0..groups).filter(|&g| totals[g].count > 0).collect();
-    lines.sort_unstable_by_key(|&g| &regions.keys[g]);
+    lines.sort_unstable_by_key(|&g| &keys[g]);
     let mut out = Vec::with_capacity(lines.len() * 96);
     for g in lines {
         let t = &totals[g];
-        out.extend_from_slice(&regions.keys[g]);
+        out.extend_from_slice(&keys[g]);
         write!(out, " {} {} ", t.count, t.id_sum).unwrap();
         push_money(&mut out, t.amount_sum);
         push_money(&mut out, t.amount_min);

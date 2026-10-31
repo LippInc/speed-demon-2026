@@ -1,14 +1,36 @@
-//! Distinct names: one table shared by every worker gives each distinct name key a dense id (0
-//! upward); each group keeps a bitset over those ids (pass2.rs), so names_distinct counts its bits.
+//! Distinct names, design D-B (c-52): each record's name goes, as a message, to the worker that owns
+//! it (by a hash of the name), and that owner alone keeps the name in its private tables, each name
+//! with the set of groups that have seen it. Nothing is shared per name: no compare-and-swap, no
+//! global id. names_distinct of a group is the sum over owners of their new (name, group) bits.
 //!
-//! A key is a name's raw bytes between its quotes, escapes kept: `""` -> `"` is one to one, so raw
-//! keys are equal exactly when the values are, and an empty unquoted name and `""` are both the
-//! empty key (c-join.md:34).
+//! A name is keyed by its raw bytes between the quotes, escapes kept: `""` -> `"` is one to one and an
+//! unquoted value holds no `"` (c-join.md:27-28), so raw keys are equal exactly when the values are, and
+//! the empty unquoted name and `""` are both the empty key (c-join.md:34).
+//!
+//! Three kinds of key, by the name's raw bytes:
+//! - short: up to 16 bytes, all below 0x80, the last one not 0: the two zero-padded words. Zero padding
+//!   is one to one once the last byte is not 0, and every bit 7 is free (89 % of seed 1's records).
+//! - medium: 17 to 32 such bytes: four words, sent as two messages (11 %; 99.99 % of names fit 24).
+//! - exact: anything else (longer, a byte of 0x80 or more, a trailing 0; c-join.md 2.1 allows them,
+//!   2.2 never writes them): the name's offset and length, compared byte for byte in the mapping.
 
-use std::arch::x86_64::{_MM_HINT_T0, _bzhi_u64, _mm_prefetch};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::arch::x86_64::*;
 
 use crate::records::load;
+
+/// One 16-byte slot of an owner's inbox. A short or medium name's first slot is its first two key
+/// words with the group in word 0's eight bit-7 positions and the kind in word 1's; a medium name's
+/// second slot is its last two words, marked TAIL; an exact name's is its offset with the group in
+/// the top byte, then its length marked EXACT. The kind marks sit in bit-7 positions, which no key
+/// byte uses, so they never collide with key bits.
+pub type Msg = [u64; 2];
+
+/// Bit 7 of every byte.
+const HIGH: u64 = 0x8080_8080_8080_8080;
+/// Kind marks in a slot's word 1: bit 7 of bytes 14 and 15.
+const MEDIUM: u64 = 1 << 55;
+const EXACT: u64 = 1 << 63;
+const TAIL: u64 = MEDIUM | EXACT;
 
 /// 64 x 64 -> 128-bit multiply, folded to 64 bits (wyhash's mum).
 fn mum(a: u64, b: u64) -> u64 {
@@ -18,8 +40,8 @@ fn mum(a: u64, b: u64) -> u64 {
 
 /// The key's word `k` (bytes 8k..8k+8) with the bytes past the key cleared: BMI2's bzhi keeps the
 /// low `8 * len - 64 * k` bits (all 64 from a count of 64 to 255, none at 0), so no branch on the
-/// length. bzhi reads only the count's low byte, so the word is right up to 24 bytes of key, and
-/// `key` uses its words only then.
+/// length. bzhi reads only the count's low byte, so a word is right while the count is under 256:
+/// the short path uses its words only up to 16 bytes.
 ///
 /// # Safety
 /// The 8 bytes at `p + at + 8k` must lie inside the padded mapping.
@@ -28,256 +50,231 @@ unsafe fn key_word(p: *const u8, at: usize, len: usize, k: usize) -> u64 {
     unsafe { _bzhi_u64(load::<u64>(p, at + 8 * k), (8 * len).saturating_sub(64 * k) as u32) }
 }
 
-/// A name key as the table sees it, five scalars passed by value so they stay in registers
-/// (880ff14 passed a 6-word struct by reference: it was spilled to the stack and reloaded around
-/// every lookup). Up to 24 bytes: the hash, the three zero-padded words and the length. Longer: the
-/// hash, then the key's offset in the mapping and its length in the words, and 25 as the length.
-#[derive(Clone, Copy)]
-pub struct Key {
-    h: u64,
-    w: [u64; 3],
-    len: u64,
-}
-
-/// The key `p[at..at + len]`. Up to 24 bytes (nearly every name, c-join.md 2.2): three zero-padded
-/// words and two multiplies, no loop and no branch; the words are also what the table compares.
-///
-/// # Safety
-/// The key and 24 bytes from its start must lie inside the padded mapping.
-#[inline(always)]
-pub unsafe fn key(p: *const u8, at: usize, len: usize) -> Key {
-    if len > 24 {
-        return unsafe { long_key(p, at, len) };
-    }
-    let w = unsafe { [key_word(p, at, len, 0), key_word(p, at, len, 1), key_word(p, at, len, 2)] };
-    let h = mum(w[0] ^ 0xa076_1d64_78bd_642f ^ len as u64, w[1] ^ 0xe703_7ed1_a0b4_28db) ^ mum(w[2] ^ 0x8ebc_6af0_9c88_c6e3, 0x5899_65cc_7537_4cc3);
-    Key { h, w, len: len as u64 }
-}
-
-/// `key` for keys over 24 bytes: one multiply per 8-byte word.
+/// An exact name's hash: one multiply per 8-byte word of `p[at..at + len]`, read from the mapping.
+/// Only exact names use it (none in generated data), at the sender and again at the owner.
 #[cold]
 #[inline(never)]
-unsafe fn long_key(p: *const u8, at: usize, len: usize) -> Key {
+fn exact_hash(p: *const u8, at: usize, len: usize) -> u32 {
     // Word k of the whole key is word 0 of the key from 8k on, at most 8 bytes of it (count <= 64).
+    // SAFETY: the name lies inside the mapping, and the guard covers the last word's 8-byte load.
     let word = |k: usize| unsafe { key_word(p, at + 8 * k, (len - 8 * k).min(8), 0) };
-    let h = (0..len.div_ceil(8)).fold(len as u64, |h, k| mum(h ^ word(k), 0x8ebc_6af0_9c88_c6e3));
-    Key { h, w: [at as u64, len as u64, 0], len: 25 }
+    ((0..len.div_ceil(8)).fold(len as u64, |h, k| mum(h ^ word(k), 0x8ebc_6af0_9c88_c6e3)) >> 32) as u32
 }
 
-/// One entry's key and id: the key's three words (a key over 24 bytes keeps its first occurrence's
-/// file offset and its length there instead), then min(length, 25) << 32 | id.
-struct Slot {
-    key: [AtomicU64; 3],
-    meta: AtomicU64,
+/// A short or medium key's 32-bit hash: crc32c of its words, one instruction each. The sender picks
+/// the owner from its high bits, the owner a bucket from its low bits.
+#[inline(always)]
+fn crc(words: &[u64]) -> u32 {
+    // SAFETY: SSE4.2 is on at compile time (x86-64-v3).
+    words.iter().fold(0, |h, &w| unsafe { _mm_crc32_u64(h, w) }) as u32
 }
 
-/// A bucket's four entries, two cache lines; their tags live apart, in `Table::tags`.
-#[repr(align(64))]
-struct Slots([Slot; 4]);
-
-/// Tag lanes: a bucket's tag word holds four 16-bit lanes, one per entry, filled in order: 0 empty,
-/// 1 PENDING while its inserter writes the entry, else the key's tag (16 hash bits, at least 2).
-const PENDING: u64 = 1;
-const LANES: u64 = 0x0001_0001_0001_0001;
-
-/// Name key -> dense id, shared by all workers, lock-free. Open addressing over buckets of four
-/// entries from the key's home bucket (the hash's high bits, by multiply-shift). A lookup loads the
-/// bucket's tag word, matches its four lanes against the key's tag at once (SWAR), and compares the
-/// key only in a matching entry: about one key compare per lookup. With two entries per bucket
-/// and a state word each (880ff14), a lookup examined 2.74 entries on average at the starting
-/// 77 % load, p99 22, p99.9 47 (full seed 1, a counting build, c-42 step 2 (a)): each a load, a
-/// compare and a branch whose count varied. The 32K tag words (256 KiB) mostly stay in L2.
-///
-/// An entry is claimed by a compare and swap of its lane from empty to PENDING, filled, then
-/// published by adding tag - 1 to its lane with Release, so a reader that Acquire-loads the tag
-/// word and sees the tag sees the whole entry. Nothing is ever moved or deleted, so every key's
-/// probe sequence is fixed and two workers inserting one new key meet at the same lane: one id.
-///
-/// The table never grows: past 7/8 full it raises `overflow` and stops inserting, and main reruns
-/// the pass with 4 times the buckets (as the e1 rerun does), so any input stays exact.
-pub struct Table {
-    tags: Box<[AtomicU64]>,
-    slots: Box<[Slots]>,
-    limit: u32,
-    next_id: AtomicU32,
-    overflow: AtomicBool,
+/// The name of one record, made into its owner's messages while its bytes are still in L1 (c-51:
+/// packing at the sender measured 23.58 ms of pass against 27.3 when the owner read the mapping).
+pub enum Name {
+    One(u32, Msg),
+    Two(u32, Msg, Msg),
 }
 
-impl Table {
-    /// A table of `buckets` buckets (4 entries each), all empty. Allocated zeroed, so its pages
-    /// are only touched (and charged) as entries land in them.
-    pub fn new(buckets: usize) -> Table {
-        let buckets = buckets.max(1);
-        // SAFETY: all-zero tag words and slots are valid: atomics of 0, every lane empty.
-        let (tags, slots) = unsafe {
-            (Box::<[AtomicU64]>::new_zeroed_slice(buckets).assume_init(), Box::<[Slots]>::new_zeroed_slice(buckets).assume_init())
-        };
-        let cap = 4 * buckets;
-        Table { tags, slots, limit: (cap - cap / 8) as u32, next_id: AtomicU32::new(0), overflow: AtomicBool::new(false) }
-    }
-
-    /// Whether some insert found the table 7/8 full: the pass that used it must be rerun, larger.
-    pub fn overflowed(&self) -> bool {
-        self.overflow.load(Ordering::Relaxed)
-    }
-
-    /// The bucket count, for a rerun's 4x.
-    pub fn buckets(&self) -> usize {
-        self.tags.len()
-    }
-
-    /// The entry count: every id handed out is below it.
-    pub fn entries(&self) -> usize {
-        4 * self.tags.len()
-    }
-
-    /// The table's base pointers and size as plain values, so the parse loop holds them in
-    /// locals instead of reloading them through the table on every record.
-    pub fn view(&self) -> View<'_> {
-        View { table: self, tags: self.tags.as_ptr(), slots: self.slots.as_ptr(), n: self.tags.len() }
-    }
-
-    /// The key's id if the published entry `e` holds it; `b` is the mapping.
+impl Name {
+    /// The name `p[at..at + len]` of a record in group `g`, with its key's hash.
+    ///
+    /// # Safety
+    /// The name and 32 bytes from its start must lie inside the padded mapping (GUARD), and so must
+    /// the byte before it (the opening quote, or the comma before an unquoted name).
     #[inline(always)]
-    fn same(e: &Slot, k: Key, b: &[u8]) -> Option<u32> {
-        let w = |i: usize| e.key[i].load(Ordering::Relaxed);
-        let meta = e.meta.load(Ordering::Relaxed);
-        let found = meta >> 32 == k.len
-            && if k.len <= 24 {
-                // Three word compares, folded into one test.
-                (w(0) ^ k.w[0]) | (w(1) ^ k.w[1]) | (w(2) ^ k.w[2]) == 0
-            } else {
-                let (at, mine, n) = (w(0) as usize, k.w[0] as usize, k.w[1] as usize);
-                w(1) == k.w[1] && b[at..at + n] == b[mine..mine + n]
-            };
-        found.then_some(meta as u32)
+    pub unsafe fn new(p: *const u8, at: usize, len: usize, g: usize) -> Name {
+        let (w0, w1) = unsafe { (key_word(p, at, len, 0), key_word(p, at, len, 1)) };
+        // The last byte is not 0 (for the empty name it reads the quote or comma before it).
+        let last = unsafe { *p.add(at + len - 1) } != 0;
+        if len <= 16 && (w0 | w1) & HIGH == 0 && last {
+            // The group in word 0's bit-7 positions: groups are at most 256 (regions.rs).
+            return Name::One(crc(&[w0, w1]), [w0 | unsafe { _pdep_u64(g as u64, HIGH) }, w1]);
+        }
+        unsafe { Name::long(p, at, len, last, g) }
     }
 
-    /// A bucket on the key's probe sequence with an empty or pending lane: waits out pending
-    /// inserts, then finds the key published in it or claims its first empty lane. Returns the id,
-    /// or None when the bucket must be read again (the caller loops).
+    /// A medium or exact name: off the short path, which takes 89 % of the records.
+    #[inline(never)]
+    unsafe fn long(p: *const u8, at: usize, len: usize, last: bool, g: usize) -> Name {
+        // key_word's count, clamped: at 32 bytes word 0's would be 256, which bzhi reads as 0.
+        let w = [0, 1, 2, 3].map(|k| unsafe { _bzhi_u64(load::<u64>(p, at + 8 * k), (8 * len).saturating_sub(64 * k).min(64) as u32) });
+        if len <= 32 && (w[0] | w[1] | w[2] | w[3]) & HIGH == 0 && last {
+            let (w1, w3) = (w[1] | MEDIUM, w[3] | TAIL);
+            return Name::Two(crc(&[w[0], w1, w[2], w3]), [w[0] | unsafe { _pdep_u64(g as u64, HIGH) }, w1], [w[2], w3]);
+        }
+        // An exact name's group goes in its offset's top byte: offsets stay under 2^47 (x86-64's
+        // user address space bounds every mapping), lengths under 2^63.
+        Name::One(exact_hash(p, at, len), [at as u64 | (g as u64) << 56, len as u64 | EXACT])
+    }
+}
+
+/// The sender's owner for a hash: multiply-shift over the hash's 32 bits.
+#[inline(always)]
+pub fn owner(h: u32, workers: usize) -> usize {
+    (h as u64 * workers as u64 >> 32) as usize
+}
+
+/// One cache line of a table's index: eight entries `tag << 32 | id`, filled in order. A tag is the
+/// key's hash with bit 31 set, so an entry is in use exactly when its sign bit is set.
+#[derive(Clone, Copy)]
+#[repr(align(64))]
+struct Bucket([u64; 8]);
+
+/// A name's key and its groups: bit g set once group g has seen the name (256 bits, regions.rs's limit).
+struct Rec<K> {
+    key: K,
+    groups: [u64; 4],
+}
+
+/// One owner's names of one kind of key: an index of 8-entry buckets over a dense array of records.
+/// Lookups start at the hash's home bucket and walk on to the next only past a full one; entries are
+/// never moved or deleted, so a key that is there sits before the first free entry of its walk.
+/// The index starts at one bucket and doubles past 3/4 full, rehashing from the tags alone; a record
+/// keeps its id, so no input size or count ever sizes it (rule 31), and every run grows it.
+struct Table<K> {
+    index: Box<[Bucket]>,
+    recs: Vec<Rec<K>>,
+}
+
+impl<K: Copy> Table<K> {
+    fn new() -> Self {
+        Table { index: Box::new([Bucket([0; 8])]), recs: Vec::new() }
+    }
+
+    #[inline(always)]
+    fn home(&self, h: u32) -> usize {
+        h as usize & (self.index.len() - 1)
+    }
+
+    /// Fetches the hash's home bucket into L1 ahead of its lookup. Only a hint; it never faults.
+    #[inline(always)]
+    fn prefetch(&self, h: u32) {
+        // SAFETY: the home bucket is inside the index; a prefetch reads nothing architecturally.
+        unsafe { _mm_prefetch::<_MM_HINT_T0>(self.index.as_ptr().add(self.home(h)) as *const i8) };
+    }
+
+    /// The groups of the key with hash `h` for which `same` holds, inserting `key` if none does.
+    #[inline(always)]
+    fn groups(&mut self, h: u32, key: K, same: impl Fn(&K) -> bool) -> &mut [u64; 4] {
+        let tag = h | 1 << 31;
+        let mut at = self.home(h);
+        // SAFETY: AVX2 is on at compile time; `at` stays inside the index; each id in an entry indexes
+        // `recs` (it was its length when the entry went in).
+        unsafe {
+            let tags = _mm256_set1_epi32(tag as i32);
+            loop {
+                let line = self.index.as_ptr().add(at) as *const __m256i;
+                let (lo, hi) = (_mm256_load_si256(line), _mm256_load_si256(line.add(1)));
+                // One bit per 32-bit half; an entry's tag is its upper half, the odd bits.
+                let eq = |v| _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(v, tags))) as u32;
+                let mut hits = (eq(lo) | eq(hi) << 8) & 0xAAAA;
+                while hits != 0 {
+                    let id = self.index[at].0[hits.trailing_zeros() as usize / 2] as u32 as usize;
+                    if same(&self.recs.get_unchecked(id).key) {
+                        return &mut self.recs.get_unchecked_mut(id).groups;
+                    }
+                    hits &= hits - 1;
+                }
+                let used = _mm256_movemask_pd(_mm256_castsi256_pd(lo)) | _mm256_movemask_pd(_mm256_castsi256_pd(hi)) << 4;
+                if used != 0xFF {
+                    return self.insert(at, used.count_ones() as usize, tag, key);
+                }
+                at = (at + 1) & (self.index.len() - 1);
+            }
+        }
+    }
+
+    /// Files a new key in entry `lane` of bucket `at` (its first free one), growing first past 3/4.
     #[cold]
     #[inline(never)]
-    fn settle(&self, word: &AtomicU64, slots: &Slots, k: Key, b: &[u8], tag: u64) -> Option<u32> {
-        let t = word.load(Ordering::Acquire);
-        let lanes = (0..4).map(|i| t >> (16 * i) & 0xFFFF);
-        if lanes.clone().any(|l| l == PENDING) {
-            std::hint::spin_loop();
-            return None;
+    fn insert(&mut self, mut at: usize, mut lane: usize, tag: u32, key: K) -> &mut [u64; 4] {
+        let id = self.recs.len();
+        if 4 * (id + 1) > 3 * 8 * self.index.len() {
+            self.grow();
+            (at, lane) = self.free(tag);
         }
-        if let Some(id) = lanes.clone().enumerate().filter(|&(_, l)| l == tag).find_map(|(i, _)| Self::same(&slots.0[i], k, b)) {
-            return Some(id);
-        }
-        if self.overflowed() {
-            return Some(0);
-        }
-        // The first empty lane (one exists: the caller saw it, and lanes are only ever filled).
-        let lane = lanes.clone().position(|l| l == 0)?;
-        if word.compare_exchange(t, t | PENDING << (16 * lane), Ordering::Acquire, Ordering::Relaxed).is_err() {
-            return None;
-        }
-        let e = &slots.0[lane];
-        for (slot, w) in e.key.iter().zip(k.w) {
-            slot.store(w, Ordering::Relaxed);
-        }
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        if id >= self.limit {
-            self.overflow.store(true, Ordering::Relaxed);
-        }
-        e.meta.store(k.len << 32 | id as u64, Ordering::Relaxed);
-        // PENDING (1) + tag - 1 = tag, inside the lane: no carry into its neighbour.
-        word.fetch_add((tag - 1) << (16 * lane), Ordering::Release);
-        Some(id)
-    }
-}
-
-/// A table's hot side (`Table::view`): its base pointers and bucket count, copied into the worker.
-#[derive(Clone, Copy)]
-pub struct View<'a> {
-    table: &'a Table,
-    tags: *const AtomicU64,
-    slots: *const Slots,
-    n: usize,
-}
-
-impl View<'_> {
-    #[inline(always)]
-    fn home(self, h: u64) -> usize {
-        ((h as u128 * self.n as u128) >> 64) as usize
+        self.index[at].0[lane] = (tag as u64) << 32 | id as u64;
+        self.recs.push(Rec { key, groups: [0; 4] });
+        &mut self.recs[id].groups
     }
 
-    /// Fetches the key's home tag word and the first line of its entries into L1 while the rest
-    /// of the record is parsed. Only hints; they never fault.
-    #[inline(always)]
-    pub fn prefetch(self, k: Key) {
-        let at = self.home(k.h);
-        // SAFETY: `at` is below the bucket count; a prefetch reads nothing architecturally.
-        unsafe {
-            _mm_prefetch(self.tags.add(at) as *const i8, _MM_HINT_T0);
-            _mm_prefetch(self.slots.add(at) as *const i8, _MM_HINT_T0);
-        }
-    }
-
-    /// The id of the key, inserting it if it is new. Returns 0 without inserting once the table has
-    /// overflowed (the pass is rerun).
-    #[inline(always)]
-    pub fn id(self, k: Key, b: &[u8]) -> u32 {
-        let tag = (k.h & 0xFFFF).max(2);
-        let (mut at, mut probed) = (self.home(k.h), 0);
+    /// The first free entry on a tag's walk, as (bucket, lane).
+    fn free(&self, tag: u32) -> (usize, usize) {
+        let mut at = self.home(tag);
         loop {
-            // SAFETY: `at` stays below the bucket count, and the table outlives the view.
-            let (word, slots) = unsafe { (&*self.tags.add(at), &*self.slots.add(at)) };
-            let t = word.load(Ordering::Acquire);
-            // Lanes equal to the tag: a zero lane in t ^ tag (SWAR; a lane above a match may show
-            // falsely, which only costs that entry's compare).
-            let x = t ^ tag * LANES;
-            let mut hits = x.wrapping_sub(LANES) & !x & 0x8000 * LANES;
-            while hits != 0 {
-                if let Some(id) = Table::same(&slots.0[hits.trailing_zeros() as usize / 16], k, b) {
-                    return id;
-                }
-                hits &= hits - 1;
+            if let Some(lane) = self.index[at].0.iter().position(|&e| e == 0) {
+                return (at, lane);
             }
-            // An empty or pending lane: the key is absent so far, or being inserted right now.
-            let low = t & !LANES; // a lane below 2 (empty or PENDING) is now 0
-            if low.wrapping_sub(LANES) & !low & 0x8000 * LANES != 0 {
-                if let Some(id) = self.table.settle(word, slots, k, b, tag) {
-                    return id;
-                }
-                continue;
-            }
-            at = if at + 1 == self.n { 0 } else { at + 1 };
-            probed += 1;
-            // Every bucket full and none holds the key: only an overflowed table gets here.
-            if probed == self.n {
-                self.table.overflow.store(true, Ordering::Relaxed);
-                return 0;
-            }
+            at = (at + 1) & (self.index.len() - 1);
+        }
+    }
+
+    /// Doubles the index and refiles every entry by its tag, whose low bits are the hash's.
+    fn grow(&mut self) {
+        // SAFETY: an all-zero bucket is valid: every entry free.
+        let bigger = unsafe { Box::<[Bucket]>::new_zeroed_slice(2 * self.index.len()).assume_init() };
+        let old = std::mem::replace(&mut self.index, bigger);
+        for &e in old.iter().flat_map(|b| &b.0).filter(|&&e| e != 0) {
+            let (at, lane) = self.free((e >> 32) as u32);
+            self.index[at].0[lane] = e;
         }
     }
 }
 
-/// A set of name ids, counting its members as they arrive.
-#[derive(Clone)]
-pub struct NameSet {
-    words: Vec<u64>,
-    pub len: u64,
+/// One worker's side as an owner: its names of each kind, and per group how many of them it has
+/// seen in that group.
+pub struct Owner {
+    short: Table<[u64; 2]>,
+    medium: Table<[u64; 4]>,
+    exact: Table<[u64; 2]>,
+    pub counts: [u64; 256],
 }
 
-impl NameSet {
-    /// A set for ids below `ids`: a pass's ids stay below its table's entry count, as each id is
-    /// handed out for one claimed entry. Sized once, so an insert has no growth check (880ff14's
-    /// grew in 1 KiB steps, a length test per insert). Zeroed pages are only charged once written.
-    pub fn new(ids: usize) -> NameSet {
-        NameSet { words: vec![0; ids.div_ceil(64)], len: 0 }
+impl Owner {
+    pub fn new() -> Self {
+        Owner { short: Table::new(), medium: Table::new(), exact: Table::new(), counts: [0; 256] }
     }
 
-    /// # Safety
-    /// `id` must be below the `ids` the set was made for.
-    #[inline(always)]
-    pub unsafe fn insert(&mut self, id: u32) {
-        let (w, bit) = (unsafe { self.words.get_unchecked_mut(id as usize / 64) }, 1 << (id % 64));
-        self.len += (*w & bit == 0) as u64;
-        *w |= bit;
+    /// Files a bucket of messages (`b` is the padded mapping, read only for exact names). Each name's
+    /// home bucket is prefetched 16 messages ahead (c-50 b6's distance).
+    pub fn file(&mut self, msgs: &[Msg], b: &[u8]) {
+        let Owner { short, medium, exact, counts } = self;
+        let mut j = 0;
+        while j < msgs.len() {
+            if let Some(&[f0, f1]) = msgs.get(j + 16) {
+                match f1 & TAIL {
+                    0 => short.prefetch(crc(&[f0 & !HIGH, f1])),
+                    // SAFETY: a medium name's two slots always travel in one bucket (pass2.rs).
+                    MEDIUM => medium.prefetch(crc(&[f0 & !HIGH, f1, unsafe { msgs.get_unchecked(j + 17) }[0], unsafe { msgs.get_unchecked(j + 17) }[1]])),
+                    _ => {}
+                }
+            }
+            let [m0, m1] = msgs[j];
+            // SAFETY: BMI2 is on at compile time (x86-64-v3).
+            let (key0, g) = if m1 & EXACT == 0 { (m0 & !HIGH, unsafe { _pext_u64(m0, HIGH) }) } else { (m0 << 8 >> 8, m0 >> 56) };
+            let groups = match m1 & TAIL {
+                0 => {
+                    let k = [key0, m1];
+                    short.groups(crc(&k), k, |r| *r == k)
+                }
+                MEDIUM => {
+                    j += 1;
+                    // SAFETY: as above.
+                    let [m2, m3] = *unsafe { msgs.get_unchecked(j) };
+                    let k = [key0, m1, m2, m3];
+                    medium.groups(crc(&k), k, |r| *r == k)
+                }
+                _ => {
+                    let (at, len) = (key0 as usize, (m1 & !EXACT) as usize);
+                    let same = |r: &[u64; 2]| r[1] as usize == len && b[r[0] as usize..][..len] == b[at..][..len];
+                    exact.groups(exact_hash(b.as_ptr(), at, len), [at as u64, len as u64], same)
+                }
+            };
+            let (word, bit) = (&mut groups[g as usize / 64], 1 << (g % 64));
+            counts[g as usize] += (*word & bit == 0) as u64;
+            *word |= bit;
+            j += 1;
+        }
     }
 }
