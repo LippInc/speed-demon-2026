@@ -193,8 +193,11 @@ impl Table {
         if let Some(i) = self.hours.iter().position(|h| h.hour == hour) {
             return i;
         }
-        self.hours.push(Default::default());
-        self.hours.last_mut().unwrap().hour = hour;
+        // a-47: reserved up front. recs at 1 << 16 entries (256 KB) is above glibc's mmap threshold (128 KiB, pinned
+        // in main), so it is mapped on its own and only the pages written are charged, instead of doubling inside the
+        // thread's heap and leaving each old block charged there; counts and errors start at the 2,048 ids that
+        // ID_BITS allows, so add's resize is only a fallback. Measured effect: PERF.md a-47.
+        self.hours.push(Hour { hour, counts: vec![0; 1 << ID_BITS], errors: vec![0; 1 << ID_BITS], recs: Vec::with_capacity(1 << 16) });
         self.hours.len() - 1
     }
 
