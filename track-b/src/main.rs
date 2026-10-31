@@ -1,10 +1,15 @@
 //! Track B: answer the BOOL and PHRASE queries of /data/queries.txt over /data/docs.txt (spec: specs/b-index.md).
 //!
 //! Queries are read first, so only their terms are looked up. One parallel pass over the memory-mapped corpus
-//! tokenizes every document and decides every BOOL query 64 documents at a time and every
+//! tokenizes every document and decides every BOOL query 1,024 documents at a time and every
 //! PHRASE pattern (by anchor checks) for it; nothing is indexed.
-//! Main tricks: `fold_window` (b-28, b-33a), `PhrasePlan` (b-8), `TermTable` (b-36a),
-//! `Window` (b-4, b-35a), `estimate_df` (b-11).
+//! A chunk is 1,024 consecutive documents of one worker. A common BOOL term has a row of 1,024 bits per chunk, and
+//! a hit sets the document's bit; any other BOOL term's hit is appended to the chunk's log as the term and the
+//! document's place in the chunk. At the chunk's end the log is sorted by term, each query that one of its terms
+//! triggers is folded once over its terms' rows (a rare term's row built from its log entries) with branch-free
+//! operator masks, the count is a popcount and the id sum comes from bit slices.
+//! Main tricks: `ChunkLog` and `fold_chunk` (b-68), `hold` (b-64), `PhrasePlan` (b-8), `TermTable` (b-36a),
+//! `estimate_df` (b-11).
 
 use std::arch::x86_64::*;
 use std::fs::File;
@@ -81,6 +86,8 @@ fn map_file(path: &str) -> &'static [u8] {
     let file = File::open(path).unwrap_or_else(|e| panic!("{path}: {e}"));
     let len = file.metadata().expect("stat").len() as usize;
     // PROT_READ, MAP_PRIVATE. An empty file maps one page (mmap refuses length 0) that the empty slice never reads.
+    // 1 = PROT_READ, 2 = MAP_PRIVATE (the Linux values), declared here so the standard library stays
+    // the only dependency.
     let ptr = unsafe { mmap(std::ptr::null_mut(), len.max(1), 1, 2, file.as_raw_fd(), 0) };
     assert!(ptr as isize != -1, "mmap {path} failed");
     // The mapping outlives the descriptor and is never unmapped, so the slice is valid for the whole run.
@@ -98,7 +105,7 @@ fn parallel<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
 
 /// The hash of a term zero-padded to 32 bytes: its four words multiplied by odd constants and xor-ed, high and low
 /// halves folded. A fixed amount of work per token, with no loop whose exit depends on the token's length.
-/// (b-31b) The byte loop's mispredicts fell from 71.1 M to 13.4 M (cachegrind, 1 worker, seed 1).
+/// (b-31b) The byte loop's mispredicts fell to 13.4 M (cachegrind, 1 worker, seed 1).
 #[inline(always)]
 fn hash32(t: &[u8; MAX_TERM]) -> u32 {
     const K: [u64; 4] = [0x9e37_79b9_7f4a_7c15, 0xc2b2_ae3d_27d4_eb4f, 0x1656_67b1_9e37_79f9, 0x27d4_eb2f_1656_67c5];
@@ -127,7 +134,7 @@ struct TermBytes([u8; MAX_TERM]);
 impl TermTable {
     /// The id of `term` (spec 2.3: 1 to 32 bytes), added if new. The slots double whenever they would pass load 1/3,
     /// rehashed from the entries: the 1 MB that 8 B slots took at load 2/3, with fewer collisions for the 2-bit tag
-    /// (b-36, cachegrind, 1 worker, seed 1: find's mispredicts 25.2 M at load 2/3, 14.2 M at 1/3; 19.0 M with 8 B).
+    /// (b-36, cachegrind, 1 worker, seed 1: find's mispredicts 19.0 M with 8 B slots, 14.2 M at load 1/3).
     fn intern(&mut self, term: &[u8]) -> u32 {
         let mut padded = [0u8; MAX_TERM];
         padded[..term.len()].copy_from_slice(term);
@@ -175,7 +182,7 @@ impl TermTable {
 
     /// The tag only filters; the bytes decide. Token and entry are both zero-padded to 32 bytes, so one 32-byte
     /// compare settles the bytes and the length (it replaced a memcmp call and a length test per hash match).
-    /// (b-31c) Measured on the box: official T 0.330 s → 0.318 s, K 21.35 → 21.75.
+    /// (b-31c) box T 0.330 → 0.318 s.
     #[inline]
     fn find(&self, token: &[u8; MAX_TERM], h: u32) -> Option<u32> {
         let mut i = self.slot(h);
@@ -200,16 +207,26 @@ impl TermTable {
         self.walk(data, i, |_, t| on_token(t))
     }
 
-    /// The term id of the token data[from..to], if it is a query term. Its bytes are loaded once, lower-cased by
-    /// setting bit 5 (spec 2.2: it maps A-Z to a-z and leaves a-z and 0-9 alone) and zero-padded to 32.
+    /// Looks up the token held back by `hold`, if any, and reports it. (b-64)
+    #[rustfmt::skip]
     #[inline(always)]
-    fn lookup(&self, data: &[u8], from: usize, to: usize) -> Option<u32> {
-        let n = to - from;
-        if n > MAX_TERM {
-            return None;
-        }
-        let token = Chunk::load(data, from).folded(n);
-        self.find(&token, hash32(&token))
+    fn settle(&self, pend: &mut Option<(usize, Option<([u8; MAX_TERM], u32)>)>, f: &mut impl FnMut(usize, Option<u32>)) {
+        if let Some((s, tok)) = pend.take() { f(s, tok.and_then(|(t, h)| self.find(&t, h))); }
+    }
+
+    /// Folds and hashes the token at from..to and prefetches its slot, then settles the token before it and holds this
+    /// one back: the slot's read overlaps the previous token's probe and hit work. Box T 0.268 -> 0.251 s. (b-64)
+    #[rustfmt::skip]
+    #[inline(always)]
+    fn hold(&self, data: &[u8], from: usize, to: usize, pend: &mut Option<(usize, Option<([u8; MAX_TERM], u32)>)>, f: &mut impl FnMut(usize, Option<u32>)) {
+        let tok = (to - from <= MAX_TERM).then(|| {
+            let t = Chunk::load(data, from).folded(to - from);
+            let h = hash32(&t);
+            unsafe { _mm_prefetch(self.slots.as_ptr().add(self.slot(h)) as *const i8, _MM_HINT_T0) };
+            (t, h)
+        });
+        self.settle(pend, f);
+        *pend = Some((from, tok));
     }
 
     /// `tokenize` with each token's start offset passed to `f` too: the phrase anchors need it (b-56). The text is
@@ -217,9 +234,11 @@ impl TermTable {
     /// taken per byte: the byte loop's two branches (separator skip, token end) were 71 M of the run's 161 M
     /// mispredicts (cachegrind, 1 worker, seed 1). (b-31a, b-31b, b-31c)
     /// Starts and ends are two masks, the i-th end closing the i-th start, so no branch decides per edge. (b-55)
+    /// Each token is reported one token late, after the next one's slot is prefetched. (b-64)
     #[inline(always)]
     fn walk(&self, data: &[u8], mut i: usize, mut f: impl FnMut(usize, Option<u32>)) -> usize {
         let mut start = NIL as usize; // the token in progress, if any
+        let mut pend = None;
         loop {
             let chunk = Chunk::load(data, i);
             let (lf, tok) = (chunk.lf(data, i), chunk.token_mask());
@@ -229,14 +248,14 @@ impl TermTable {
             let mut ends = !tok & prev; // bit k: a token ends just before byte i + k
             if start != NIL as usize && ends != 0 {
                 // the token carried in from the previous chunk ends at the first end bit
-                f(start, self.lookup(data, start, i + ends.trailing_zeros() as usize));
+                self.hold(data, start, i + ends.trailing_zeros() as usize, &mut pend, &mut f);
                 ends &= ends - 1;
                 start = NIL as usize;
             }
             while ends != 0 {
                 // every remaining end closes the earliest open start in this chunk
                 let (s, e) = (starts.trailing_zeros() as usize, ends.trailing_zeros() as usize);
-                f(i + s, self.lookup(data, i + s, i + e));
+                self.hold(data, i + s, i + e, &mut pend, &mut f);
                 starts &= starts - 1;
                 ends &= ends - 1;
             }
@@ -245,6 +264,7 @@ impl TermTable {
             }
             // The LF is no token byte, so a token that runs up to it has ended in the loop above.
             if lf != 0 {
+                self.settle(&mut pend, &mut f);
                 return i + lf.trailing_zeros() as usize + 1;
             }
             i += 32;
@@ -361,7 +381,8 @@ fn parse_id(data: &[u8], mut i: usize) -> (u32, usize) {
 const SAMPLE_WINDOWS: usize = 64;
 const SAMPLE_SHARE: usize = 128;
 
-fn estimate_df(docs: &[u8], dict: &TermTable, workers: usize) -> Vec<u32> {
+/// Returns the estimated df per term and the number of docs sampled.
+fn estimate_df(docs: &[u8], dict: &TermTable, workers: usize) -> (Vec<u32>, u32) {
     let (n_terms, window) = (dict.bytes.len(), docs.len() / SAMPLE_SHARE / SAMPLE_WINDOWS);
     // The windows are spread over the workers (window k on worker k % n) and their counts summed: the sample was
     // 15 ms of serial prologue on the box. (b-11)
@@ -381,21 +402,22 @@ fn estimate_df(docs: &[u8], dict: &TermTable, workers: usize) -> Vec<u32> {
                 });
             }
         }
-        df
+        (df, stamp)
     });
     let mut df = vec![0u32; n_terms];
-    for part in &parts {
+    for (part, _) in &parts {
         df.iter_mut().zip(part).for_each(|(d, p)| *d += p);
     }
-    df
+    (df, parts.iter().map(|p| p.1).sum())
 }
 
-/// BOOL queries evaluated inside the pass, 64 docs at a time, so no posting list is ever stored (b-2 kept 47.6 MB of
-/// blocks and 7.3 MB of heads for 29.2 MB of varints at 12 workers). Under the strict left fold (spec 3) a doc is
+/// BOOL queries evaluated inside the pass, CHUNK docs at a time, so no posting list is ever stored (b-2 kept 47.6 MB
+/// of blocks and 7.3 MB of heads for 29.2 MB of varints at 12 workers). Under the strict left fold (spec 3) a doc is
 /// in R exactly when the same fold over the booleans "the doc contains t" is true, so the fold over words whose bit
-/// j says "doc base + j contains t" decides 64 docs at once (`fold_window`). A query is only folded for the windows
-/// where one of its trigger terms occurs, a cover such that every doc in R contains one of them (`cover`); every
-/// query has one, so the path is exact for every shape, NOT forms and absent terms included.
+/// j says "doc base + j contains t" decides 64 docs at once, a chunk's 16 words all of R in the chunk
+/// (`fold_chunk`). A query is only folded for the chunks where one of its trigger terms occurs, a cover such that
+/// every doc in R contains one of them (`cover`); every query has one, so the path is exact for every shape, NOT
+/// forms and absent terms included.
 const MAX_BOOL_TERMS: usize = 6; // spec 2.3: a BOOL query has 1 to 6 terms
 /// A query's code: its first term, then op << OP_SHIFT | term per operator, NIL-padded.
 type Code = [u32; MAX_BOOL_TERMS];
@@ -404,9 +426,14 @@ const TERM: u32 = (1 << OP_SHIFT) - 1;
 const OP_AND: u32 = 0;
 const OP_OR: u32 = 1;
 const OP_NOT: u32 = 2;
-const OP_KEEP: u32 = 3; // pads a trigger's code to 3 words: r is left as it is
 
-/// One query listed under one of its trigger terms, with its code inline so a window's folds read the
+/// Docs per chunk: a doc's place in its chunk takes the low LOCAL_BITS of a log entry, and a chunk's row is
+/// CHUNK / 64 words. (b-68)
+const LOCAL_BITS: u32 = 10;
+const CHUNK: u32 = 1 << LOCAL_BITS;
+const ROW: usize = CHUNK as usize / 64;
+
+/// One query listed under one of its trigger terms, with its code inline so a chunk's evaluations read the
 /// trigger list front to back instead of jumping to each query.
 #[derive(Clone, Copy, Default)]
 struct Trigger {
@@ -414,8 +441,14 @@ struct Trigger {
     code: Code,
 }
 
+/// The BOOL terms are the ids 0..n_bool, the dense ones (sampled in at least 1/64 of the docs) first: a dense
+/// term's hits set bits in a row of CHUNK bits, every other term's are appended to the chunk's log. Sparse term t
+/// has the log key t - n_dense + 1; key 0 marks a dense term's hit, which the log does not keep. (b-68)
 struct BoolPlan {
-    trigger_start: Vec<u32>, // per term, into triggers (CSR)
+    n_dense: usize,
+    n_bool: usize,
+    every_chunk: Vec<Trigger>, // queries whose cover holds a dense term: folded in every chunk
+    trigger_start: Vec<u32>,   // per sparse key, into triggers (CSR)
     triggers: Vec<Trigger>,
     // Per query its accumulator slot. Slots follow the trigger lists, so the queries one term triggers have
     // neighbouring accumulators and first-id bounds (b-24b, which numbered them by query, read +3 ms on the box).
@@ -446,21 +479,22 @@ fn cover(q: &Code, df: &[u32]) -> Vec<u32> {
 }
 
 impl BoolPlan {
-    /// The BOOL terms are the ids 0..n_terms.
-    fn new(queries: &[Code], n_terms: usize, df: &[u32]) -> Self {
-        assert!(n_terms < 1 << OP_SHIFT);
-        let mut triggers = Vec::new();
+    fn new(queries: &[Code], n_dense: usize, n_bool: usize, df: &[u32]) -> Self {
+        assert!(n_bool < 1 << OP_SHIFT && n_bool - n_dense < 1 << (32 - LOCAL_BITS));
+        let (mut every_chunk, mut triggers) = (Vec::new(), Vec::new());
         for (qi, q) in queries.iter().enumerate() {
             let cover = cover(q, df);
-            let mut code = *q;
-            code[1..3].iter_mut().filter(|w| **w == NIL).for_each(|w| *w = OP_KEEP << OP_SHIFT | q[0]);
-            let trig = Trigger { query: qi as u32, code };
-            triggers.extend(cover.iter().map(|&t| (t, trig)));
+            let trig = Trigger { query: qi as u32, code: *q };
+            if cover[0] < n_dense as u32 {
+                every_chunk.push(trig); // sorted: a dense term, if any, comes first
+            } else {
+                triggers.extend(cover.iter().map(|&t| (t - n_dense as u32 + 1, trig)));
+            }
         }
-        let (trigger_start, mut triggers) = by_term(n_terms, &triggers);
-        // Every query has a trigger, so every query gets a slot.
+        let (trigger_start, mut triggers) = by_term(n_bool - n_dense + 1, &triggers);
+        // Every query is in one of the two lists, so every query gets a slot.
         let (mut slot, mut n_slots) = (vec![NIL; queries.len()], 0);
-        for trig in &mut triggers {
+        for trig in every_chunk.iter_mut().chain(&mut triggers) {
             let q = trig.query as usize;
             if slot[q] == NIL {
                 (slot[q], n_slots) = (n_slots, n_slots + 1);
@@ -468,33 +502,29 @@ impl BoolPlan {
             trig.query = slot[q];
         }
         let ids = FirstIds::new(queries.len());
-        BoolPlan { trigger_start, triggers, slot, ids }
+        BoolPlan { n_dense, n_bool, every_chunk, trigger_start, triggers, slot, ids }
     }
 }
 
-/// spec 3: strict left fold, no precedence; `a OR b AND c` is `(a OR b) AND c` (b-index.md:136-141), over 64 docs
-/// at once: bit j of a term's word says doc base + j contains it. AND, OR and NOT only combine bits that some term
-/// set, so docs missing from the range stay 0. Each step is r & (b ^ x | y) | b & o, with the operator's masks from
-/// OP_MASKS, so the operator takes no branch: its match was 16.9 M of the flush's mispredicts (cachegrind, 1
-/// worker, seed 1). (b-32b) The flush's mispredicts fell from 52.9 M to 41.5 M.
+/// spec 3: strict left fold, no precedence; `a OR b AND c` is `(a OR b) AND c` (b-index.md:136-141), over a chunk
+/// at once: bit j of `row(t)` says doc base + j contains t. AND, OR and NOT only combine bits that some term set, so
+/// docs missing from the range stay 0. Each step is r & (b ^ x | y) | b & o, with the operator's masks from
+/// OP_MASKS, so the operator takes no branch (b-32b) and a step is four AVX2 operations per 256 bits.
 #[inline]
-fn fold_window(code: &[u32; MAX_BOOL_TERMS], words: &[u64]) -> u64 {
-    // (x, y, o) for AND, OR, NOT and KEEP
-    const OP_MASKS: [(u64, u64, u64); 4] = [(0, 0, 0), (0, !0, !0), (!0, 0, 0), (0, !0, 0)];
-    let step = |r: u64, w: u32| {
-        let (b, (x, y, o)) = (words[(w & TERM) as usize], OP_MASKS[(w >> OP_SHIFT) as usize]);
-        r & (b ^ x | y) | b & o
-    };
-    // Two fixed steps (OP_KEEP pads codes of 1 or 2 terms), then a tail that only codes of 4 to 6 terms enter, so
-    // the loop exit is not a per-fold guess between lengths 1, 2 and 3: the length test was 13.7 M of the flush's
-    // mispredicts (cachegrind, 1 worker, seed 1). (b-33a) The flush's mispredicts fell from 41.5 M to 32.9 M,
-    // and its Ir from 2.56 G to 2.45 G.
-    let r = step(step(words[code[0] as usize], code[1]), code[2]);
-    code[3..].iter().take_while(|&&w| w != NIL).fold(r, |r, &w| step(r, w))
+fn fold_chunk(code: &Code, row: impl Fn(u32) -> [u64; ROW]) -> [u64; ROW] {
+    // (x, y, o) per operator in r & (b ^ x | y) | b & o, with 1 = all ones: AND (0, 0, 0) gives r & b,
+    // OR (0, 1, 1) gives r | b, NOT (1, 0, 0) gives r & !b.
+    const OP_MASKS: [(u64, u64, u64); 3] = [(0, 0, 0), (0, !0, !0), (!0, 0, 0)];
+    let mut r = row(code[0]);
+    for &w in code[1..].iter().take_while(|&&w| w != NIL) {
+        let (b, (x, y, o)) = (row(w & TERM), OP_MASKS[(w >> OP_SHIFT) as usize]);
+        r.iter_mut().zip(b).for_each(|(r, b)| *r = *r & (b ^ x | y) | b & o);
+    }
+    r
 }
 
 /// Bit k of a bit position j, for every j at once: the sum of the set positions of w is
-/// sum over k of popcount(w & BIT_SLICES[k]) << k, so a window's id sum needs no walk over its matches.
+/// sum over k of popcount(w & BIT_SLICES[k]) << k, so a word's id sum needs no walk over its matches.
 const BIT_SLICES: [u64; 6] = [
     0xaaaa_aaaa_aaaa_aaaa,
     0xcccc_cccc_cccc_cccc,
@@ -504,57 +534,166 @@ const BIT_SLICES: [u64; 6] = [
     0xffff_ffff_0000_0000,
 ];
 
-/// One worker's current window of docs base..base + 64: bit j of words[t] says doc base + j contains term t, and
-/// `touched` lists the terms whose word is not zero.
-struct Window {
-    base: u32,
-    words: Vec<u64>, // by term id
-    // (term, its trigger range): the range is read at the hit that first sets the term's word, next to the probe
-    // that just found the term, instead of as a miss on trigger_start in the flush.
-    touched: Vec<(u32, u32, u32)>,
-    n_touched: usize, // touched[..n_touched] is this window's; the array has a slot per BOOL term and one more
+/// Adds the matches r (bit j: doc base + j) to slot q's count and sum, and offers them as first ids while they can
+/// still be one: the bound is NIL until ten are kept.
+#[inline]
+fn record(acc: &mut BoolAcc, ids: &FirstIds, q: usize, base: u32, r: u64) {
+    let n = r.count_ones();
+    let offsets: u32 = (0..6).map(|k| (r & BIT_SLICES[k]).count_ones() << k).sum();
+    acc.count += n;
+    acc.sum += base as u64 * n as u64 + offsets as u64;
+    let mut bits = r;
+    while bits != 0 && base + bits.trailing_zeros() < ids.bound[q].load(Relaxed) {
+        ids.offer(q, base + bits.trailing_zeros());
+        bits &= bits - 1;
+    }
 }
 
-impl Window {
-    /// Folds every query that a term of the window triggers, once, and clears the window's words.
-    fn flush(&mut self, plan: &BoolPlan, acc: &mut [BoolAcc]) {
-        let (base, stamp) = (self.base, self.base / 64 + 1);
-        for &(_, from, to) in &self.touched[..self.n_touched] {
-            for trig in &plan.triggers[from as usize..to as usize] {
-                // A query listed under several touched terms is reached once per term and counts once: every
-                // query is stamped and a repeat's result masked to zero, with no branch on a MULTI flag or the stamp
-                // (b-35: those were 8.9 M of the flush's mispredicts, cachegrind, 1 worker, seed 1). A query
-                // listed under one term is reached once per window, so its stamp never matches early.
-                let q = trig.query as usize;
-                let repeat = acc[q].done == stamp;
-                acc[q].done = stamp;
-                let r = fold_window(&trig.code, &self.words) & (repeat as u64).wrapping_sub(1);
-                if r == 0 {
-                    continue;
-                }
-                let n = r.count_ones();
-                let offsets: u32 = (0..6).map(|k| (r & BIT_SLICES[k]).count_ones() << k).sum();
-                acc[q].count += n;
-                acc[q].sum += base as u64 * n as u64 + offsets as u64;
-                // First ids only while this window can still hold one: the bound is NIL until ten are kept.
-                let mut bits = r;
-                while bits != 0 && base + bits.trailing_zeros() < plan.ids.bound[q].load(Relaxed) {
-                    plan.ids.offer(q, base + bits.trailing_zeros());
-                    bits &= bits - 1;
-                }
+/// One worker's current chunk of docs base..base + CHUNK, the sorted chunk log: a dense term's hit sets its bit in
+/// `rows`, any other BOOL term's hit is appended to `log` as key << LOCAL_BITS | (id - base), a store with no read.
+/// It replaces the 64-doc window (b-4, b-35a): a chunk folds each triggered query once, about a fifth of the
+/// window's folds. (b-68) box T 0.250 → 0.238 s.
+struct ChunkLog {
+    base: u32,
+    rows: Vec<u64>,  // ROW words per dense term, and a dummy row that every sparse hit ORs into instead
+    log: Vec<u32>,   // log[..n] is this chunk's; the entry at n is written by every hit and kept by a sparse one
+    n: usize,
+    tmp: Vec<u32>,   // the radix sort's other buffer
+    count: Vec<u32>, // the radix sort's digit counts
+    half: u32,       // digit bits: two passes cover every key
+    // Per key, its entries' (start << 32 | end) in the sorted log; 0 (empty) for a key not in the chunk.
+    span: Vec<u64>,
+}
+
+impl ChunkLog {
+    fn new(plan: &BoolPlan) -> Self {
+        let keys = plan.n_bool - plan.n_dense + 1;
+        let half = (usize::BITS - keys.leading_zeros()).div_ceil(2);
+        ChunkLog {
+            base: 0,
+            rows: vec![0; (plan.n_dense + 1) * ROW],
+            log: vec![0; CHUNK as usize],
+            n: 0,
+            tmp: Vec::new(),
+            count: vec![0; (1 << half) + 1],
+            half,
+            span: vec![0; keys],
+        }
+    }
+
+    /// Records that doc `id` of this chunk contains BOOL term t: no branch on dense or sparse.
+    #[inline(always)]
+    fn hit(&mut self, n_dense: usize, t: usize, id: u32) {
+        let local = id - self.base;
+        self.rows[t.min(n_dense) * ROW + local as usize / 64] |= 1 << (local % 64);
+        let key = (t + 1).saturating_sub(n_dense) as u32;
+        if self.n == self.log.len() {
+            self.grow();
+        }
+        self.log[self.n] = key << LOCAL_BITS | local;
+        self.n += (key != 0) as usize;
+    }
+
+    /// Doubles the log, only while the first chunks size it. Out of line, so the hit stays small enough to be inlined
+    /// into the token walk: inline, the resize made the hit a call per token. (b-68) The pass's instructions fell by
+    /// 0.85 G (cachegrind, 1 worker, seed 1).
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self) {
+        self.log.resize(self.log.len() * 2, 0);
+    }
+
+    /// Sorts the log by key (a 2-pass LSD radix sort, stable, so each key's docs stay ascending), drops repeats of
+    /// a (key, doc) pair, and fills `span`. Returns the distinct entries' count.
+    fn sort(&mut self) -> usize {
+        let (n, half) = (self.n, self.half);
+        self.tmp.resize(n, 0);
+        let count = &mut self.count;
+        let mut pass = |from: &[u32], to: &mut [u32], shift: u32| {
+            let digit = |e: u32| (e >> shift) as usize & ((1 << half) - 1);
+            count.fill(0);
+            from.iter().for_each(|&e| count[digit(e) + 1] += 1);
+            (1..count.len()).for_each(|d| count[d] += count[d - 1]);
+            for &e in from {
+                to[count[digit(e)] as usize] = e;
+                count[digit(e)] += 1;
             }
+        };
+        pass(&self.log[..n], &mut self.tmp, LOCAL_BITS);
+        pass(&self.tmp, &mut self.log[..n], LOCAL_BITS + half);
+        let log = &mut self.log[..n];
+        // Each entry is written at m and kept when it differs from the one before; its key's span is rewritten
+        // at every entry, with no branch.
+        let (mut m, mut prev, mut start) = (0, NIL, 0);
+        for i in 0..n {
+            let e = log[i];
+            start = if e >> LOCAL_BITS != prev >> LOCAL_BITS { m } else { start };
+            log[m] = e;
+            m += (e != prev) as usize;
+            self.span[(e >> LOCAL_BITS) as usize] = (start as u64) << 32 | m as u64;
+            prev = e;
         }
-        for &(t, _, _) in &self.touched[..self.n_touched] {
-            self.words[t as usize] = 0;
+        m
+    }
+
+    /// Folds every query of the chunk once: the every-chunk queries, then those a key in the log triggers. Then
+    /// clears the chunk.
+    fn end(&mut self, plan: &BoolPlan, acc: &mut [BoolAcc]) {
+        let m = self.sort();
+        let (log, span, rows) = (&self.log[..m], &self.span, &self.rows);
+        let n_dense = plan.n_dense;
+        // A dense term's row, or a sparse term's built from its entries.
+        let row = |t: u32| {
+            let t = t as usize;
+            if t < n_dense {
+                return rows[t * ROW..(t + 1) * ROW].try_into().unwrap();
+            }
+            let mut r = [0u64; ROW];
+            let s = span[t - n_dense + 1];
+            for &e in &log[(s >> 32) as usize..s as u32 as usize] {
+                let local = e & (CHUNK - 1);
+                r[local as usize / 64] |= 1 << (local % 64);
+            }
+            r
+        };
+        // A query listed under several keys of the chunk is folded at the first one; `done` is the chunk's stamp.
+        let stamp = self.base / CHUNK + 1;
+        let mut fold = |trig: &Trigger| {
+            let q = trig.query as usize;
+            if acc[q].done == stamp {
+                return;
+            }
+            acc[q].done = stamp;
+            let r = fold_chunk(&trig.code, row);
+            // Only the words with a match are recorded, found through a mask of them, not a branch per word.
+            // (b-68) The evaluation's mispredicts fell to 21.6 M (cachegrind, 1 worker, seed 1).
+            let mut words = r.iter().enumerate().fold(0u32, |m, (j, &w)| m | ((w != 0) as u32) << j);
+            while words != 0 {
+                let j = words.trailing_zeros();
+                record(&mut acc[q], &plan.ids, q, self.base + 64 * j, r[j as usize]);
+                words &= words - 1;
+            }
+        };
+        plan.every_chunk.iter().for_each(&mut fold);
+        let mut i = 0;
+        while i < m {
+            let key = (log[i] >> LOCAL_BITS) as usize;
+            let (from, to) = (plan.trigger_start[key], plan.trigger_start[key + 1]);
+            plan.triggers[from as usize..to as usize].iter().for_each(&mut fold);
+            i = span[key] as u32 as usize;
         }
-        self.n_touched = 0;
+        for k in 0..m {
+            self.span[(self.log[k] >> LOCAL_BITS) as usize] = 0;
+        }
+        self.rows.fill(0);
+        self.n = 0;
     }
 }
 
 /// Per worker and BOOL query slot: the evaluation stamp and the running count and sum.
 #[derive(Clone, Copy, Default)]
 struct BoolAcc {
-    done: u32, // last window index + 1 this query was folded for
+    done: u32, // last chunk index + 1 this query was folded for
     count: u32,
     sum: u64,
 }
@@ -595,34 +734,26 @@ type Shard = (Vec<BoolAcc>, Vec<(u32, u32)>);
 
 fn scan(data: &[u8], dict: &TermTable, phrases: &PhrasePlan, plan: &BoolPlan) -> Shard {
     let (mut acc, mut matches) = (vec![BoolAcc::default(); plan.slot.len()], Vec::new());
-    // Flushing a window of no words changes nothing, so the first window needs no special case.
-    let words = vec![0u64; plan.trigger_start.len() - 1]; // by BOOL term id
-    let touched = vec![(0, 0, 0); words.len() + 1];
-    let mut window = Window { base: 0, words, touched, n_touched: 0 };
+    // Ending a chunk with no hits adds nothing, so the first chunk needs no special case.
+    let mut chunk = ChunkLog::new(plan);
     // The doc's anchor occurrences as (term, byte offset); per pattern the last doc id + 1 it was reported for.
     let (mut hits, mut pattern_last) = (Vec::new(), vec![0u32; phrases.anchors.len()]);
     let mut i = 0;
     while i < data.len() {
         let (id, text) = parse_id(data, i);
-        // Ids are dense and ascending through docs.txt (specs/b-index.md), so a window, once left, never returns.
-        if id / 64 * 64 != window.base {
-            window.flush(plan, &mut acc);
-            window.base = id / 64 * 64;
+        // Ids are dense and ascending through docs.txt (specs/b-index.md), so a chunk, once left, never returns.
+        if id / CHUNK * CHUNK != chunk.base {
+            chunk.end(plan, &mut acc);
+            chunk.base = id / CHUNK * CHUNK;
         }
         i = dict.walk(data, text, |start, hit| {
             let Some(t) = hit else { return };
             if phrases.anchor_bits[t as usize / 64] >> (t % 64) & 1 != 0 {
                 hits.push((t as usize, start - text));
             }
-            let Some(word) = window.words.get_mut(t as usize) else {
-                return; // a phrase-only term
-            };
-            // The entry is written at n_touched on every hit and kept only by the first one in the window, with no
-            // first-touch branch (b-37: 10.9 M mispredicts in cachegrind, 1 worker, seed 1).
-            let (from, to) = (plan.trigger_start[t as usize], plan.trigger_start[t as usize + 1]);
-            window.touched[window.n_touched] = (t, from, to);
-            window.n_touched += (*word == 0) as usize;
-            *word |= 1 << (id % 64);
+            if (t as usize) < plan.n_bool {
+                chunk.hit(plan.n_dense, t as usize, id);
+            }
         });
         // `i - 1` is the doc's LF, so the check reads this doc's text only; clamped for out-of-spec TAB-less lines.
         let end = (i - 1).min(data.len());
@@ -634,7 +765,7 @@ fn scan(data: &[u8], dict: &TermTable, phrases: &PhrasePlan, plan: &BoolPlan) ->
         });
         hits.clear();
     }
-    window.flush(plan, &mut acc);
+    chunk.end(plan, &mut acc);
     (acc, matches)
 }
 
@@ -655,9 +786,9 @@ fn main() {
         _ => std::thread::available_parallelism().map_or(1, |n| n.get()),
     };
 
-    // Queries: intern every term; every line is its own query. A line dedupe (whole lines as keys of a std
-    // HashMap) was 70 M of the parse's 110 M instructions; removing it took the VM's parse from 32 ms to 22.7 ms,
-    // for 349 repeated lines of seed 1's 50,000; a repeated line now only costs its own evaluation (b-38, b-38a).
+    // Queries: intern every term; every line is its own query, with no line dedupe: removing it took the VM's
+    // parse from 32 ms to 22.7 ms, for 349 repeated lines of seed 1's 50,000; a repeated line now only costs its
+    // own evaluation (b-38, b-38a).
     let mut terms = TermTable { slots: vec![0; 2], shift: 31, bytes: Vec::new() };
     let (mut bools, mut patterns): (Vec<Code>, Vec<Vec<u32>>) = (Vec::new(), Vec::new());
     let parse = |line: &[u8]| {
@@ -683,7 +814,7 @@ fn main() {
     let n_terms = terms.bytes.len();
 
     let docs = map_file(&format!("{data_dir}/docs.txt"));
-    let df = estimate_df(docs, &terms, workers);
+    let (df, n_sample) = estimate_df(docs, &terms, workers);
     // Renumber the terms: BOOL terms first, so a window's words cover them only (53,444 of 75,747 terms on seed 1),
     // each part by descending sampled df, so the terms most tokens hit have neighbouring ids and their per-term
     // entries and words share a few hundred KB of cache lines. Only speed depends on the order.
@@ -705,7 +836,11 @@ fn main() {
     // The two plans are independent: build them on two threads.
     let (plan, phrases) = std::thread::scope(|s| {
         let phrases = s.spawn(|| PhrasePlan::new(&patterns, n_terms, &df));
-        let plan = BoolPlan::new(&bools, n_bool, &df);
+        // Dense: sampled in at least 1/64 of the sampled docs, so a chunk holds about CHUNK / 64 = ROW or more of
+        // its docs and a row of ROW words is no larger than its log entries would be. BOOL ids are in descending
+        // df, so the dense terms are the first n_dense. (b-68)
+    let n_dense = (0..n_bool).take_while(|&t| df[t] > 0 && df[t] as u64 * 64 >= n_sample as u64).count();
+    let plan = BoolPlan::new(&bools, n_dense, n_bool, &df);
         (plan, phrases.join().unwrap())
     });
 
@@ -759,6 +894,7 @@ fn main() {
 }
 
 /// Appends n in decimal without leading zeros (spec 4); `write!` through fmt was most of the output's time.
+/// The recursion is at most 20 deep: a u64 has at most 20 decimal digits.
 fn push_decimal(out: &mut Vec<u8>, n: u64) {
     if n >= 10 {
         push_decimal(out, n / 10);

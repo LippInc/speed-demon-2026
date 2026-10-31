@@ -4,6 +4,12 @@ Every step from the reference to your final version, each with the live-board ru
 
 Terms used below: the board is the organisers' live leaderboard, one run per push; the box is our bench machine with the scoring machine's CPU, where each reading is 5 runs on seed 1's full data (official) and 5 on one fresh seed at full size (fresh), and K is the lower of the two; the VM is a 4-core cloud machine used for cachegrind counts and quick timings, never for K; lifted means copied from our working repository into this one and pushed, so the board ran it. A "kit <sha>" in a row names the commit in our working repository whose code that push carried; a hash in parentheses in the lists below is a box-only reading with no board run.
 
+How to read this, in plain words:
+
+- K is the organisers' speed score. It grows as T (run time), M (peak memory), S (lines of code) and D (1 + declared dependencies; ours is 1, the standard library only) fall against the reference. Points are the board's speed points computed from K.
+- b-NN names one of our numbered experiments; KNOWN marks a known technique, OURS our own idea. A D1 miss is a load that missed the CPU's first-level data cache; a mispredict is a branch the CPU guessed wrong. Both are counted with cachegrind on the VM at one worker.
+- The steps that moved the score most: b-1 (one pass over the mapped corpus, step 1), b-3 (BOOL decided inside the pass with no posting store, M 93 → 36 MB, step 8), b-4 (BOOL queries folded 64 documents at a time, step 9), b-8 (phrases matched at their rarest term, step 13), b-31c (a 32-byte AVX2 tokenizer, step 33) and b-38a + b-38b (each query line parsed once, results written by the workers, step 38).
+
 | Step | Change | Run ID | T (s) | M (MB) | Points | KNOWN/OURS | Spread (box T) | Kept/reverted |
 |---|---|---|---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 56.35 | 2,200 | 0 | - | - | - |
@@ -35,14 +41,14 @@ Terms used below: the board is the organisers' live leaderboard, one run per pus
 | 26 | b-21: the C runtime linked statically, so no dynamic loader runs before main | c32fd6a · Track B (run-458067610cc9) | 0.38 | 33 | 64.0 | KNOWN | - | kept |
 | 27 | b-21 again: a C push re-ran the same B folder (kit 92d0a12) | 2979028 · Track B (run-721cdfcab188) | 0.39 | 33 | 63.9 | KNOWN | - | kept |
 | 28 | b-27: b-24's S trim with b-21's static C runtime (kit 6f66339) | 0c42543 · Track B (run-25fdad391ad8) | 0.39 | 28 | 64.8 | KNOWN + OURS | - | kept |
-| 29 | b-28: every BOOL query folded per 64-document window (kit 8fed7f2); M +6 MB: per-term window words, 427 KB × 12 workers | b581408 · Track B (run-0e68675834d6) | 0.38 | 34 | 65.2 | OURS | - | kept |
+| 29 | b-28: every BOOL query folded per 64-document window (kit 8fed7f2); M +6 MB, 5.0 MB of it the per-term window words (427 KB × 12 workers) | b581408 · Track B (run-0e68675834d6) | 0.38 | 34 | 65.2 | OURS | - | kept |
 | 30 | b-28 again: a D push re-ran the same B folder (kit 8fed7f2) | e2b846c · Track B (run-4e5ca7d3ed9a) | 0.38 | 34 | 65.2 | OURS | - | kept |
 | 31 | b-30: trigger ranges carried in the touched list (kit 232155c) | 5d16aa8 · Track B (run-66a6690ad61e) | 0.38 | 35 | 65.3 | OURS | - | kept |
 | 32 | b-30 again: a D push re-ran the same B folder (kit 232155c) | dc1cab8 · Track B (run-0edc17d32962) | 0.38 | 34 | 65.4 | OURS | - | kept |
 | 33 | b-31c: AVX2 tokenizer, word-wide hash, 32-byte compare (kit ecb8f26) | 5c78ab8 · Track B (run-afd9ddaba664) | 0.33 | 35 | 66.6 | KNOWN | 0.318-0.319 s | kept |
 | 34 | b-32b + b-33a: the fold in two fixed steps, then a loop over terms 4 to 6 only (kit 9a562a6) | 59a4bfa · Track B (run-40a2f3fa1b0a) | 0.31 | 34 | 67.1 | OURS | 0.306-0.342 s | kept |
 | 35 | b-35a: every query stamped per window, a repeat's fold masked to zero (kit 7ae0d7e) | 8c4d4fe · Track B (run-8fd24c1540b1) | 0.31 | 34 | 67.2 | OURS | 0.301-0.302 s | kept |
-| 36 | b-36a + b-37a: 4-byte term-table slots, the touched entry written on every hit (kit 3e6a9da); board T rose 0.310 → 0.345 s while the box read 0.302 → 0.295 s for this code (step 36 below) | 9224ad7 · Track B (run-490adc93f9d9) | 0.34 | 34 | 66.0 | OURS | 0.293-0.295 s | kept |
+| 36 | b-36a + b-37a: 4-byte term-table slots, the touched entry written on every hit (kit 3e6a9da); board T rose 0.310 → 0.345 s while the box read 0.302 → 0.295 s for this code (step 36 below) | 9224ad7 · Track B (run-490adc93f9d9) | 0.34 | 34 | 66.0 | OURS | 0.293-0.295 s | kept (box and board disagree) |
 | 37 | b-36a + b-37a, re-run (another track's push) | 6ba03de · Track B (run-81e48f4a6dd3) | 0.32 | 35 | 66.8 | OURS | - | kept |
 | 38 | b-38a + b-38b: every query line parsed as its own query; results.txt formatted by the workers (kit 23bbfc3) | 8604c2c · Track B (run-75493eef7d4f) | 0.28 | 35 | 68.1 | OURS | 0.279-0.284 s | kept |
 | 39 | b-38a + b-38b, re-run (another track's push) | 67c71f1 · Track B (run-03f599a11cbe) | 0.29 | 35 | 68.0 | OURS | 0.279-0.284 s | kept |
@@ -53,6 +59,9 @@ Terms used below: the board is the organisers' live leaderboard, one run per pus
 | 44 | b-38a + b-38b, re-run (same code) | 5a559a8 · Track B (run-e9d7f7e3c71d) | 0.29 | 35 | 67.9 | OURS | 0.279-0.284 s | kept |
 | 45 | b-38a + b-38b, re-run (same code) | 2fd5fd7 · Track B (run-530519d7e31b) | 0.29 | 35 | 67.7 | OURS | 0.279-0.284 s | kept |
 | 46 | b-38a + b-38b, re-run (same code) | 63c975d · Track B (run-52cb41ba0444) | 0.30 | 36 | 67.7 | OURS | 0.279-0.284 s | kept |
+| 47 | b-55 + b-56 + b-59 + b-59r: token starts and ends as two masks, phrases checked at their anchor's byte offsets, one tokenizer loop, the phrase-check clamp for a docs line with no TAB (kit 0720fc9) | c8760d4 · Track B (run-11f0e517f808) | 0.28 | 34 | 68.2 | OURS | 0.267-0.269 s | kept |
+
+Keeps are decided on the box (5 runs on each of two seeds), because one board run of unchanged code varies by about 4 % (steps 38-46: T 0.284-0.295 s). Step 36 is the one step where the board moved the other way by more than that (0.310 → 0.345 s, then 0.32 s on a re-run); we kept it on the box's reading (0.302 → 0.295 s).
 
 What each push carried (the board re-runs the same code on every push):
 
@@ -81,7 +90,10 @@ What each push carried (the board re-runs the same code on every push):
 - **Step 35: experiment b-35a**, every query stamped per window and a repeat's fold masked to zero, so the MULTI flag and its two branches go.
 - **Step 36: experiments b-36a and b-37a**, 4-byte term-table slots (the term id in the low 30 bits, the hash's top 2 bits as a tag), and every hit writing its touched entry, kept only by the window's first hit on the term. The board's T on this run, 0.345 s, was 17 % above the box's 0.293-0.295 s for the same code.
 - **Step 37: b-36a and b-37a again.** A track C push re-ran the same B folder.
-- **Steps 38-46: experiments b-38a and b-38b**, every query line parsed as its own query (no line dedupe) and results.txt formatted by the workers, one contiguous slice of the queries each; steps 39-46 are later pushes re-running the same B code (board K 22.59-23.04, median 22.76: board single runs spread about 2 %).
+- **Steps 38-46: experiments b-38a and b-38b**, every query line parsed as its own query (no line dedupe) and results.txt formatted by the workers, one contiguous slice of the queries each; steps 39-46 are later pushes re-running the same B code (board K over steps 38-46, nine runs: 22.59-23.04, median 22.76: board single runs spread about 2 %).
+- **Step 47: b-55, b-56, b-59 and b-59r**, lifted together (kit 0720fc9, code 5668086).
+  - Box: K 23.60 (lower: fresh), official T 0.268 s (0.267-0.269), fresh T 0.269 s, M 33.1 MB, S 646.
+  - Its first board run read T 0.279 s, K 23.15, points 68.2, our best board result: 11 ms above the box, the same offset the board showed for b-38b's code (board 0.284-0.295 s against box 0.279-0.284 s).
 
 Experiments read on the bench box (sd-bench/B); the lifted ones also have their board rows in the table above:
 
@@ -166,7 +178,7 @@ Experiments read on the bench box (sd-bench/B); the lifted ones also have their 
   - Seed 1: 28.95 M query-term lookups and 7.62 M non-query lookups (20.8 %).
   - Query terms take 1.05 slot steps per lookup, with 0.37 M false tag matches. Non-query tokens take 1.49 steps, 0.94 M failed 32-byte compares (12.4 %), and all stop at an empty slot.
   - Cachegrind (1 worker): query-term lookups 37.6 Ir, 1.38 D1 misses and 0.05 mispredicts each; non-query lookups 29 Ir, 1.15 D1 misses and 0.72 mispredicts each. Slots are 1 MB, term bytes 2.42 MB, with no LL misses.
-  - No mechanism was estimated above about 2 ms of box time net of its S: a filter in front of the slots (b-29 and b-31d forms), more tag bits, inline bytes (b-18a), or a hash from the classifier's lanes. See REPORT-b-39.md.
+  - No mechanism was estimated above about 2 ms of box time net of its S: a filter in front of the slots (b-29 and b-31d forms), more tag bits, inline bytes (b-18a), or a hash from the classifier's lanes.
   - Docs commits on b-38b's code (46759bf), its third and fourth readings: `K 23.24 (lower: official) | official K 23.24 T 0.279s | fresh K 23.27 T 0.278s | M 33.4MB S 631 L | sha 5/5+5/5 OK` (3951bc2) and `K 23.22 (lower: fresh) | official K 23.24 T 0.279s (0.279-0.282) | fresh K 23.22 T 0.279s (0.278-0.281) | M 33.6MB S 631 L | sha 5/5+5/5 OK` (bbcbe94).
 
 - **b-40** (OURS), the flush's misses, on b-38b.
@@ -176,7 +188,7 @@ Experiments read on the bench box (sd-bench/B); the lifted ones also have their 
     - single-cover and multi-cover lists apart: 2.54 M zero single-cover folds of 20.88 M, about 1 ms;
     - an accumulator renumbering: 20.88 M list entries over 12.94 M distinct lines, but 71 % of folds are multi-cover queries listed under several terms.
 
-- **b-41** (OURS), four small cuts named in REPORT-b-37, REPORT-b-38 and REPORT-b-40, built on b-40a (e878d6c); none kept.
+- **b-41** (OURS), four small cuts, built on b-40a (e878d6c); none kept.
   - b-41a and b-41b, one branch: a BOOL line's words in a fixed array of 11 slices instead of a Vec per line, and the phrase anchor position kept without a branch: `K 23.24 (lower: official) | official K 23.24 T 0.277s | fresh K 23.32 T 0.276s | M 33.4MB S 644 L | sha 5/5+5/5 OK`. Level with b-40a, at S +9.
   - b-41c, failed: the term's first trigger entry prefetched at the hit: `K 23.06 (lower: official) | official K 23.06 T 0.283s | fresh K 23.11 T 0.281s | M 33.8MB S 638 L | sha 5/5+5/5 OK`. 3-6 ms slower than b-40a.
   - b-41d: the df sample at 1/256 of the corpus instead of 1/128: `K 23.20 (lower: fresh) | official K 23.23 T 0.279s (0.276-0.280) | fresh K 23.20 T 0.279s (0.278-0.280) | M 33.5MB S 635 L | sha 5/5+5/5 OK`. Level with b-40a or slower.
@@ -192,14 +204,14 @@ Experiments read on the bench box (sd-bench/B); the lifted ones also have their 
     - bitmaps, 14-33 ms;
     - evaluation, 0.80 s of CPU: rare-cover queries 0.55 s, dense-cover queries 0.25 s.
   - Peak RSS was 0.5 GB with u32 pairs; per-term lists alone are 55-73 MB at any dense threshold.
-  - More work than the flush saves, so nothing was built. See REPORT-b-45.md.
+  - More work than the flush saves, so nothing was built.
 
 - **b-46** (OURS), BOOL terms numbered by query co-occurrence, measured on b-38b with a probe and not built.
   - The order was greedy: queries by descending sampled cover df, each query's unplaced terms placed together, then the remaining terms by df. Answers were unchanged.
   - Statically, distinct word lines per fold fell from 2.71 to 2.11 on both seeds.
   - Cachegrind (1 worker), on seed 1 and fresh seed 20261031: the flush's D1 misses fell 12.3 M and 12.7 M, but the hit path's first-touch reads rose 10.3 M and 11.2 M, as the common terms no longer share lines. The whole run's D1 misses fell only 1.6 M and 1.0 M.
   - Building the order costs about 6.3 ms of serial plan time.
-  - Net negative, so nothing was built. See REPORT-b-46.md.
+  - Net negative, so nothing was built.
 
 - **b-47** (OURS), wider windows (W = 128 or 256 docs, each term's word a [u64; W/64], folds lane-wise), measured on b-38b with probes and not built. Answers matched on seed 1 and fresh seed 20261031.
   - Seed 1, distinct (query, window) folds: 18.82 M at W = 64, 13.00 M at 128, 8.73 M at 256. Touched terms: 10.39 M, 8.53 M, 6.78 M. Words per worker: 427 KB, 855 KB, 1.7 MB.
@@ -208,7 +220,7 @@ Experiments read on the bench box (sd-bench/B); the lifted ones also have their 
     - hit path D1 misses 28.8 M to 33.3 M, at +0.23 G Ir;
     - whole run D1 misses 163.8 M to 137.7 M, mispredicts 58.8 M to 52.3 M, Ir 8.49 G to 8.91 G.
   - Modelled gain: about 7-8 ms per worker at 12 workers, under the 10 ms bar. The VM's interleaved wall times read W = 256 slower than today (4 workers 0.74-1.00 s against 0.68-0.94 s) and W = 128 level to slower.
-  - Not built. See REPORT-b-47.md.
+  - Not built.
 
 - **b-48** (OURS), the tokenizer's per-token cost split on b-38b, measured and not built.
   - Today's tokenizer already is a block tokenizer: since b-31a it classifies 32 bytes per AVX2 compare and cuts tokens from the mask edges with no per-byte loop; b-31b and b-31c added the zero-padded token, the word-wide hash and the 32-byte compare.
@@ -216,22 +228,22 @@ Experiments read on the bench box (sd-bench/B); the lifted ones also have their 
     - boundary finding: about 0.85 G Ir and about 10.0 M mispredicts (the edge loop's exit per chunk 8.4 M, the start/end alternation 1.3 M);
     - fold and hash: about 0.5 G Ir and no mispredicts;
     - probe: 1.24 G Ir, 48.4 M D1 misses, 14.2 M mispredicts.
-  - Removing every boundary mispredict would be worth about 4 ms per worker at 12 workers, under the 10 ms bar. Not built. See REPORT-b-48.md.
+  - Removing every boundary mispredict would be worth about 4 ms per worker at 12 workers, under the 10 ms bar. Not built.
 - **b-50** (OURS), a scan-floor probe on b-42's code (f119ef0), never lifted.
   - Query parse with interning 20.3-21.5 ms on one thread; split and hash without interning 1.6-1.9 ms on 12 threads.
   - Scan floor (doc ids, tokenize, term lookup, no query work) 87.9-90.5 ms per worker.
 - **b-51** (OURS), lookup layouts probed on the box (c8f972b), not built.
   - Tokenize only 42.4-42.9 ms per worker; with today's lookup 95.5-96.0 ms.
   - One 64-byte bucket per lookup 98.7-100.3 ms; a hot 4,096-term table in front 139.2-140.2 ms.
-  - Every layout exact; none faster. See REPORT-b-51.md.
+  - Every layout exact; none faster.
 - **b-52** (OURS), the query parse on all workers, built to a spec by GLM (518500b).
   - Box K 21.77 (official T 0.277 s, fresh 0.275 s), M 55.1 MB, S 695: each worker cloned its query structures (+21.7 MB), and T fell only 2-4 ms. Not kept.
 - **b-52t** (OURS), stderr timers on b-52 (ab148ee), never lifted.
   - Parse 7.0 ms, term table 12.9, df sample 14.9, renumber 19.7, plans 23.7, pass done 264-269, end 269-275 ms (cumulative, box, 10 runs): the setup is about 24 ms, the pass about 245 ms of the run.
 - **b-53** (OURS), dense BOOL terms (sampled df at least 1/64) folded once per block of 512 docs from 8-word rows (345910d).
   - Box K 22.62 official / 22.64 fresh, T 0.282 s, M 37.6 MB, S 727.
-  - Cachegrind (1 worker, seed 1): the flush fell 2.57 G to 0.92 G instructions, but the hit's second store added 0.44 G and 11.7 M misses and per-lane accumulation 1.19 G.
-  - Not kept. See REPORT-b-53.md.
+  - Cachegrind (1 worker, seed 1): the triggered flush fell 2.57 G to 0.92 G instructions, but the block folds added 0.25 G and their per-lane accumulation 1.19 G (2.36 G in all), and the hit's second store 0.44 G and 11.7 M misses.
+  - Not kept.
 - **b-54** (OURS), judge-readiness fixes to these docs and main.rs comments (b80f5bf); no code change.
 - **b-55** (OURS), token starts and ends decoded as two masks per 32-byte chunk, built to a spec (6303ae6).
   - Box K 23.38 official / 23.36 fresh, T 0.275 s (0.274-0.277), M 33.5 MB, S 639. Kept.
@@ -240,11 +252,23 @@ Experiments read on the bench box (sd-bench/B); the lifted ones also have their 
 - **b-57** (OURS), b-53 without the hit's second store and with one test per dense query per block, built to a spec (4bc95c5).
   - Box K 22.83 official / 22.86 fresh, T 0.277 / 0.276 s, M 37.7 MB, S 731. Not kept; the dense fold line is closed.
 - **b-58** (OURS), a per-document batched lookup with the slot line prefetched, probed (3b63fd3, 5af6cac), not built.
-  - The scan floor fell from about 88 ms to 78-80 ms per worker, under its 20 ms go line. See REPORT-b-58.md.
+  - The scan floor fell from about 88 ms to 78-80 ms per worker, under its 20 ms go line.
 - **b-59** (OURS), b-55 and b-56 in one version with one tokenizer loop (`walk`; `tokenize` wraps it), built to a spec (f592839).
   - Box K 23.67 official / 23.68 fresh, T 0.267 s, M 32.9 MB, S 645. Kept.
 - **b-60** (OURS), b-58's batch wired into the pass: three passes per document (slot prefetch, term-entry prefetch, compare), then the hit work over the id buffer with the next token's words and trigger range prefetched (13a07aa).
-  - Box K 23.26 official / 23.29 fresh, T 0.269 s, M 33.5 MB, S 707, against b-59's 0.267 s and a 10 ms go line. Reverted. See REPORT-b-60.md.
+  - Box K 23.26 official / 23.29 fresh, T 0.269 s, M 33.5 MB, S 707, against b-59's 0.267 s and a 10 ms go line. Reverted.
+- **b-63** (OURS), each BOOL query's count and id sum by inclusion-exclusion over its terms' documents, rarest term first, the first ids still from triggered folds (prototype 50da923, fix round b-63a a968002).
+  - Box: prototype K 20.19, T 0.347 / 0.344 s, M 42.8 MB, S 774; b-63a K 21.83, T 0.282 / 0.281 s, M 47.5 MB, S 790, against b-59's 0.267 s. Not kept.
+- **b-64** (KNOWN), each token's slot line prefetched one token ahead in `walk`, the token itself reported one step late (`hold`; f205d4a, on the banked tip 3a7af1f).
+  - Box K 24.37 / 24.39, T 0.251 / 0.250 s (f205d4a); on the banked tip K 24.38 / 24.43, T 0.250 / 0.249 s, M 33.1 MB, S 659, against 0720fc9's K 23.64, T 0.268 s. Kept.
+- **b-65** (OURS), an exact 48-bit key table for tokens of up to 8 bytes in front of the term table, probed on the VM (f27bc68, 18839f6).
+  - The scan floor rose 8-13 ms per worker: the length branch mispredicts, since 20 % of tokens are 9-12 bytes. Dropped.
+- **b-66** (OURS), design A: BOOL rows per 512 documents for the common terms and the terms of their queries, doc-end stamps for the rest; its hit path probed on the box (ab65735, d14d4ad, 0a2671e).
+  - Hit path 28 / 28 ms over the scan floor against the window's 22 / 23 ms, at a KILL line of 25 ms. Not built.
+- **b-67** (OURS), judge-readiness fixes to these docs and the main.rs comments (75b9acf, cb92964, 5c045ef); no code change.
+- **b-68** (OURS), BOOL queries per 1,024-document chunk: a common term's hits set bits in its 16-word row, every other term's hits are appended to a log that is radix-sorted per chunk, and each triggered query is folded once per chunk; it replaces the 64-document window, its touched list and its flush (a129cda, on b-64).
+  - Box K 24.49 official / 24.55 fresh, T 0.238 / 0.237 s, M 39.9 MB, S 753, against b-64's K 24.38 / 24.43, T 0.250 / 0.249 s. Its floor probe (e0a9f5f) put the hits and the sort at 33 / 34 ms over the scan floor, against the window's 22 / 23 ms; the chunk folds 3.64 M (query, chunk) pairs where the window folded 18.84 M (seed 1, 12 workers). Cachegrind (1 worker, seed 1): D1 misses 161.6 M → 91.5 M, instructions 8.32 G → 9.18 G. Kept.
+- **b-70** (OURS), b-67's docs merged onto b-68 and brought up to date; no code change.
 
 ## Decisions
 
@@ -252,7 +276,7 @@ The plan's core choices (KNOWN = the known-best technique's version, OURS = our 
 
 - 1, map `docs.txt` read-only and never copy it to the heap (KNOWN): held. The mapped corpus costs about nothing in the box's M (b-1).
 - 2, look up only the terms the queries use (KNOWN): held, in one table for interning and the probe (b-13), with 4-byte slots (b-36a).
-- 2b, one 12-thread pass over document ranges with posting lists in arena blocks (OURS): the pass held; the posting lists were traded. With a posting store one pass could not get under the 43,999,232 B memory cap (b-2), so b-3 decides BOOL queries inside the pass with no store, and b-28 folds every BOOL query per 64-document window.
+- 2b, one 12-thread pass over document ranges with posting lists in arena blocks (OURS): the pass held; the posting lists were traded. With a posting store one pass could not get under the 43,999,232 B memory cap (b-2), so b-3 decides BOOL queries inside the pass with no store, and b-28 folds every BOOL query per 64-document window. That window was traded in turn by b-68, which folds each triggered query once per 1,024-document chunk from rows and a sorted log of the rarer terms' hits (box T 0.250 → 0.238 s).
 - 3, no stored positions, phrases through an inline Aho-Corasick automaton over term ids (OURS): no positions held; the automaton was traded for anchor checks at each phrase's rarest term (b-8).
 
 Rejected:
@@ -266,6 +290,7 @@ Rejected:
 - b-20 (OURS): 12-byte BOOL accumulators (count and sum), the multi-trigger stamps kept apart; dropped, slightly slower on the box.
 - b-22 (KNOWN): AND queries of rare terms answered by intersecting doc lists instead of per-document triggers; not built, such queries hold 0.9 % of the 10.7 M per-document evaluations at "rarer than 1 in 1,024 docs".
 - b-23 (OURS): the worker count capped at 6, 8 and 10 threads in place of all available CPUs; dropped, the box read K 16.17 (6 workers), 16.41 (8) and 17.78 (10) at T 0.44-0.53 s, so all available CPUs stay.
+- b-24b (OURS): accumulator slots numbered by query instead of by trigger list; the box read it 3 ms slower, so the slots follow the trigger lists.
 - b-25 (OURS): the window path opened to OR-only queries whose cover holds at least 1 document in 128, 256 or 512; dropped, the box read K 19.13, 18.96 and 18.65, so 1 in 64 stays.
 - b-29 (KNOWN): a 32 KB / 64 KB bit filter in front of the term slots; dropped, the box read T level or 1-2 ms worse.
 - b-34 (OURS): 4-byte term-table slots, a second 4-byte table beside the 8-byte parse table, one table for parse and pass, and load 1/3; all parts read level or worse in K and were reverted.
@@ -276,10 +301,13 @@ Rejected:
 - b-47 (OURS): wider windows of 128 or 256 docs; modelled gain about 7-8 ms per worker at 12 workers, under the 10 ms bar, and the VM read W = 256 slower and W = 128 level to slower; not built.
 - b-48 (OURS): the tokenizer's per-token cost split; removing every boundary mispredict would be worth about 4 ms per worker at 12 workers, under the 10 ms bar; not built.
 - b-52 (OURS): the query parse on all workers; each worker cloned its query structures (+21.7 MB) and T fell only 2-4 ms; not kept.
-- b-53 (OURS): dense BOOL terms folded once per block of 512 docs; the flush's instructions fell 2.57 G to 0.92 G but the hit's second store added 0.44 G and 11.7 M misses and per-lane accumulation 1.19 G; not kept.
-- b-57 (OURS): the dense fold without the hit's second store; box K 22.83 official / 22.86 fresh against b-55's 23.38 at 33.5 MB and 639; not kept, the dense fold line is closed.
+- b-53 (OURS): dense BOOL terms folded once per block of 512 docs; the evaluation's instructions fell only 2.57 G to 2.36 G (block folds and per-lane accumulation included) while the hit's second store added 0.44 G and 11.7 M misses; not kept.
+- b-57 (OURS): the dense fold without the hit's second store, on b-53; box K 22.83 official / 22.86 fresh at M 37.7 MB, S 731, against the tip of the day, b-55, at K 23.38, M 33.5 MB, S 639; not kept, the dense fold line is closed.
 - b-58 (OURS): a per-document batched lookup with the slot line prefetched; probed, not built: the scan floor fell from about 88 ms to 78-80 ms per worker, under its 20 ms go line.
 - b-60 (OURS): b-58's batch in the pass with the term entry and the hit path's words prefetched as well; box T 0.269 s against b-59's 0.267 s at S +62; reverted, the batched-lookup line is closed.
+- b-63 (OURS): BOOL count and id sum by inclusion-exclusion; box T 0.282 s at best (b-63a) against b-59's 0.267 s, with M 47.5 MB; not kept.
+- b-65 (OURS): an exact 48-bit key table for tokens of up to 8 bytes; the VM's scan floor rose 8-13 ms per worker on the length branch; dropped.
+- b-66 (OURS): per-512-doc rows plus doc-end stamps (design A); its hit path read 28 ms over the scan floor on the box against the window's 22-23 ms and a 25 ms KILL line; not built.
 
 Experiments measured only on the build VM and not kept:
 
@@ -287,4 +315,4 @@ Experiments measured only on the build VM and not kept:
 - **b-17** (KNOWN), tokenizing 64 bytes at a time with AVX2 class masks, lower-casing in the vector and hashing each token a word at a time. A second variant kept the byte loop and changed only the hash. Both were slower on the VM at 1, 4 and 12 workers, and both ran more instructions per docs byte (cachegrind). The byte loop's FNV multiply costs almost nothing, because it overlaps the scan. No code was committed.
 - **b-22** (KNOWN), answering AND queries of rare terms by intersecting doc lists instead of per-document triggers. It was not built, because the VM count showed too little to gain: such queries hold 0.9 % of the 10.7 M per-document evaluations at "rarer than 1 in 1,024 docs", and 3 % at 1 in 256. No code was committed.
 
-Final result (this tip): the board has not run the tip's code yet; its last run, of b-38b's code, read board K 22.59-23.04 over 9 runs, median 22.76; best run-75493eef7d4f (T 0.284 s, M 34.8 MB, S 631, D 1), against the reference's T 56.35 s and M 2,200 MB.
+Final result (this tip, code a129cda): box K 24.49 (lower of two seeds), T 0.238 s, M 39.9 MB, S 753. The board's latest run, run-11f0e517f808 (c8760d4 · Track B), measured the code before b-64 and b-68 (5668086): T 0.279 s, M 34.4 MB, S 646, D 1, K 23.15, points 68.2, against the reference's T 56.35 s and M 2,200 MB.
