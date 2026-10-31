@@ -5,7 +5,6 @@
 //! PHRASE pattern (by anchor checks) for it; nothing is indexed.
 
 use std::arch::x86_64::*;
-use std::collections::HashMap;
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
@@ -258,7 +257,7 @@ fn by_term<T: Copy + Default>(n_terms: usize, items: &[(u32, T)]) -> (Vec<u32>, 
     (start, lists)
 }
 
-/// PHRASE matching by anchor checks. Each distinct phrase is one pattern and gets one anchor: its term with the
+/// PHRASE matching by anchor checks. Each PHRASE line is one pattern and gets one anchor: its term with the
 /// lowest estimated df (the df sample only picks the anchor; a term in no doc has df 0, so a phrase with an absent
 /// term is never even checked). Each doc records its token sequence as term ids (NIL for a token that is no query
 /// term, which no phrase can match across); every occurrence of an anchor term at position i is a candidate start
@@ -636,13 +635,12 @@ fn main() {
         _ => std::thread::available_parallelism().map_or(1, |n| n.get()),
     };
 
-    // Queries: intern every term, dedupe BOOL lines and PHRASE term sequences. Under spec 2.3's grammar (single
-    // spaces, lower-case terms) two PHRASE lines are equal exactly when their term sequences are, so whole lines are
-    // the dedupe key for both kinds (b-9 also hashed a cloned Vec<u32> per phrase).
+    // Queries: intern every term; every line is its own query. A line dedupe (whole lines as keys of a std
+    // HashMap) was 70 M of the parse's 110 M instructions and most of its 32 ms of serial time on the VM, for 349
+    // repeated lines of seed 1's 50,000; a repeated line now only costs its own evaluation (b-38).
     let mut terms = TermTable { slots: vec![0; 2], shift: 31, bytes: Vec::new() };
-    let mut distinct: HashMap<&[u8], Query> = HashMap::new();
     let (mut bools, mut patterns): (Vec<Code>, Vec<Vec<u32>>) = (Vec::new(), Vec::new());
-    let mut parse = |line: &[u8]| {
+    let parse = |line: &[u8]| {
         if let Some(body) = line.strip_prefix(b"PHRASE \"") {
             let phrase = body[..body.len() - 1].split(|&b| b == b' ');
             patterns.push(phrase.map(|t| terms.intern(t)).collect());
@@ -661,8 +659,7 @@ fn main() {
     };
     let qtext = map_file(&format!("{data_dir}/queries.txt"));
     let lines = qtext.split(|&b| b == b'\n').filter(|l| !l.is_empty());
-    let queries: Vec<Query> = lines.map(|l| *distinct.entry(l).or_insert_with(|| parse(l))).collect();
-    drop(distinct);
+    let queries: Vec<Query> = lines.map(parse).collect();
     let n_terms = terms.bytes.len();
 
     let docs = map_file(&format!("{data_dir}/docs.txt"));
@@ -716,19 +713,25 @@ fn main() {
         }
     }
 
-    let mut out = Vec::with_capacity(queries.len() * 32);
-    for q in queries {
-        let (count, sum, first) = match q {
-            Query::Bool(b) => &bool_results[plan.slot[b] as usize],
-            Query::Phrase(p) => &phrase_results[p],
-        };
-        let first = first.iter().map(|&id| id as u64);
-        for n in [*count, *sum].into_iter().chain(first) {
-            push_decimal(&mut out, n);
-            out.push(b' ');
+    // Each worker formats one contiguous slice of the queries, and the slices are joined in order: the formatting
+    // was 9-10 ms of serial time after the pass on the VM at 4 workers (b-38).
+    let format = |k: usize| {
+        let mut out = Vec::with_capacity(queries.len() * 32 / workers);
+        for &q in &queries[queries.len() * k / workers..queries.len() * (k + 1) / workers] {
+            let (count, sum, first) = match q {
+                Query::Bool(b) => &bool_results[plan.slot[b] as usize],
+                Query::Phrase(p) => &phrase_results[p],
+            };
+            let first = first.iter().map(|&id| id as u64);
+            for n in [*count, *sum].into_iter().chain(first) {
+                push_decimal(&mut out, n);
+                out.push(b' ');
+            }
+            *out.last_mut().unwrap() = b'\n';
         }
-        *out.last_mut().unwrap() = b'\n';
-    }
+        out
+    };
+    let out = parallel(workers, format).concat();
     std::fs::write(format!("{out_dir}/results.txt"), out).expect("write results.txt");
     // results.txt is written and closed: exit now, without dropping the tables (frees and unmaps the run does
     // not need).

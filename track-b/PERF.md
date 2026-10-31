@@ -39,6 +39,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 32 | b-30 again: a D push re-ran the same B folder (kit 232155c) | dc1cab8 · Track B (run-0edc17d32962) | 0.38 | 34 | 65.4 |
 | 33 | b-31c: AVX2 tokenizer, word-wide hash, 32-byte compare (kit ecb8f26) | 5c78ab8 · Track B (run-afd9ddaba664) | 0.33 | 35 | 66.6 |
 | 34 | b-33a: the fold in two fixed steps, then a loop over terms 4 to 6 only (kit 9a562a6) | 59a4bfa · Track B (run-40a2f3fa1b0a) | 0.31 | 34 | 67.1 |
+| 35 | b-35a: every query stamped per window, a repeat's fold masked to zero (kit 7ae0d7e) | 8c4d4fe · Track B (run-8fd24c1540b1) | 0.31 | 34 | 67.2 |
+| 36 | b-36a + b-37a: 4-byte term-table slots, the touched entry written on every hit (kit 3e6a9da) | 9224ad7 · Track B (run-490adc93f9d9) | 0.34 | 34 | 66.0 |
 
 What each push carried (the board re-runs the same code on every push):
 
@@ -63,6 +65,8 @@ What each push carried (the board re-runs the same code on every push):
 - **Steps 31-32: experiment b-30**, each term's trigger range read at the hit that first sets its window word; step 32 is a track D push re-running the same B folder.
 - **Step 33: experiment b-31c**, the tokenizer classifying 32 bytes at a time with AVX2, the token hashed as four 64-bit words, and one 32-byte compare per hash match.
 - **Step 34: experiment b-33a**, the fold in two fixed steps (codes of 1 or 2 terms padded with a step that keeps the result), then a loop over terms 4 to 6 only.
+- **Step 35: experiment b-35a**, every query stamped per window and a repeat's fold masked to zero, so the MULTI flag and its two branches go.
+- **Step 36: experiments b-36a and b-37a**, 4-byte term-table slots (the term id in the low 30 bits, the hash's top 2 bits as a tag), and every hit writing its touched entry, kept only by the window's first hit on the term. The board's T on this run, 0.345 s, was 17 % above the box's 0.293-0.295 s for the same code.
 
 Experiments measured only on the bench box (sd-bench/B), with no board run:
 
@@ -125,7 +129,7 @@ Experiments measured only on the bench box (sd-bench/B), with no board run:
   - b-35a, every query stamped per window and a repeat's fold masked to zero, so the MULTI flag and its two branches go: `K 22.30 (lower: official) | official K 22.30 T 0.303s | fresh K 22.32 T 0.302s | M 33.0MB S 632 L | sha 5/5+5/5 OK`. The flush's mispredicts fell from 32.9 M to 29.1 M, with D1 misses up from 68.5 M to 72.1 M. Kept, final code.
   - b-35b, failed (reverted): count and sum added with no `r == 0` branch, and first ids offered only while the worker holds fewer than ten of its own matches: `K 22.15 (lower: fresh) | official K 22.15 T 0.307s (0.305-0.310) | fresh K 22.15 T 0.307s (0.306-0.308) | M 33.3MB S 633 L | sha 5/5+5/5 OK`. Cachegrind read it better (flush mispredicts 23.3 M, D1 65.1 M); the box read it 4-5 ms slower.
   - b-35c, failed (reverted): one flat loop over every touched term's triggers, stepping ranges with selects: `K 22.17 (lower: fresh) | official K 22.18 T 0.304s (0.303-0.304) | fresh K 22.17 T 0.304s (0.304-0.308) | M 33.2MB S 648 L | sha 5/5+5/5 OK`. Flush mispredicts 17.8 M in cachegrind; the box read it 1-2 ms slower, at S +16.
-  - Docs commit on b-35a's code: SECOND_READING_35.
+  - Docs commit on b-35a's code (302e6d9), the second reading: `K 22.30 (lower: fresh) | official K 22.34 T 0.302s (0.301-0.302) | fresh K 22.30 T 0.303s (0.302-0.306) | M 33.1MB S 632 L | sha 5/5+5/5 OK`.
 
 - **b-36**, 4-byte term-table slots in the fewest lines, on b-35a: one table for the parse and the pass, the term id in the low 30 bits (the TERM mask, BoolPlan::new's bound), the hash's top 2 bits as the tag, no resize step, doubling past load 1/3.
   - b-36a: `K 22.35 (lower: official) | official K 22.35 T 0.302s | fresh K 22.37 T 0.301s | M 33.1MB S 630 L | sha 5/5+5/5 OK`. Kept.
@@ -136,6 +140,31 @@ Experiments measured only on the bench box (sd-bench/B), with no board run:
   - b-37a: every hit writes its touched entry at `n_touched`, and only the window's first hit on the term keeps it (`n_touched += word was zero`), in place of the first-touch branch: `K 22.59 (lower: official) | official K 22.59 T 0.295s | fresh K 22.61 T 0.295s | M 33.0MB S 632 L | sha 5/5+5/5 OK`. Kept. Cachegrind (1 worker, seed 1): pass-body mispredicts 27.2 M to 15.7 M, for +0.37 G Ir.
   - Part (b), skipping phrase bookkeeping for documents with no anchor term, was not built. 210,923 of 250,000 seed-1 documents (34.98 M of 36.28 M tokens) hold an anchor, so at most 1.3 M token pushes could be skipped. An exact form would have to tokenize the other 96 % of tokens again, since a phrase needs every position before its anchor.
   - Docs commit: `K 22.59 (lower: official) | official K 22.59 T 0.295s | fresh K 22.67 T 0.293s | M 33.0MB S 632 L | sha 5/5+5/5 OK` (53b2453).
+
+- **b-38**, the serial setup and output around the pass, on b-37a.
+  - b-38a: every query line parsed as its own query, without the std HashMap line dedupe (70 M of the parse's 110 M instructions; 349 repeated lines of 50,000 on seed 1): `K 22.83 (lower: official) | official K 22.83 T 0.290s | fresh K 22.89 T 0.288s | M 33.3MB S 627 L | sha 5/5+5/5 OK`. Kept. The VM's parse fell from 32 ms to 22.7 ms.
+  - b-38b: results.txt formatted by the workers, one contiguous slice of the queries each, joined in order: `K 23.23 (lower: official) | official K 23.23 T 0.279s | fresh K 23.26 T 0.279s | M 33.4MB S 631 L | sha 5/5+5/5 OK`. Kept.
+  - A parse split over the workers, with per-part term tables merged, was measured on the VM only and not pushed: parse 26-37 ms against 22.7 ms, S +33. The merge interns every part's distinct terms again, which grows with the part count.
+  - Docs commit: `K 23.21 (lower: fresh) | official K 23.22 T 0.280s (0.279-0.284) | fresh K 23.21 T 0.280s (0.278-0.281) | M 33.5MB S 631 L | sha 5/5+5/5 OK` (21a6eea).
+
+- **b-39**, a measurement of tokenize and probe on b-38b (46759bf), with nothing built.
+  - Seed 1: 28.95 M query-term lookups and 7.62 M non-query lookups (20.8 %).
+  - Query terms take 1.05 slot steps per lookup, with 0.37 M false tag matches. Non-query tokens take 1.49 steps, 0.94 M failed 32-byte compares (12.4 %), and all stop at an empty slot.
+  - Cachegrind (1 worker): query-term lookups 37.6 Ir, 1.38 D1 misses and 0.05 mispredicts each; non-query lookups 29 Ir, 1.15 D1 misses and 0.72 mispredicts each. Slots are 1 MB, term bytes 2.42 MB, with no LL misses.
+  - No mechanism was estimated above about 2 ms of box time net of its S: a filter in front of the slots (b-29 and b-31d forms), more tag bits, inline bytes (b-18a), or a hash from the classifier's lanes. See REPORT-b-39.md.
+  - Docs commits on b-38b's code (46759bf), its third and fourth readings: `K 23.24 (lower: official) | official K 23.24 T 0.279s | fresh K 23.27 T 0.278s | M 33.4MB S 631 L | sha 5/5+5/5 OK` (3951bc2) and `K 23.22 (lower: fresh) | official K 23.24 T 0.279s (0.279-0.282) | fresh K 23.22 T 0.279s (0.278-0.281) | M 33.6MB S 631 L | sha 5/5+5/5 OK` (bbcbe94).
+
+- **b-40**, the flush's misses, on b-38b.
+  - Measured (cachegrind, 1 worker, seed 1), the flush's 72.7 M D1 misses: window words 26.2 M, trigger entries 13.5 M, the accumulator stamp read 12.1 M, the shared first-id bound 6.6 M, touched-list walks 3.9 M.
+  - b-40a: the first-id loop is entered only while the worker holds fewer than ten of the query's matches, tested on the count in the accumulator line just read: `K 23.31 (lower: fresh) | official K 23.32 T 0.277s (0.276-0.278) | fresh K 23.31 T 0.277s (0.276-0.278) | M 33.5MB S 635 L | sha 5/5+5/5 OK`. Flush D1 misses fell from 72.7 M to 65.7 M. Its docs commits read `K 23.31 (lower: official) | official K 23.31 T 0.277s | fresh K 23.35 T 0.276s | M 33.5MB S 635 L | sha 5/5+5/5 OK` (9ab4dbd) and `K 23.27 (lower: fresh) | official K 23.31 T 0.277s (0.277-0.279) | fresh K 23.27 T 0.278s (0.276-0.279) | M 33.4MB S 635 L | sha 5/5+5/5 OK` (e878d6c). Its readings, 23.27-23.35, meet b-38b's, 23.21-23.27, at 23.27, so it is not beyond the spread (S +4): not in this tip, held to go with the next experiment.
+  - Not built, on numbers:
+    - single-cover and multi-cover lists apart: 2.54 M zero single-cover folds of 20.88 M, about 1 ms;
+    - an accumulator renumbering: 20.88 M list entries over 12.94 M distinct lines, but 71 % of folds are multi-cover queries listed under several terms.
+
+- **b-41**, four small cuts named in REPORT-b-37, REPORT-b-38 and REPORT-b-40, built on b-40a (e878d6c); none kept.
+  - b-41a and b-41b, one branch: a BOOL line's words in a fixed array of 11 slices instead of a Vec per line, and the phrase anchor position kept without a branch: `K 23.24 (lower: official) | official K 23.24 T 0.277s | fresh K 23.32 T 0.276s | M 33.4MB S 644 L | sha 5/5+5/5 OK`. Level with b-40a, at S +9.
+  - b-41c, failed: the term's first trigger entry prefetched at the hit: `K 23.06 (lower: official) | official K 23.06 T 0.283s | fresh K 23.11 T 0.281s | M 33.8MB S 638 L | sha 5/5+5/5 OK`. 3-6 ms slower than b-40a.
+  - b-41d: the df sample at 1/256 of the corpus instead of 1/128: `K 23.20 (lower: fresh) | official K 23.23 T 0.279s (0.276-0.280) | fresh K 23.20 T 0.279s (0.278-0.280) | M 33.5MB S 635 L | sha 5/5+5/5 OK`. Level with b-40a or slower.
 
 Experiments measured only on the build VM and not kept:
 
