@@ -55,14 +55,15 @@ fn find(b: &[u8], mut i: usize, c: u8) -> usize {
         }
         i += 32;
     }
-    i + b[i..].iter().position(|&x| x == c).expect("unterminated field")
+    // Not found (only in a range cut inside a quoted field): the end of the mapping.
+    b.get(i..).and_then(|r| r.iter().position(|&x| x == c)).map_or(b.len(), |p| i + p)
 }
 
 /// One text field (name or note) starting at `i`, which is followed by a comma.
 /// Returns where the raw bytes between the quotes start and how many there are (escapes kept),
 /// the value's length once `""` is unescaped, and the index just past the comma.
 fn text_field(b: &[u8], i: usize) -> (usize, usize, u64, usize) {
-    if b[i] != b'"' {
+    if b.get(i) != Some(&b'"') {
         // Unquoted: everything up to the comma (c-join.md:28).
         let end = find(b, i, b',');
         return (i, end - i, (end - i) as u64, end + 1);
@@ -84,8 +85,8 @@ fn text_field(b: &[u8], i: usize) -> (usize, usize, u64, usize) {
 /// An unsigned decimal ending at `stop`; returns it and the index just past `stop`.
 fn uint_until(b: &[u8], mut i: usize, stop: u8) -> (u64, usize) {
     let mut n = 0u64;
-    while b[i] != stop {
-        n = n * 10 + (b[i] - b'0') as u64;
+    while let Some(&d) = b.get(i).filter(|&&d| d != stop) {
+        n = n * 10 + (d - b'0') as u64;
         i += 1;
     }
     (n, i + 1)
@@ -112,15 +113,23 @@ pub fn parse_range<L: Lookup + ?Sized>(
         let (_, _, note_len, next) = text_field(b, next);
         let (region_id, next) = uint_until(b, next, b',');
         // `-?[0-9]+\.[0-9]{2}` as integer cents (c-join.md:24, 37).
-        let negative = b[next] == b'-';
+        let negative = b.get(next) == Some(&b'-');
         let (whole, next) = uint_until(b, next + negative as usize, b'.');
-        let cents = whole as i64 * 100 + ((b[next] - b'0') * 10 + (b[next + 1] - b'0')) as i64;
+        let frac = b.get(next..next + 2).map_or(0, |d| (d[0] - b'0') * 10 + (d[1] - b'0'));
+        let cents = whole as i64 * 100 + frac as i64;
         let (cents, next) = (if negative { -cents } else { cents }, next + 2);
         // Terminator: CRLF or LF (c-join.md:21), skipped without a branch: one byte, plus one for a CR.
         // At the end of a file without a final terminator this is one past the end, which ends the
         // range all the same. Measured (this VM, 12 workers, full seed 1, interleaved medians of 9):
         // pass2+names 259 -> 255 ms, inside the noise; it is kept for being four lines shorter.
         *i = next + 1 + (b.get(next) == Some(&b'\r')) as usize;
+        // A record that ran past the end of the file is garbage from a range cut inside a quoted
+        // field (c-join.md 2.1 allows LF + digit there): it is dropped and `*i` is past `end`, so
+        // pass 2's exact check fails and main reruns the file on one worker. Every read above is
+        // bounds-checked for this case, so such a range ends here instead of aborting.
+        if next > b.len() {
+            break;
+        }
 
         let group = lookup.group(region_id as usize);
         let s = &mut slots[group];
@@ -150,12 +159,13 @@ pub fn parse_range<L: Lookup + ?Sized>(
 /// header, which holds no quotes); a range with no record start gets no records.
 ///
 /// e1: by the grammar (c-join.md:17-36) a record opens with a digit (the id) or a BOM right after
-/// its terminator (CRLF or LF, both ending in LF), and no quoted field ever holds an LF followed by
-/// a digit or BOM (names hold no LF at all, notes are lowercase words), so LF + digit/BOM marks a
-/// record start and each start is one short search from the range's offset instead of pass 1's full
-/// quote-parity scan of every byte. Pass 2 checks pairwise that every worker stopped exactly on its
-/// cut, and main reruns the whole file on one worker if not, so a wrong cut can never change the
-/// answer. Measured (this VM, full data, 12 workers, interleaved medians of 11, warm page cache):
+/// its terminator (CRLF or LF, both ending in LF). The generator's files (c-join.md 2.2) never hold
+/// an LF followed by a digit or BOM inside a quoted field (names hold no LF at all, notes are
+/// lowercase words), so LF + digit/BOM marks a record start and each start is one short search from
+/// the range's offset instead of pass 1's full quote-parity scan of every byte. The grammar alone
+/// (2.1) allows one inside quotes; then the cut is wrong, the previous worker does not stop exactly
+/// on it, and main reruns the whole file on one worker, so a wrong cut can never change the answer
+/// (parse_range drops a garbage record that runs past the end of the file instead of aborting). Measured (this VM, full data, 12 workers, interleaved medians of 11, warm page cache):
 /// pass1 7.3 -> 0.1 ms, total 112.6 -> 109.4 ms.
 pub fn record_starts(b: &[u8], first: usize, workers: usize) -> Vec<usize> {
     // Equal byte ranges: len / workers each (rounded up), the last one shorter.
