@@ -12,9 +12,12 @@
 //!   is one to one once the last byte is not 0, and every bit 7 is free (89 % of seed 1's records).
 //! - medium: 17 to 32 such bytes: four words, sent as two messages (11 %; 99.99 % of names fit 24).
 //! - exact: anything else (longer, a byte of 0x80 or more, a trailing 0; c-join.md 2.1 allows them,
-//!   2.2 never writes them): the name's offset and length, compared byte for byte in the mapping.
+//!   2.2 never writes them): the name's offset and length, and the owner keeps the bytes it reads
+//!   from the mapping in a plain HashMap, off the fast path.
 
 use std::arch::x86_64::*;
+use std::collections::HashMap;
+use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 
 use crate::records::load;
 
@@ -41,27 +44,16 @@ const TAIL: u64 = MEDIUM | EXACT;
 /// The 8 bytes at `p + at + 8k` must lie inside the padded mapping.
 #[inline(always)]
 unsafe fn key_word(p: *const u8, at: usize, len: usize, k: usize) -> u64 {
-    unsafe {
-        _bzhi_u64(
-            load::<u64>(p, at + 8 * k),
-            (8 * len).saturating_sub(64 * k) as u32,
-        )
-    }
+    let bits = (8 * len).saturating_sub(64 * k) as u32;
+    unsafe { _bzhi_u64(load::<u64>(p, at + 8 * k), bits) }
 }
 
-/// An exact name's hash: one multiply per 8-byte word of `p[at..at + len]`, read from the mapping.
-/// Only exact names use it (none in generated data), at the sender and again at the owner.
+/// An exact name's hash, used at the sender; the owner's HashMap hashes the bytes itself. A fixed
+/// hasher: sender and owner of one name must agree, whichever thread asks.
 #[cold]
 #[inline(never)]
-fn exact_hash(p: *const u8, at: usize, len: usize) -> u32 {
-    // Word k of the whole key is word 0 of the key from 8k on, at most 8 bytes of it (count <= 64).
-    // SAFETY: the name lies inside the mapping, and the guard covers the last word's 8-byte load.
-    let word = |k: usize| unsafe { key_word(p, at + 8 * k, (len - 8 * k).min(8), 0) };
-    // 64 x 64 -> 128-bit multiplies, each folded to 64 bits (wyhash's mum).
-    ((0..len.div_ceil(8)).fold(len as u64, |h, k| {
-        let x = (h ^ word(k)) as u128 * 0x8ebc_6af0_9c88_c6e3 as u128;
-        x as u64 ^ (x >> 64) as u64
-    }) >> 32) as u32
+fn exact_hash(key: &[u8]) -> u32 {
+    (BuildHasherDefault::<DefaultHasher>::default().hash_one(key) >> 32) as u32
 }
 
 /// A short or medium key's 32-bit hash: crc32c of its words, one instruction each. The sender picks
@@ -92,10 +84,8 @@ impl Name {
         let last = unsafe { *p.add(at + len - 1) } != 0;
         if len <= 16 && (w0 | w1) & HIGH == 0 && last {
             // The group in word 0's bit-7 positions: groups are at most 256 (regions.rs).
-            return Name::One(
-                crc(&[w0, w1]),
-                [w0 | unsafe { _pdep_u64(g as u64, HIGH) }, w1],
-            );
+            let m = [w0 | unsafe { _pdep_u64(g as u64, HIGH) }, w1];
+            return Name::One(crc(&[w0, w1]), m);
         }
         unsafe { Name::long(p, at, len, last, g) }
     }
@@ -104,26 +94,18 @@ impl Name {
     #[inline(never)]
     unsafe fn long(p: *const u8, at: usize, len: usize, last: bool, g: usize) -> Name {
         // key_word's count, clamped: at 32 bytes word 0's would be 256, which bzhi reads as 0.
-        let w = [0, 1, 2, 3].map(|k| unsafe {
-            _bzhi_u64(
-                load::<u64>(p, at + 8 * k),
-                (8 * len).saturating_sub(64 * k).min(64) as u32,
-            )
-        });
+        let bits = |k: usize| (8 * len).saturating_sub(64 * k).min(64) as u32;
+        let w = [0, 1, 2, 3].map(|k| unsafe { _bzhi_u64(load::<u64>(p, at + 8 * k), bits(k)) });
         if len <= 32 && (w[0] | w[1] | w[2] | w[3]) & HIGH == 0 && last {
             let (w1, w3) = (w[1] | MEDIUM, w[3] | TAIL);
-            return Name::Two(
-                crc(&[w[0], w1, w[2], w3]),
-                [w[0] | unsafe { _pdep_u64(g as u64, HIGH) }, w1],
-                [w[2], w3],
-            );
+            let m = [w[0] | unsafe { _pdep_u64(g as u64, HIGH) }, w1];
+            return Name::Two(crc(&[w[0], w1, w[2], w3]), m, [w[2], w3]);
         }
         // An exact name's group goes in its offset's top byte: offsets stay under 2^47 (x86-64's
         // user address space bounds every mapping), lengths under 2^63.
-        Name::One(
-            exact_hash(p, at, len),
-            [at as u64 | (g as u64) << 56, len as u64 | EXACT],
-        )
+        let key = unsafe { std::slice::from_raw_parts(p.add(at), len) };
+        let m = [at as u64 | (g as u64) << 56, len as u64 | EXACT];
+        Name::One(exact_hash(key), m)
     }
 }
 
@@ -145,12 +127,11 @@ struct Table<K> {
     recs: Vec<(K, [u64; 4])>,
 }
 
-impl<K: Copy> Table<K> {
+impl<K: Copy + PartialEq> Table<K> {
     fn new() -> Self {
-        Table {
-            index: Box::new([Bucket([0; 8])]),
-            recs: Vec::new(),
-        }
+        let index: Box<[Bucket]> = Box::new([Bucket([0; 8])]);
+        let recs = Vec::new();
+        Table { index, recs }
     }
 
     #[inline(always)]
@@ -165,9 +146,9 @@ impl<K: Copy> Table<K> {
         unsafe { _mm_prefetch::<_MM_HINT_T0>(self.index.as_ptr().add(self.home(h)) as *const i8) };
     }
 
-    /// The groups of the key with hash `h` for which `same` holds, inserting `key` if none does.
+    /// The groups of the key `key` with hash `h`, inserting it if it is not there.
     #[inline(always)]
-    fn groups(&mut self, h: u32, key: K, same: impl Fn(&K) -> bool) -> &mut [u64; 4] {
+    fn groups(&mut self, h: u32, key: K) -> &mut [u64; 4] {
         let tag = h | 1 << 31;
         let mut at = self.home(h);
         // SAFETY: AVX2 is on at compile time; `at` stays inside the index; each id in an entry indexes
@@ -183,7 +164,7 @@ impl<K: Copy> Table<K> {
                 let mut hits = (eq(lo) | eq(hi) << 8) & 0xAAAA;
                 while hits != 0 {
                     let id = self.index[at].0[hits.trailing_zeros() as usize / 2] as u32 as usize;
-                    if same(&self.recs.get_unchecked(id).0) {
+                    if self.recs.get_unchecked(id).0 == key {
                         return &mut self.recs.get_unchecked_mut(id).1;
                     }
                     hits &= hits - 1;
@@ -226,8 +207,7 @@ impl<K: Copy> Table<K> {
     /// Doubles the index and refiles every entry by its tag, whose low bits are the hash's.
     fn grow(&mut self) {
         // SAFETY: an all-zero bucket is valid: every entry free.
-        let bigger =
-            unsafe { Box::<[Bucket]>::new_zeroed_slice(2 * self.index.len()).assume_init() };
+        let bigger = unsafe { Box::<[Bucket]>::new_zeroed_slice(2 * self.index.len()).assume_init() };
         let old = std::mem::replace(&mut self.index, bigger);
         for &e in old.iter().flat_map(|b| &b.0).filter(|&&e| e != 0) {
             let (at, lane) = self.free((e >> 32) as u32);
@@ -236,46 +216,45 @@ impl<K: Copy> Table<K> {
     }
 }
 
+/// Exact names (see the module comment): their bytes and the groups that have seen them.
+type ExactNames = HashMap<Vec<u8>, [u64; 4]>;
+
+/// The groups of an exact name, inserting it if it is not there. Off the fast path: generated
+/// data has none.
+#[cold]
+#[inline(never)]
+fn exact_groups<'a>(exact: &'a mut ExactNames, key: &[u8]) -> &'a mut [u64; 4] {
+    exact.entry(key.to_vec()).or_default()
+}
+
 /// One worker's side as an owner: its names of each kind, and per group how many of them it has
 /// seen in that group.
 pub struct Owner {
     short: Table<[u64; 2]>,
     medium: Table<[u64; 4]>,
-    exact: Table<[u64; 2]>,
+    exact: ExactNames,
     pub counts: [u64; 256],
 }
 
 impl Owner {
     pub fn new() -> Self {
-        Owner {
-            short: Table::new(),
-            medium: Table::new(),
-            exact: Table::new(),
-            counts: [0; 256],
-        }
+        let (short, medium) = (Table::new(), Table::new());
+        Owner { short, medium, exact: HashMap::new(), counts: [0; 256] }
     }
 
-    /// Files a bucket of messages (`b` is the padded mapping, read only for exact names). Each name's
-    /// home bucket is prefetched 16 messages ahead (c-50 b6's distance).
+    /// Files a bucket of messages (`b` is the file, read only for exact names). Each name's home
+    /// bucket is prefetched 16 messages ahead (c-50 b6's distance).
     pub fn file(&mut self, msgs: &[Msg], b: &[u8]) {
-        let Owner {
-            short,
-            medium,
-            exact,
-            counts,
-        } = self;
         let mut j = 0;
         while j < msgs.len() {
             if let Some(&[f0, f1]) = msgs.get(j + 16) {
                 match f1 & TAIL {
-                    0 => short.prefetch(crc(&[f0 & !HIGH, f1])),
-                    // SAFETY: a medium name's two slots always travel in one bucket (pass2.rs).
-                    MEDIUM => medium.prefetch(crc(&[
-                        f0 & !HIGH,
-                        f1,
-                        unsafe { msgs.get_unchecked(j + 17) }[0],
-                        unsafe { msgs.get_unchecked(j + 17) }[1],
-                    ])),
+                    0 => self.short.prefetch(crc(&[f0 & !HIGH, f1])),
+                    MEDIUM => {
+                        // SAFETY: a medium name's two slots always travel in one bucket (pass2.rs).
+                        let [f2, f3] = unsafe { *msgs.get_unchecked(j + 17) };
+                        self.medium.prefetch(crc(&[f0 & !HIGH, f1, f2, f3]));
+                    }
                     _ => {}
                 }
             }
@@ -289,29 +268,21 @@ impl Owner {
             let groups = match m1 & TAIL {
                 0 => {
                     let k = [key0, m1];
-                    short.groups(crc(&k), k, |r| *r == k)
+                    self.short.groups(crc(&k), k)
                 }
                 MEDIUM => {
                     j += 1;
                     // SAFETY: as above.
                     let [m2, m3] = *unsafe { msgs.get_unchecked(j) };
                     let k = [key0, m1, m2, m3];
-                    medium.groups(crc(&k), k, |r| *r == k)
+                    self.medium.groups(crc(&k), k)
                 }
                 _ => {
-                    let (at, len) = (key0 as usize, (m1 & !EXACT) as usize);
-                    let same = |r: &[u64; 2]| {
-                        r[1] as usize == len && b[r[0] as usize..][..len] == b[at..][..len]
-                    };
-                    exact.groups(
-                        exact_hash(b.as_ptr(), at, len),
-                        [at as u64, len as u64],
-                        same,
-                    )
+                    exact_groups(&mut self.exact, &b[key0 as usize..][..(m1 & !EXACT) as usize])
                 }
             };
             let (word, bit) = (&mut groups[g as usize / 64], 1 << (g % 64));
-            counts[g as usize] += (*word & bit == 0) as u64;
+            self.counts[g as usize] += (*word & bit == 0) as u64;
             *word |= bit;
             j += 1;
         }

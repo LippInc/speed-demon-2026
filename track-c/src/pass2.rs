@@ -2,14 +2,15 @@
 //! their own per-group slots, and send each record's name to its owner (names.rs). A worker writes
 //! its messages into one bucket per owner through raw cursors, hands a full bucket to the owner's
 //! inbox, and files the buckets in its own inbox at each of its hand-overs and after every chunk.
-//! No rounds and no barriers
-//! (8a60e4e's routing: a slow CPU delays only its own chunks and inbox, c-18 probe w13).
+//! No rounds and no barriers (the routing of c-18: a slow CPU delays only its own chunks and
+//! inbox, probe w13). At its end each worker adds its slots and its owner's counts to the totals.
 
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::*};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::names::{Msg, Name, Owner};
-use crate::{records::Slot, records::parse_chunk, records::record_start, regions::Build};
+use crate::records::{Slot, parse_chunk, record_start};
+use crate::regions::Build;
 
 unsafe extern "C" {
     fn madvise(addr: *const u8, len: usize, advice: i32) -> i32;
@@ -17,7 +18,7 @@ unsafe extern "C" {
 
 /// Bytes per chunk: a design constant, about 800 chunks for the 202 MB file, so the last chunks to
 /// finish are short whoever holds them.
-pub const CHUNK: usize = 1 << 18;
+const CHUNK: usize = 1 << 18;
 
 /// Slots per bucket (4 KiB): a full bucket is one hand-off to its owner.
 const BUCKET: usize = 256;
@@ -27,22 +28,14 @@ const BUCKET: usize = 256;
 /// fresh 4 KiB buckets per run (12-15 MB, laptop counts, c-52 s2). Never reached while owners keep up.
 const LAG: usize = 16;
 
+/// Per group the merged slots, and names_distinct.
+pub type Totals = (Vec<Slot>, Vec<u64>);
+
 /// An owner's mailbox: the full buckets sent to it, and the empty ones filed, which senders take back.
 #[derive(Default)]
 struct Mailbox {
     full: Vec<Vec<Msg>>,
     empty: Vec<Vec<Msg>>,
-}
-
-/// What the pass returns.
-pub struct Pass2 {
-    /// Per worker, its per-group slots.
-    pub slots: Vec<Vec<Slot>>,
-    /// names_distinct per group.
-    pub distinct: Vec<u64>,
-    /// False when some chunk did not stop exactly on the next chunk's start (e1), i.e. a cut was not
-    /// a record start; the caller must then rerun on one worker with one chunk.
-    pub exact: bool,
 }
 
 /// One worker's sending side: its outgoing buckets, one per owner, written through raw cursors (no
@@ -61,21 +54,20 @@ struct Worker<'a> {
 
 impl<'a> Worker<'a> {
     fn new(w: usize, b: &'a [u8], boxes: &'a [Mutex<Mailbox>], owners: &'a [Mutex<Owner>]) -> Self {
-        let mut out: Vec<Vec<Msg>> = (0..boxes.len())
-            .map(|_| Vec::with_capacity(BUCKET))
-            .collect();
-        let cur: Vec<*mut Msg> = out.iter_mut().map(|v| v.as_mut_ptr()).collect();
+        let n = boxes.len();
+        let none = std::ptr::null_mut();
+        let (out, cur, lim) = (vec![Vec::new(); n], vec![none; n], vec![none; n]);
+        let mut me = Worker { w, b, boxes, owners, out, cur, lim };
+        (0..n).for_each(|o| me.refill(o, None));
+        me
+    }
+
+    /// Makes `bucket` (or a new one) owner `o`'s outgoing bucket, with its cursor and limit.
+    fn refill(&mut self, o: usize, bucket: Option<Vec<Msg>>) {
+        self.out[o] = bucket.unwrap_or_else(|| Vec::with_capacity(BUCKET));
+        self.cur[o] = self.out[o].as_mut_ptr();
         // SAFETY: each bucket has room for BUCKET slots.
-        let lim = cur.iter().map(|&c| unsafe { c.add(BUCKET - 1) }).collect();
-        Worker {
-            w,
-            b,
-            boxes,
-            owners,
-            out,
-            cur,
-            lim,
-        }
+        self.lim[o] = unsafe { self.cur[o].add(BUCKET - 1) };
     }
 
     /// Files every bucket in owner `o`'s mailbox and returns them emptied, unless another worker is
@@ -144,10 +136,7 @@ impl<'a> Worker<'a> {
         if backlog > LAG {
             self.drain(o, false);
         }
-        self.out[o] = fresh.unwrap_or_else(|| Vec::with_capacity(BUCKET));
-        self.cur[o] = self.out[o].as_mut_ptr();
-        // SAFETY: as in `new`.
-        self.lim[o] = unsafe { self.cur[o].add(BUCKET - 1) };
+        self.refill(o, fresh);
         self.drain(self.w, false);
     }
 
@@ -160,95 +149,89 @@ impl<'a> Worker<'a> {
     }
 }
 
-/// Runs the pass on `workers` threads over the records of `b[..len]` from `first` to the end (`b`
-/// holds the guard after them), cut into `chunk`-byte pieces at record starts. Every worker first
-/// helps build the region table (`Build::ready`; at once on a rerun).
-pub fn run(
-    b: &[u8],
-    len: usize,
-    first: usize,
-    chunk: usize,
-    workers: usize,
-    regions: &Build,
-) -> Pass2 {
-    let file = &b[..len];
-    let chunks = (len - first).div_ceil(chunk);
-    let start = |k: usize| {
-        if k == 0 {
-            first
-        } else {
-            record_start(file, (first + k * chunk).min(len))
-        }
-    };
+/// Runs the pass over the records of `b` (followed by the guard, see `map_padded`) on `workers`
+/// threads and returns the totals: per group the merged slots and names_distinct. Every worker
+/// first helps build the region table (`Build::ready`; at once on a rerun).
+///
+/// e1: a chunk that does not stop exactly on the next chunk's start means a cut was not a record
+/// start, so the parse is untrustworthy and the owners hold names from wrong records. Then the
+/// whole file runs again as one chunk on one worker, where the start is always right. That rerun's
+/// own end check is not made: its one chunk starts at the first record (always a record start) and
+/// ends at the file's end, and one worker parses it to there, so it stops exactly where it should
+/// (a last record without a terminator ends at the file's end, records.rs `i.min(len)`). Only a
+/// record running past the end of the file (outside the grammar) breaks that, and then no answer is
+/// right anyway.
+pub fn run(b: &[u8], workers: usize, regions: &Build) -> Totals {
+    let (totals, exact) = pass(b, CHUNK, workers, regions);
+    exact.then_some(totals).unwrap_or_else(|| pass(b, usize::MAX, 1, regions).0)
+}
+
+/// One pass with `chunk`-byte pieces cut at record starts (the first at the first record after the
+/// header), and whether every piece stopped exactly on the next one's start.
+fn pass(b: &[u8], chunk: usize, workers: usize, regions: &Build) -> (Totals, bool) {
+    let chunks = b.len().div_ceil(chunk);
+    let start = |k: usize| record_start(b, (k * chunk).min(b.len()));
     let boxes: Vec<Mutex<Mailbox>> = (0..workers).map(|_| Mutex::default()).collect();
     let owners: Vec<Mutex<Owner>> = (0..workers).map(|_| Mutex::new(Owner::new())).collect();
+    let totals = Mutex::new((vec![Slot::new(); 256], vec![0; 256]));
     let next = AtomicUsize::new(0);
     let flushed = AtomicUsize::new(0);
     let exact = AtomicBool::new(true);
 
     let worker = |w: usize| {
-        let (lookup, groups) = regions.ready();
-        let mut slots = vec![Slot::new(); groups];
+        let table = regions.ready();
+        let mut slots = vec![Slot::new(); 256];
         let mut me = Worker::new(w, b, &boxes, &owners);
-        loop {
-            let k = next.fetch_add(1, Ordering::Relaxed);
-            if k >= chunks {
-                break;
-            }
+        while let k = next.fetch_add(1, Relaxed)
+            && k < chunks
+        {
             let end = start(k + 1);
             let on_record = |g: usize, at: usize, n: usize| {
                 // SAFETY: parse_chunk passes a name span inside the padded mapping, after the quote
                 // or comma that opens it; GUARD covers 32 bytes past its start.
                 me.send(unsafe { Name::new(b.as_ptr(), at, n, g) })
             };
-            let stop = parse_chunk(b, len, start(k), end, lookup, &mut slots, on_record);
+            // SAFETY: `b` comes from `map_padded`, which follows it with GUARD bytes; `slots` has 256.
+            let stop = unsafe { parse_chunk(b, start(k), end, table, &mut slots, on_record) };
             // Pairwise end check (e1): the parse must stop exactly on the next chunk's start.
-            exact.fetch_and(stop == end, Ordering::Relaxed);
+            exact.fetch_and(stop == end, Relaxed);
             me.drain(w, false);
         }
         // The mapping's page-table entries (about 50k for the 202 MB file) were torn down at exit on
         // one CPU; each worker drops its share now (c-37f). A page touched again (a neighbour's last
         // record, a rerun, an exact name's compare) faults back in from the page cache. The last
         // partial page is kept: it holds the guard (main.rs), a private copy MADV_DONTNEED would discard.
-        let pages = len & !4095;
+        let pages = b.len() & !4095;
         let share = pages.div_ceil(workers).next_multiple_of(4096);
         let from = (w * share).min(pages);
         // SAFETY: a page-aligned range inside the mapping; madvise only drops page-table entries.
         unsafe { madvise(b.as_ptr().add(from), share.min(pages - from), 4) }; // 4 = MADV_DONTNEED
-        for o in 0..workers {
-            let bucket = me.seal(o);
-            boxes[o].lock().unwrap().full.push(bucket);
+        for (o, mailbox) in boxes.iter().enumerate() {
+            mailbox.lock().unwrap().full.push(me.seal(o));
         }
         // Once every worker has flushed (each flush is under the mailbox locks, before its count), no
         // bucket can arrive any more: one last drain, waiting out a sender filing here, empties this
         // mailbox for good.
-        flushed.fetch_add(1, Ordering::Release);
-        while flushed.load(Ordering::Acquire) < workers {
+        flushed.fetch_add(1, Release);
+        while flushed.load(Acquire) < workers {
             me.drain(w, false);
             std::thread::yield_now();
         }
         me.drain(w, true);
-        slots
+        let (total_slots, distinct) = &mut *totals.lock().unwrap();
+        let counts = owners[w].lock().unwrap().counts;
+        for g in 0..256 {
+            total_slots[g].merge(&slots[g]);
+            distinct[g] += counts[g];
+        }
     };
     // The workers start before the region table exists and build it first (c-47 s2); this thread is
     // worker 0, so it spawns one thread fewer and joins in once the others are spawned.
-    let slots: Vec<Vec<Slot>> = std::thread::scope(|s| {
-        let handles: Vec<_> = (1..workers).map(|w| s.spawn(move || worker(w))).collect();
-        let mine = worker(0);
-        std::iter::once(mine)
-            .chain(handles.into_iter().map(|h| h.join().unwrap()))
-            .collect()
+    std::thread::scope(|s| {
+        for w in 1..workers {
+            s.spawn(move || worker(w));
+        }
+        worker(0);
     });
-    let counts: Vec<[u64; 256]> = owners
-        .into_iter()
-        .map(|own| own.into_inner().unwrap().counts)
-        .collect();
-    let distinct = (0..slots[0].len())
-        .map(|g| counts.iter().map(|c| c[g]).sum())
-        .collect();
-    Pass2 {
-        slots,
-        distinct,
-        exact: exact.load(Ordering::Relaxed),
-    }
+    (totals.into_inner().unwrap(), exact.into_inner())
 }

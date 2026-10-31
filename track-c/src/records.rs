@@ -7,12 +7,11 @@
 //! from a cut inside a quoted field) is caught once per record, by its end position, never per byte.
 
 use std::arch::x86_64::*;
-
 use std::sync::atomic::AtomicU8;
 
 use crate::regions::group;
 
-pub(crate) const BOM: &[u8] = b"\xEF\xBB\xBF";
+const BOM: &[u8] = b"\xEF\xBB\xBF";
 
 /// Guard bytes after the file's last byte (`"` `,` LF repeated). A record's six searches each start at
 /// most 3 bytes past the previous one's stop, so from the end of the file they stay within 24 bytes;
@@ -67,12 +66,10 @@ pub(crate) unsafe fn load<T>(p: *const u8, i: usize) -> T {
 /// Names and notes nearly always fit one step (c-join.md 2.2), so this is one load and one branch.
 #[inline(always)]
 unsafe fn find(p: *const u8, mut i: usize, c: u8) -> usize {
+    // SAFETY (caller's): a `c` (quote or comma, both in the guard) lies before the reservation's end.
+    let needle = unsafe { _mm256_set1_epi8(c as i8) };
     loop {
-        // SAFETY (caller's): a `c` (quote or comma, both in the guard) lies before the reservation's end.
-        let m = unsafe {
-            let block = _mm256_loadu_si256(p.add(i) as *const __m256i);
-            _mm256_movemask_epi8(_mm256_cmpeq_epi8(block, _mm256_set1_epi8(c as i8))) as u32
-        };
+        let m = unsafe { _mm256_movemask_epi8(_mm256_cmpeq_epi8(load(p, i), needle)) } as u32;
         if m != 0 {
             return i + m.trailing_zeros() as usize;
         }
@@ -109,10 +106,8 @@ unsafe fn text(p: *const u8, i: usize) -> (usize, usize, u64, usize) {
 #[inline(always)]
 unsafe fn digits(p: *const u8, i: usize) -> (u64, u32) {
     let x = unsafe { load::<u64>(p, i) } ^ 0x3030_3030_3030_3030;
-    (
-        x,
-        ((x.wrapping_add(0x7676_7676_7676_7676) | x) & 0x8080_8080_8080_8080).trailing_zeros() / 8,
-    )
+    let non_digits = (x.wrapping_add(0x7676_7676_7676_7676) | x) & 0x8080_8080_8080_8080;
+    (x, non_digits.trailing_zeros() / 8)
 }
 
 /// Folds the `len` (0 to 8) digit values at the bottom of `x` into their number. The digits move
@@ -121,7 +116,7 @@ unsafe fn digits(p: *const u8, i: usize) -> (u64, u32) {
 /// those (x100 + 1), then the two 4-digit halves (x10000 + 1). Six vector instructions where the
 /// scalar fold (three multiplies, shifts and masks) took about 13 and three 64-bit constants.
 #[inline(always)]
-pub(crate) fn fold(x: u64, len: u32) -> u64 {
+fn fold(x: u64, len: u32) -> u64 {
     // SAFETY: SSE4.1 and SSSE3 are on at compile time (x86-64-v3).
     unsafe {
         let v = _mm_cvtsi64_si128(((x << 1) << (63 - 8 * len)) as i64);
@@ -132,53 +127,46 @@ pub(crate) fn fold(x: u64, len: u32) -> u64 {
     }
 }
 
-/// An unsigned decimal at `i` ending at `stop`; returns it and the index past `stop`. One load
-/// parses up to 7 digits and their `stop` (id and region id always fit: c-join.md 2.2); anything
-/// else goes to `slow`, off the hot path. The stop byte is read from the loaded word: shifted out
-/// of range (8 digits) the word's first digit is never a stop byte.
+/// An unsigned decimal at `i` ending at a comma; returns it and the index past the comma. One load
+/// parses up to 7 digits and their comma (id and region id always fit: c-join.md 2.2); anything
+/// else goes to `long_number`, off the hot path. The stop byte is read from the loaded word: shifted
+/// out of range (8 digits) the word's first digit is never a comma.
 #[inline(always)]
-unsafe fn uint(
-    p: *const u8,
-    i: usize,
-    stop: u8,
-    slow: unsafe fn(*const u8, usize) -> (u64, usize),
-) -> (u64, usize) {
+unsafe fn uint(p: *const u8, i: usize) -> (u64, usize) {
     let (x, len) = unsafe { digits(p, i) };
-    if x.wrapping_shr(8 * len) as u8 == stop ^ b'0' {
+    if x.wrapping_shr(8 * len) as u8 == b',' ^ b'0' {
         return (fold(x, len), i + len as usize + 1);
     }
-    unsafe { slow(p, i) }
+    let (n, stop) = unsafe { long_number(p, i) };
+    (n, stop + 1)
 }
 
-/// `uint`'s slow path: digits one by one up to the first non-digit, which the caller's grammar
-/// makes the stop byte (a garbage record may end elsewhere; its end check catches it).
+/// The slow path of `uint` and `amount`: the digits one by one, a `.` skipped (so an amount comes
+/// out in cents), up to the first other byte, which the caller's grammar makes the stop byte (a
+/// garbage record may end elsewhere; its end check catches it). Returns the number and the index of
+/// the stop byte. A BOM before the digits is where a record's id lands when a BOM follows its
+/// terminator (c-join.md:36): skipped here, which took the BOM test off every record (777 BOMs in
+/// 3.32M records, c-join.md:200).
 #[cold]
 #[inline(never)]
-unsafe fn uint_long(p: *const u8, mut i: usize) -> (u64, usize) {
+unsafe fn long_number(p: *const u8, mut i: usize) -> (u64, usize) {
+    i += 3 * (unsafe { load::<u32>(p, i) } & 0xFF_FFFF == 0xBF_BBEF) as usize;
     let mut n = 0u64;
-    // SAFETY: a digit run ends at the guard's `"` at the latest.
-    while let d @ b'0'..=b'9' = unsafe { *p.add(i) } {
-        n = n.wrapping_mul(10).wrapping_add((d - b'0') as u64);
+    // SAFETY: a run of digits and points ends at the guard's `"` at the latest.
+    while let d @ (b'0'..=b'9' | b'.') = unsafe { *p.add(i) } {
+        if d != b'.' {
+            n = n.wrapping_mul(10).wrapping_add((d - b'0') as u64);
+        }
         i += 1;
     }
-    (n, i + 1)
-}
-
-/// The id's slow path, which is also where a BOM before a record lands (its first byte is no digit):
-/// a BOM directly after a terminator is skipped (c-join.md:36). Moving the BOM test here took it off
-/// every record: 777 BOMs in 3.32M records (c-join.md:200).
-#[cold]
-#[inline(never)]
-unsafe fn id_long(p: *const u8, i: usize) -> (u64, usize) {
-    let bom = unsafe { load::<u32>(p, i) } & 0xFF_FFFF == 0xBF_BBEF;
-    unsafe { uint_long(p, i + 3 * bom as usize) }
+    (n, i)
 }
 
 /// An amount `-?[0-9]+\.[0-9]{2}` at `i` as integer cents (c-join.md:24, 37); returns it and the index
-/// past it. Up to 5 whole digits (the generator's range, c-join.md 2.2) one load holds the whole
-/// part, the point and both fraction digits: by the grammar the first non-digit is the point, whose
-/// byte is cut out (the bytes above it shifted down one) so the rest folds as one number. 6 or more
-/// whole digits (beyond the spec) fold digit by digit, then take the two fraction digits.
+/// of the byte after it. Up to 5 whole digits (the generator's range, c-join.md 2.2) one load holds the
+/// whole part, the point and both fraction digits: by the grammar the first non-digit is the point,
+/// whose byte is cut out (the bytes above it shifted down one) so the rest folds as one number. 6 or
+/// more whole digits (beyond the spec) go to `long_number`.
 #[inline(always)]
 unsafe fn amount(p: *const u8, i: usize) -> (i64, usize) {
     let negative = unsafe { *p.add(i) } == b'-';
@@ -186,17 +174,10 @@ unsafe fn amount(p: *const u8, i: usize) -> (i64, usize) {
     let (x, len) = unsafe { digits(p, at) };
     let (cents, next) = if len <= 5 {
         let below = unsafe { _bzhi_u64(!0, 8 * len) };
-        (
-            fold(x & below | (x >> 8) & !below, len + 2),
-            at + len as usize + 3,
-        )
+        let cents = fold(x & below | (x >> 8) & !below, len + 2);
+        (cents, at + len as usize + 3)
     } else {
-        let (whole, next) = unsafe { uint_long(p, at) };
-        let frac = unsafe { load::<u16>(p, next) }.wrapping_sub(0x3030);
-        (
-            whole.wrapping_mul(100) + (frac & 0xFF) as u64 * 10 + (frac >> 8) as u64,
-            next + 2,
-        )
+        unsafe { long_number(p, at) }
     };
     // The sign without a branch: two's complement negation when `negative` is 1.
     let n = negative as i64;
@@ -204,31 +185,33 @@ unsafe fn amount(p: *const u8, i: usize) -> (i64, usize) {
 }
 
 /// Parses the records that start in `i..end` (`i` is a record start, the last record may run past
-/// `end`) of the file `b[..len]` into `slots`, and calls `on_record(group, name start, raw name
+/// `end`) of the file `b` into `slots`, and calls `on_record(group, name start, raw name
 /// length)` once each record is done (a closure inlined here). Returns where it stopped: the next
 /// record start, or `usize::MAX` when a record ran past the end of the file (garbage from a wrong
-/// cut, so the caller's end check fails and main reruns on one worker).
-pub fn parse_chunk(
+/// cut, so the caller's end check fails and the pass reruns on one worker).
+///
+/// # Safety
+/// The mapping must continue for GUARD bytes after `b` (main.rs `map_padded`), and `slots` must hold
+/// 256 entries: every group `regions` holds is below that.
+pub unsafe fn parse_chunk(
     b: &[u8],
-    len: usize,
     mut i: usize,
     end: usize,
     regions: &[AtomicU8],
     slots: &mut [Slot],
     mut on_record: impl FnMut(usize, usize, usize),
 ) -> usize {
-    assert!(b.len() >= len + GUARD && end <= len);
+    let len = b.len();
+    assert!(end <= len);
     let p = b.as_ptr();
     // SAFETY: every load starts at most a few bytes past the guard's start (see GUARD) or inside the file.
     unsafe {
         while i < end {
-            let (id, next) = uint(p, i, b',', id_long);
+            let (id, next) = uint(p, i);
             let (name_start, name_raw, name_len, next) = text(p, next);
             let (_, _, note_len, next) = text(p, next);
-            let (region, next) = uint(p, next, b',', uint_long);
+            let (region, next) = uint(p, next);
             let (cents, after) = amount(p, next);
-            // Checked by builds with debug assertions (the guard plant): no scan stopped past the guard's middle.
-            debug_assert!(after <= len + GUARD / 2, "a scan left the guard");
             // A record past the end of the file is garbage (see the module comment): stop here.
             if after > len {
                 return usize::MAX;
@@ -254,7 +237,8 @@ pub fn parse_chunk(
 }
 
 /// The first record start at or after `from` (`from` itself excluded unless it follows an LF), or the
-/// end of the file: where a chunk begins (and its predecessor ends).
+/// end of the file: where a chunk begins (and its predecessor ends). `from` 0 finds the first record
+/// after the header, which holds no quotes (c-join.md:18-19, 43).
 ///
 /// e1: by the grammar (c-join.md:17-36) a record opens with a digit (the id) or a BOM right after
 /// its terminator (CRLF or LF, both ending in LF). The generator's files (c-join.md 2.2) never hold

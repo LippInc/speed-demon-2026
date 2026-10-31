@@ -1,10 +1,8 @@
 //! regions.csv: `region_id,country` lines, LF-terminated, ids unique and ascending, country `[A-Z]{3}`
 //! (c-join.md:58-59). Parsed into a dense table region id -> group index; group 0 is `_UNMATCHED`.
 
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU8, AtomicU16, AtomicUsize, Ordering::*};
-
-use crate::records::fold;
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering::*};
+use std::sync::{Mutex, OnceLock};
 
 /// Group of a record's region id; ids the table does not hold (holes, or above its range) are group
 /// 0. The table's last entry (one past the largest region id) is group 0, and every id above the
@@ -17,135 +15,94 @@ pub fn group(table: &[AtomicU8], region_id: u64) -> usize {
     cell.load(Relaxed) as usize
 }
 
-/// The region id of the line that ends at the LF `lf`, the previous line's LF being `prev`. The line
-/// shape is fixed (c-join.md:58-59): the country is the 3 bytes before the LF and the comma is at
-/// `lf - 4`, so the id is the `lf - 5 - prev` digits before that comma (at most 6: ids <= 999,999,
-/// c-join.md:60). They are the top bytes of the 8 bytes ending at the comma, which lie inside the
-/// file (the 18-byte header precedes every line), and fold in one SSE multiply-add chain; a longer
-/// id (beyond the spec, but the kit has one) folds byte by byte.
-#[inline(always)]
-fn id(b: &[u8], prev: usize, lf: usize) -> usize {
-    let len = (lf - 5 - prev) as u32;
-    assert!(b[lf - 4] == b',' && len > 0, "bad line");
-    if len > 7 {
-        return b[prev + 1..lf - 4]
-            .iter()
-            .fold(0, |n, &d| n * 10 + (d - b'0') as usize);
-    }
-    let x = u64::from_le_bytes(b[lf - 12..lf - 4].try_into().unwrap()) ^ 0x3030_3030_3030_3030;
-    fold(x >> (64 - 8 * len), len) as usize
-}
-
-/// Calls `line(prev, lf)` for every LF at `lf` in `from..to`, `prev` being the LF before it. A
-/// per-byte loop is enough here: a worker's piece is 64 KiB (PIECE), and the AVX2 scan that replaced
-/// it (c-47 s1) only paid when one thread parsed the whole file.
-fn each_line(b: &[u8], from: usize, to: usize, mut line: impl FnMut(usize, usize)) {
-    let mut prev = b[..from].iter().rposition(|&c| c == b'\n').unwrap_or(0);
-    for lf in from..to {
-        if b[lf] == b'\n' {
-            line(prev, lf);
-            prev = lf;
-        }
-    }
-}
-
 /// Bytes of regions.csv per piece a worker claims, a design constant: about 34 pieces for the 2.2 MB
 /// file, so the workers spawned last still find work.
 const PIECE: usize = 1 << 16;
 
+/// The start of the first line that begins after `at`: just past the first LF at or after it.
+fn line_start(b: &[u8], at: usize) -> usize {
+    let lf = b[at..].iter().position(|&c| c == b'\n');
+    lf.map_or(b.len(), |p| at + p + 1)
+}
+
+/// A line `<id>,<code>` and its LF as the region id and the country code (c-join.md:58-59). The id
+/// is folded digit by digit, whatever its length (the spec's reach 6 digits, longer ones fold the
+/// same way): 200,000 lines, shared out over the workers.
+fn parse_line(line: &[u8]) -> (usize, [u8; 3]) {
+    let [digits @ .., b',', a, b, c, b'\n'] = line else {
+        panic!("bad regions.csv line");
+    };
+    let id = digits.iter().fold(0, |n, &d| n * 10 + (d - b'0') as usize);
+    (id, [*a, *b, *c])
+}
+
 /// regions.csv parsed by every worker at once (c-47 s2): they claim pieces of the file from a
-/// counter, and a line belongs to the piece that holds its LF; ids are unique, so no two lines store
-/// to one entry. Groups are numbered in first-seen order under a lock, taken only when a code has no
-/// group yet (240 times at full scale); the output is sorted by key, so the numbering never shows.
+/// counter, and a line belongs to the piece that holds the LF before it (the header's line to none);
+/// ids are unique, so no two lines store to one entry. Groups are numbered in first-seen order, once
+/// per code under a lock (240 times at full scale); the output is sorted by key, so the numbering
+/// never shows.
+#[derive(Default)]
 pub struct Build<'a> {
     b: &'a [u8],
-    /// Index just past the header `region_id,country`.
-    first: usize,
     /// Region id -> group, one byte each: the spec has 240 countries (c-join.md:60).
     table: Box<[AtomicU8]>,
-    /// Country code [A-Z]{3} (c-join.md:59) as its index in 26^3 -> group, 0 while it has none.
-    code_group: Box<[AtomicU16]>,
+    /// Country code [A-Z]{3} (c-join.md:59) as its index in 26^3 -> its group, once it has one.
+    code_group: Box<[OnceLock<u8>]>,
+    /// The countries' output keys in group order, from group 1 on (group 0 is `_UNMATCHED`).
     keys: Mutex<Vec<Vec<u8>>>,
+    /// The first byte of the next unclaimed piece, and how many bytes of pieces are filled in.
     next: AtomicUsize,
     done: AtomicUsize,
 }
 
 impl<'a> Build<'a> {
     pub fn new(b: &'a [u8]) -> Self {
-        // c-57: an empty regions.csv (outside the grammar, kit case c14 madv-empty-regions) maps nothing instead of aborting.
-        let first = b
-            .iter()
-            .position(|&c| c == b'\n')
-            .map_or(b.len(), |p| p + 1);
-        // Ids are ascending (c-join.md:59), so the last line (it ends with LF, c-join.md:58) holds
-        // the largest and sizes the table: ids 0..=max, plus the group-0 entry every larger id is
-        // clamped to (`group`). Zeroed memory is fresh pages, which the workers fault in.
-        let last = b
-            .len()
-            .checked_sub(1)
-            .and_then(|e| b[..e].iter().rposition(|&c| c == b'\n'));
-        let max = last.map_or(0, |prev| id(b, prev, b.len() - 1));
+        // Ids are ascending (c-join.md:59), so the last line holds the largest and sizes the table:
+        // ids 0..=max, plus the group-0 entry every larger id is clamped to (`group`). A file with no
+        // line after the header (outside the grammar, kit case c14) maps nothing. Zeroed memory is
+        // fresh pages, which the workers fault in.
+        let body = &b[line_start(b, 0)..];
+        let last = body.split_inclusive(|&c| c == b'\n').next_back();
+        let mut build = Build { b, ..Default::default() };
         // SAFETY: all-zero bytes are valid atomics (0).
-        let (table, code_group) = unsafe {
-            let table = Box::new_zeroed_slice(max + 2).assume_init();
-            (table, Box::new_zeroed_slice(26 * 26 * 26).assume_init())
-        };
-        let keys = Mutex::new(vec![b"_UNMATCHED".to_vec()]);
-        let (next, done) = (AtomicUsize::new(0), AtomicUsize::new(0));
-        Build {
-            b,
-            first,
-            table,
-            code_group,
-            keys,
-            next,
-            done,
-        }
+        build.table = unsafe { Box::new_zeroed_slice(last.map_or(0, |l| parse_line(l).0) + 2).assume_init() };
+        build.code_group = (0..26 * 26 * 26).map(|_| OnceLock::new()).collect();
+        build
     }
 
     /// Fills the table from pieces until none is left unclaimed, then waits for the other workers'
-    /// pieces (each finished piece is counted with Release, read here with Acquire). Returns the table
-    /// and the group count.
-    pub fn ready(&self) -> (&[AtomicU8], usize) {
-        let (b, pieces) = (self.b, (self.b.len() - self.first).div_ceil(PIECE));
-        let mut k = self.next.fetch_add(1, Relaxed);
-        while k < pieces {
-            let from = self.first + k * PIECE;
-            each_line(b, from, b.len().min(from + PIECE), |prev, lf| {
-                let c = &b[lf - 3..lf];
-                let code = (c[0] as usize * 676 + c[1] as usize * 26 + c[2] as usize)
-                    .wrapping_sub(65 * 703);
+    /// pieces (each finished piece is counted with Release, read here with Acquire). Returns the table:
+    /// at most 255 countries, so every group fits a byte and a slot array of 256.
+    pub fn ready(&self) -> &[AtomicU8] {
+        let b = self.b;
+        while let from = self.next.fetch_add(PIECE, Relaxed)
+            && from < b.len()
+        {
+            let to = b.len().min(from + PIECE);
+            for line in b[line_start(b, from)..line_start(b, to)].split_inclusive(|&c| c == b'\n') {
+                let (id, code) = parse_line(line);
                 // A byte outside A-Z indexes out of range or another code; the shape is the spec's.
-                let mut group = self.code_group[code].load(Relaxed);
-                if group == 0 {
-                    group = self.new_group(&self.code_group[code], c);
-                }
-                self.table[id(b, prev, lf)].store(group as u8, Relaxed);
-            });
-            self.done.fetch_add(1, Release);
-            k = self.next.fetch_add(1, Relaxed);
+                let index = code.iter().fold(0, |n, &c| n * 26 + (c - b'A') as usize);
+                let group = self.code_group[index].get_or_init(|| {
+                    let mut keys = self.keys.lock().unwrap();
+                    keys.push(code.to_vec());
+                    assert!(keys.len() < 256, "over 255 countries");
+                    keys.len() as u8
+                });
+                self.table[id].store(*group, Relaxed);
+            }
+            self.done.fetch_add(to - from, Release);
         }
-        while self.done.load(Acquire) < pieces {
+        while self.done.load(Acquire) < b.len() {
             std::hint::spin_loop();
         }
-        let groups = self.keys.lock().unwrap().len();
-        assert!(groups <= 256, "over 255 countries");
-        (&self.table, groups)
-    }
-
-    /// Numbers a code's group, unless another worker did first.
-    #[cold]
-    fn new_group(&self, cell: &AtomicU16, code: &[u8]) -> u16 {
-        let mut keys = self.keys.lock().unwrap();
-        if cell.load(Relaxed) == 0 {
-            cell.store(keys.len() as u16, Relaxed);
-            keys.push(code.to_vec());
-        }
-        cell.load(Relaxed)
+        &self.table
     }
 
     /// Each group's output key (index 0 is `_UNMATCHED`).
     pub fn keys(self) -> Vec<Vec<u8>> {
-        self.keys.into_inner().unwrap()
+        let mut keys = self.keys.into_inner().unwrap();
+        keys.insert(0, b"_UNMATCHED".to_vec());
+        keys
     }
 }

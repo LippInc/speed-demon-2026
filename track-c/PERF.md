@@ -20,7 +20,9 @@ Times are the live board's T; every step has its run IDs in the table.
   table, page-table entries dropped by the workers in parallel at the end: 0.04 s (steps 46 and 47).
 - The owner design (D-B): each name goes to the worker that owns its hash, which keeps it in a private table, so there is
   no shared table and no atomic operation on names; the region table is built by all workers: 0.03 s, 73.9 points
-  (step 48).
+  (steps 48 and 49).
+- The same program in fewer lines and less memory outside the name path (c-55, S 812 to 769): 0.03 s, 74.2 points
+  (step 50).
 
 What did not work, with the measurements (details in the log):
 
@@ -30,6 +32,8 @@ What did not work, with the measurements (details in the log):
 - A two-stage structural parse (c-58): 37 % faster on one thread (114 against 181 ms) but only 5 % faster at 12 workers,
   because two hyperthreads share one core's execution ports and the method executes more instructions.
 - Profile-guided optimisation (c-61): 1.0 to 1.2 ms slower in two A/B rounds.
+- Prefetching the region table cell (c-62): 41 % fewer L2 misses, no time saved, because those misses were never what
+  the cores waited on.
 - One malloc arena (c-65): 0.3 MB less memory, but T 0.031 to 0.033 s and K 30.85 to 29.87.
 
 | Step | Change | Run ID | T (s) | M (MB) | Points | KNOWN/OURS | Spread (board T, same code) | Kept |
@@ -82,7 +86,9 @@ What did not work, with the measurements (details in the log):
 | 45 | re-run of step 43 (another push) | 19e5d85 · Track C (run-e40aeefdf850) | 0.06 | 15 | 68.2 | KNOWN | 0.058-0.060 s, 3 runs | re-run |
 | 46 | c-35, c-37, c-39, c-42: a lean parse over a padded mapping (digits folded by SSE multiply-adds, the BOM test on a cold path), a name table of 4-entry buckets with one tag word, page-table entries dropped in parallel at the end; S 582 to 729 | af85844 · Track C (run-8d78dc657a67) | 0.04 | 14 | 71.2 | OURS | 0.041-0.042 s, 2 runs | kept |
 | 47 | re-run of step 46 (another push) | 1be93e4 · Track C (run-a47a8fbd9b44) | 0.04 | 14 | 71.8 | OURS | 0.041-0.042 s, 2 runs | re-run |
-| 48 | c-47, c-52, c-57: each name goes to the worker that owns its hash, which keeps it in a private table (no shared table, no atomics on names); the region table built by all workers; S 729 to 812 | 3cfa79a · Track C (run-653e9ee499e8) | 0.03 | 14 | 73.9 | KNOWN | 1 run | kept |
+| 48 | c-47, c-52, c-57: each name goes to the worker that owns its hash, which keeps it in a private table (no shared table, no atomics on names); the region table built by all workers; S 729 to 812 | 3cfa79a · Track C (run-653e9ee499e8) | 0.03 | 14 | 73.9 | KNOWN | 0.032 s, 2 runs | kept |
+| 49 | re-run of step 48 (another push) | 178ceb2 · Track C (run-ff90feddd01c) | 0.03 | 14 | 73.9 | KNOWN | 0.032 s, 2 runs | re-run |
+| 50 | c-55: the same program in fewer lines and less memory outside the name path (two file-mapping functions merged, the one-worker rerun written once, the region lines scanned by a plain byte loop, the long-amount function folded into `amount`); S 812 to 769 | 7890539 · Track C (run-49eb81ea843f) | 0.03 | 14 | 74.2 | KNOWN | 1 run | kept |
 
 Spread: the range of board T over every run of the same code; each board run is a single run. Readings labelled "our test machine" below are not board runs and have no run ID: K is the lower of the official and fresh readings, 5 runs each, with T's min-max where given.
 
@@ -249,14 +255,14 @@ Entries are roughly in the order the work was done. A board run has a run ID in 
   test-machine K 30.55 (official 30.55 T 0.031 s, fresh 30.57 T 0.031 s), M 13.6 MB, S 812, output hash 5/5 + 5/5, the
   same as c-52 s2 within the spread. This is the code of push 3cfa79a: board run-653e9ee499e8, K 30.04, T 0.0321 s,
   M 14.2 MB, S 812, 73.9 points (step 48). Verdict KEEP.
-- c-55 (the code in this commit; no board run yet): cut S and M everywhere except the name path, one step at a time,
+- c-55 (in step 50): cut S and M everywhere except the name path, one step at a time,
   keeping a step only when S or M fell and T stayed inside the spread. s1: two functions that mapped a file merged into
   one, the one-worker rerun written once, a record as a (key, groups) tuple, one helper inlined: test-machine K 30.65
   (official 30.72, fresh 30.65), M 13.7 MB, against 30.55. s2: the region lines scanned by a plain byte loop, the
   long-amount function folded into `amount`, the owner's multiply-shift written at its two send sites. Together:
   S 812 -> 769, test-machine K 30.85 (official 30.93, fresh 30.85; T 0.031 s), M 13.5 MB, output hash 5/5 + 5/5. The
-  code of push 3cfa79a read K 30.46 (official 30.46, fresh 30.56), M 13.9 MB on the same machine. Verdict KEEP; it
-  has no run ID until it is pushed to the board.
+  code of push 3cfa79a read K 30.46 (official 30.46, fresh 30.56), M 13.9 MB on the same machine. Verdict KEEP. This is the code of
+  push 7890539: board run-49eb81ea843f, K 30.49, T 0.0320 s, M 13.9 MB, S 769, 74.2 points (step 50).
 - c-58 two-stage structural parse, four rounds: stage 1 finds every comma and quote of a 64-byte block with SIMD
   masks, stage 2 reads the fields from the masks. Expected to help because it executes fewer instructions per
   field. On one thread it is 37 % faster (114 ms against 181 ms), but at 12 workers only 5 % (pass 16.3 ms against 17.1
@@ -272,6 +278,21 @@ Entries are roughly in the order the work was done. A board run has a run ID in 
   the run-to-run spread. Verdict DROP; 16 stays.
 - c-65 one malloc arena (`MALLOC_ARENA_MAX=1`): expected to save memory, as threads then share one heap. Test machine:
   M 13.4 -> 13.1 MB, but T 0.031 -> 0.033 s and K 30.85 -> 29.87. Verdict DROP.
+- c-62 region-table prefetch, two rounds: on d22e493 the region lookup's table cell missed the L2 cache on 1.86 M of the
+  run's 4.34 M L2 load misses (test machine, 12 workers). Round 1: the parse prefetches each record's cell and finishes
+  the record 4, 8 or 16 records later through a small ring: K 30.18 / 30.34 / 30.54 against 30.85. perf stat at 12
+  workers: L2 misses 4.32 M -> 2.49 M, instructions 1,175 M -> 1,306 M (+11 %), cycles 811.6 M -> 817-826 M (flat); the
+  ring's bookkeeping cost about 40 instructions per record. Round 2a, one record of distance kept in local variables:
+  K 30.71; instructions 1,304 M, cycles 797.8 M, misses 2.48 M. Round 2b, the prefetch alone with no deferral: K 30.70;
+  instructions 1,182 M (+0.6 %), cycles 816.3 M (+0.8 %), misses 2.56 M. Verdict DROP: removing 41 % of the L2 misses at
+  almost no instruction cost (2b) saved no cycles, so those misses were never on the critical path (out-of-order
+  execution and the second hyperthread on each core already overlap them).
+- c-66 (the code in this commit; no board run yet): every source file rewritten for size, one file per step, each step
+  read on the test machine (lower K): s1 regions.rs 30.55, s2 main.rs 30.75, s3 records.rs 30.97, s4 pass2.rs 30.00
+  (official reading; M 16.5 MB), s5 names.rs 31.38, s6 cleanup 31.42 (official 31.42, fresh 31.46, T 0.031 s,
+  M 13.9 MB). S 769 -> 655. s4's M 16.5 MB did not come back: 30 runs each in a fresh memory cgroup read d22e493 at a
+  median 13.6 MB (12.6-14.2) and c-66 at 13.7 MB (13.0-14.7). The S term alone predicts +2.4 % K and the M change
+  -0.6 %; T is unchanged. Verdict KEEP; its board row is added after the push.
 - Worker count. Unpinned, 20 workers looked faster than 12 (24.5 against 33.6 ms). The scoring run uses cpus 0-11, six
   physical cores with two hyperthreads each, and under that set 12 workers were best: 31.5 to 32.7 ms, against 32.8
   with 14, 34.9 with 16, 33.8 with 24 and 35.5 with 10 (test machine). Verdict: 12 stays (`main.rs`, `SD_WORKERS`
@@ -303,4 +324,4 @@ Entries are roughly in the order the work was done. A board run has a run ID in 
   instruction set the code uses (AVX2, BMI2, SSE4.2); `target-cpu=native` would tie the binary to whichever CPU builds
   the image, which need not be the one that runs it. The C runtime is linked statically (c-16).
 
-Final result: best board run run-653e9ee499e8 (push 3cfa79a): K 30.04, T 0.0321 s, M 14.2 MB, S 812, 73.9 points; our test machine on this code K 30.85.
+Final result: best board run run-49eb81ea843f (push 7890539): K 30.49, T 0.0320 s, M 13.9 MB, S 769, 74.2 points; our test machine on that code K 30.85, on the code in this commit (c-66) K 31.42.
