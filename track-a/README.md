@@ -2,7 +2,7 @@
 
 Reads 3,100,000 HTTP request log lines and, for every hour and endpoint that saw traffic, writes the request count, the nearest-rank p50, p95 and p99 latency, and the number and rate of 5xx responses.
 
-Rust, standard library only. K 39.49 (box `sd-bench/A`, commit fa5a5d4, a-40; fresh, the lower reading; official 40.32): T 0.027-0.028 s, M 23.6 MB, S 392, D 1. The board's best run of this design: run-0c2ed3d6fdec, K 38.98, T 0.0299 s (a-29, the same hot loop before a-35's cold-code line cuts).
+Rust, standard library only. K 39.49 (box `sd-bench/A`, commit fa5a5d4, a-40; fresh, the lower reading; official 40.32): T 0.027-0.028 s, M 23.6 MB, S 392, D 1. This code's board runs: run-67d08e654e03, K 39.62, T 28.1 ms (the best of three; run-cf19ad557a30 read T 41.0 ms, a single-run outlier). The track's best board run is run-136eb6e8fd39, K 39.97, T 28.6 ms (a-35's code).
 
 Reproduce with seed 1's full data in `<data>`, then compare the hash with the full seed-1 output hash in the [spec](https://github.com/hackathon-raptors/speed-demon-2026/blob/main/specs/a-ingest.md):
 `docker build -t a track-a && docker run --rm --network=none -v <data>:/data:ro -v <out>:/out a && sha256sum <out>/summary.txt`
@@ -62,4 +62,4 @@ None.
 
 ## With another 24 hours
 
-Cut the line count further: S is 356 lines here (a-35 cut 11 from cold code), and K moves about as S^-0.15, so 300 lines would be about 2.6 % more K. Two rewrites of the endpoint lookup (a-22, a-31) and a line walk from 64-byte LF bitmasks (a-34) read level or lower on the box, so neither the lookup nor the LF search is where the scan waits.
+Cut the line count further: S is 392 lines here (a-35 cut 11 lines of cold code, then a-40's faster scan added 36), and K moves about as S^-0.15, so 300 lines would be about 4 % more K. Two rewrites of the endpoint lookup (a-22, a-31) and a line walk from 64-byte LF bitmasks (a-34) read level or lower on the box, so neither the lookup nor the LF search is where the scan waits.
