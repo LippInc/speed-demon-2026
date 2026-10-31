@@ -380,6 +380,7 @@ const TERM: u32 = (1 << OP_SHIFT) - 1;
 const OP_AND: u32 = 0;
 const OP_OR: u32 = 1;
 const OP_NOT: u32 = 2;
+const OP_KEEP: u32 = 3; // pads a trigger's code to 3 words: r is left as it is
 const MULTI: u32 = 1 << 31; // Trigger::query flag: the query has several triggers, so one window can reach it twice
 
 /// One query listed under one of its trigger terms, with its code inline so a window's folds read the
@@ -428,7 +429,9 @@ impl BoolPlan {
         let mut triggers = Vec::new();
         for (qi, q) in queries.iter().enumerate() {
             let cover = cover(q, df);
-            let trig = Trigger { query: qi as u32 | (cover.len() > 1) as u32 * MULTI, code: *q };
+            let mut code = *q;
+            code[1..3].iter_mut().filter(|w| **w == NIL).for_each(|w| *w = OP_KEEP << OP_SHIFT | q[0]);
+            let trig = Trigger { query: qi as u32 | (cover.len() > 1) as u32 * MULTI, code };
             triggers.extend(cover.iter().map(|&t| (t, trig)));
         }
         let (trigger_start, mut triggers) = by_term(n_terms, &triggers);
@@ -448,22 +451,22 @@ impl BoolPlan {
 
 /// spec 3: strict left fold, no precedence; `a OR b AND c` is `(a OR b) AND c` (b-index.md:136-141), over 64 docs
 /// at once: bit j of a term's word says doc base + j contains it. AND, OR and NOT only combine bits that some term
-/// set, so docs missing from the range stay 0.
+/// set, so docs missing from the range stay 0. Each step is r & (b ^ x | y) | b & o, with the operator's masks from
+/// OP_MASKS, so the operator takes no branch: its match was 16.9 M of the flush's mispredicts (cachegrind, 1
+/// worker, seed 1).
 #[inline]
 fn fold_window(code: &[u32; MAX_BOOL_TERMS], words: &[u64]) -> u64 {
-    let mut r = words[code[0] as usize];
-    for &w in &code[1..] {
-        if w == NIL {
-            break;
-        }
-        let b = words[(w & ((1 << OP_SHIFT) - 1)) as usize];
-        r = match w >> OP_SHIFT {
-            OP_AND => r & b,
-            OP_OR => r | b,
-            _ => r & !b,
-        };
-    }
-    r
+    // (x, y, o) for AND, OR, NOT and KEEP
+    const OP_MASKS: [(u64, u64, u64); 4] = [(0, 0, 0), (0, !0, !0), (!0, 0, 0), (0, !0, 0)];
+    let step = |r: u64, w: u32| {
+        let (b, (x, y, o)) = (words[(w & TERM) as usize], OP_MASKS[(w >> OP_SHIFT) as usize]);
+        r & (b ^ x | y) | b & o
+    };
+    // Two fixed steps (OP_KEEP pads codes of 1 or 2 terms), then a tail that only codes of 4 to 6 terms enter, so
+    // the loop exit is not a per-fold guess between lengths 1, 2 and 3: the length test was 13.7 M of the flush's
+    // mispredicts (cachegrind, 1 worker, seed 1).
+    let r = step(step(words[code[0] as usize], code[1]), code[2]);
+    code[3..].iter().take_while(|&&w| w != NIL).fold(r, |r, &w| step(r, w))
 }
 
 /// Bit k of a bit position j, for every j at once: the sum of the set positions of w is

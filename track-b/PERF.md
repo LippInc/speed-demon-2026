@@ -86,6 +86,21 @@ Experiments measured only on the bench box (sd-bench/B), with no board run:
   - b-31d, failed (reverted): the 512 highest-df terms in an 8 KB slot table probed first: `K 20.52 (lower: fresh) | official K 20.53 T 0.354s (0.353-0.354) | fresh K 20.52 T 0.354s (0.353-0.356) | M 33.0MB S 654 L | sha 5/5+5/5 OK`. It saved 2.0 M D1 misses and added 37.4 M mispredicts.
   - Second reading on the docs commit: `K 21.70 (lower: official) | official K 21.70 T 0.320s | fresh K 21.72 T 0.319s | M 33.1MB S 631 L | sha 5/5+5/5 OK` (e6d5eb3).
 
+- **b-32**, the flush's branches, on b-31c (ef63a96).
+  - b-32a, failed (reverted): the count and sum added with no `r == 0` test, and the first-id loop entered through one test against the bound: `K 21.67 (lower: fresh) | official K 21.70 T 0.320s (0.318-0.323) | fresh K 21.67 T 0.321s (0.320-0.322) | M 33.2MB S 633 L | sha 5/5+5/5 OK`. The flush's mispredicts stayed at 52.9 M, and loading the bound on every fold added 3.2 M D1 misses.
+  - b-32b, the fold's operator selecting (x, y, o) masks from a table in place of a match: `K 21.94 (lower: fresh) | official K 21.96 T 0.313s (0.312-0.315) | fresh K 21.94 T 0.313s (0.313-0.315) | M 33.1MB S 629 L | sha 5/5+5/5 OK`. The flush's mispredicts fell from 52.9 M to 41.5 M. Kept, final code.
+  - b-32c, failed (reverted): the per-window MULTI stamp as one bit per query slot (3.8 KB): `K 21.76 (lower: fresh) | official K 21.87 T 0.315s (0.313-0.318) | fresh K 21.76 T 0.318s (0.316-0.320) | M 33.2MB S 633 L | sha 5/5+5/5 OK`. The flush's D1 misses fell only from 68.5 M to 67.4 M: the misses moved to the accumulator update.
+  - b-32d, failed (reverted): prefetching the next trigger's first three words: `K 21.76 (lower: fresh) | official K 21.78 T 0.317s (0.317-0.331) | fresh K 21.76 T 0.318s (0.317-0.318) | M 33.2MB S 635 L | sha 5/5+5/5 OK`. The flush's Ir rose from 2.56 G to 3.20 G.
+  - A fully padded, branch-free six-step fold was measured on the VM only: mispredicts 52.9 M to 24.2 M, but flush Ir 2.27 G to 3.78 G, and slower on the VM.
+  - Part (4), the token edges as two masks, was not built. After b-32b the byte loop (13.4 M mispredicts) ranks behind the flush (41.5 M) and `find` (19.0 M).
+  - Second reading on the docs commit: `K 21.93 (lower: official) | official K 21.93 T 0.314s | fresh K 21.94 T 0.313s | M 33.1MB S 629 L | sha 5/5+5/5 OK` (1c0f072).
+
+- **b-33**, the fold's length and the accumulators, on b-32b (ee2af70).
+  - b-33a, the fold in two fixed steps (codes of 1 or 2 terms padded with an OP_KEEP step), then a loop over terms 4 to 6 only: `K 22.11 (lower: fresh) | official K 22.11 T 0.307s (0.306-0.342) | fresh K 22.11 T 0.307s (0.307-0.309) | M 33.0MB S 637 L | sha 5/5+5/5 OK`. The flush's mispredicts fell from 41.5 M to 32.9 M, and its Ir from 2.56 G to 2.45 G. Kept, final code.
+  - Grouping each term's triggers by code length was tried first on the VM only. The flush's mispredicts moved from 41.5 M to 41.1 M, since most terms trigger one or two queries, so the runs are too short to train the exit.
+  - b-33b, failed (reverted): 8-byte accumulators (count, low 32 bits of the sum), with the high 32 bits and the MULTI stamp in arrays of their own: `K 22.06 (lower: fresh) | official K 22.09 T 0.306s (0.305-0.307) | fresh K 22.06 T 0.307s (0.306-0.308) | M 31.9MB S 649 L | sha 5/5+5/5 OK`. T was level at S +12. The flush's D1 misses rose from 68.5 M to 73.0 M.
+  - Second reading on the docs commit: `K 22.12 (lower: fresh) | official K 22.13 T 0.307s (0.306-0.308) | fresh K 22.12 T 0.307s (0.306-0.309) | M 33.2MB S 637 L | sha 5/5+5/5 OK` (6cf0987).
+
 Experiments measured only on the build VM and not kept:
 
 - **b-16**, a parallel query parse over two insert-only sets shared by the workers (lines and terms). The parse got slower on the VM, not faster: the shared, fixed-size term set misses cache on every term, and the parse did not scale from 1 to 4 workers. It also added 91 lines of S, so no code was committed.
