@@ -110,7 +110,10 @@ fn hash32(t: &[u8; MAX_TERM]) -> u32 {
 /// against the term's bytes, stored inline and zero-padded to 32 B (one more line). b-4 probed slots sized from
 /// every term occurrence (4 MB), a separate hash array, and a slice into queries.txt per term.
 struct TermTable {
-    slots: Vec<u64>, // hash << 32 | (term id + 1), 0 = empty
+    // 4 B slots: the hash's top 2 bits | (term id + 1) in the low 30 (TERM: ids stay below 2^30, BoolPlan::new),
+    // 0 = empty. The tag only filters and the bytes decide, so any query file is exact. Half the bytes of 8 B slots
+    // for the probe's slot misses (b-36; b-34a measured -5 ms on the box).
+    slots: Vec<u32>,
     shift: u32,
     bytes: Vec<TermBytes>, // by term id
 }
@@ -120,9 +123,9 @@ struct TermTable {
 struct TermBytes([u8; MAX_TERM]);
 
 impl TermTable {
-    /// The id of `term` (spec 2.3: 1 to 32 bytes), added if new. The slots double whenever they would pass load 2/3,
-    /// rehashed from the hash each slot keeps: 1 MB of slots on seed 1. Measured against load 1/2 (2 MB) and 1/4
-    /// (4 MB): the smallest table was fastest, since misses cost more than probe steps.
+    /// The id of `term` (spec 2.3: 1 to 32 bytes), added if new. The slots double whenever they would pass load 1/3,
+    /// rehashed from the entries: the 1 MB that 8 B slots took at load 2/3, with fewer collisions for the 2-bit tag
+    /// (b-36, cachegrind, 1 worker, seed 1: find's mispredicts 25.2 M at load 2/3, 14.2 M at 1/3; 19.0 M with 8 B).
     fn intern(&mut self, term: &[u8]) -> u32 {
         let mut padded = [0u8; MAX_TERM];
         padded[..term.len()].copy_from_slice(term);
@@ -130,23 +133,21 @@ impl TermTable {
         if let Some(t) = self.find(&padded, h) {
             return t;
         }
-        if 3 * (self.bytes.len() + 1) > 2 * self.slots.len() {
-            let size = self.slots.len() * 2;
-            let old = std::mem::replace(&mut self.slots, vec![0; size]);
-            self.shift -= 1;
-            old.into_iter().for_each(|s| self.place(s)); // an empty slot placed again stays empty
+        if 3 * (self.bytes.len() + 1) > self.slots.len() {
+            (self.slots, self.shift) = (vec![0; self.slots.len() * 2], self.shift - 1);
+            (0..self.bytes.len()).for_each(|t| self.place(hash32(&self.bytes[t].0), t as u32 + 1));
         }
         self.bytes.push(TermBytes(padded));
-        self.place((h as u64) << 32 | self.bytes.len() as u64);
+        self.place(h, self.bytes.len() as u32);
         self.bytes.len() as u32 - 1
     }
 
-    fn place(&mut self, s: u64) {
-        let mut i = self.slot((s >> 32) as u32);
+    fn place(&mut self, h: u32, id1: u32) {
+        let mut i = self.slot(h);
         while self.slots[i] != 0 {
             i = (i + 1) & (self.slots.len() - 1);
         }
-        self.slots[i] = s;
+        self.slots[i] = h & !TERM | id1;
     }
 
     /// Renumbers the terms by ascending `key` in place: the slots keep their hash and get the new id, and the
@@ -159,7 +160,7 @@ impl TermTable {
             new_id[old] = new as u32;
         }
         for s in self.slots.iter_mut().filter(|s| **s != 0) {
-            *s = (*s >> 32) << 32 | (new_id[(*s as u32 - 1) as usize] as u64 + 1);
+            *s = *s & !TERM | (new_id[(*s & TERM) as usize - 1] + 1);
         }
         self.bytes = order.iter().map(|&t| self.bytes[t]).collect();
         new_id
@@ -170,7 +171,7 @@ impl TermTable {
         (h.wrapping_mul(0x9e37_79b1) >> self.shift) as usize
     }
 
-    /// The hash only filters; the bytes decide. Token and entry are both zero-padded to 32 bytes, so one 32-byte
+    /// The tag only filters; the bytes decide. Token and entry are both zero-padded to 32 bytes, so one 32-byte
     /// compare settles the bytes and the length (it replaced a memcmp call and a length test per hash match).
     #[inline]
     fn find(&self, token: &[u8; MAX_TERM], h: u32) -> Option<u32> {
@@ -180,8 +181,8 @@ impl TermTable {
             if s == 0 {
                 return None;
             }
-            if (s >> 32) as u32 == h {
-                let t = s as u32 - 1;
+            if (s ^ h) & !TERM == 0 {
+                let t = (s & TERM) - 1;
                 if self.bytes[t as usize].0 == *token {
                     return Some(t);
                 }
@@ -487,13 +488,14 @@ struct Window {
     // (term, its trigger range): the range is read at the hit that first sets the term's word, next to the probe
     // that just found the term, instead of as a miss on trigger_start in the flush.
     touched: Vec<(u32, u32, u32)>,
+    n_touched: usize, // touched[..n_touched] is this window's; the array has a slot per BOOL term and one more
 }
 
 impl Window {
     /// Folds every query that a term of the window triggers, once, and clears the window's words.
     fn flush(&mut self, plan: &BoolPlan, acc: &mut [BoolAcc]) {
         let (base, stamp) = (self.base, self.base / 64 + 1);
-        for &(_, from, to) in &self.touched {
+        for &(_, from, to) in &self.touched[..self.n_touched] {
             for trig in &plan.triggers[from as usize..to as usize] {
                 // A query listed under several touched terms is reached once per term and counts once: every
                 // query is stamped and a repeat's result masked to zero, with no branch on a MULTI flag or the stamp
@@ -518,10 +520,10 @@ impl Window {
                 }
             }
         }
-        for &(t, _, _) in &self.touched {
+        for &(t, _, _) in &self.touched[..self.n_touched] {
             self.words[t as usize] = 0;
         }
-        self.touched.clear();
+        self.n_touched = 0;
     }
 }
 
@@ -571,7 +573,8 @@ fn scan(data: &[u8], dict: &TermTable, phrases: &PhrasePlan, plan: &BoolPlan) ->
     let (mut acc, mut matches) = (vec![BoolAcc::default(); plan.slot.len()], Vec::new());
     // Flushing a window of no words changes nothing, so the first window needs no special case.
     let words = vec![0u64; plan.trigger_start.len() - 1]; // by BOOL term id
-    let mut window = Window { base: 0, words, touched: Vec::new() };
+    let touched = vec![(0, 0, 0); words.len() + 1];
+    let mut window = Window { base: 0, words, touched, n_touched: 0 };
     // The doc's tokens as term ids (NIL for any other token) and the positions in `seq` of anchor terms; per
     // pattern the last doc id + 1 it was reported for.
     let (mut seq, mut anchored) = (Vec::new(), Vec::new());
@@ -595,10 +598,11 @@ fn scan(data: &[u8], dict: &TermTable, phrases: &PhrasePlan, plan: &BoolPlan) ->
             let Some(word) = window.words.get_mut(t as usize) else {
                 return; // a phrase-only term
             };
-            if *word == 0 {
-                let (from, to) = (plan.trigger_start[t as usize], plan.trigger_start[t as usize + 1]);
-                window.touched.push((t, from, to));
-            }
+            // The entry is written at n_touched on every hit and kept only by the first one in the window, with no
+            // first-touch branch (b-37: 10.9 M mispredicts in cachegrind, 1 worker, seed 1).
+            let (from, to) = (plan.trigger_start[t as usize], plan.trigger_start[t as usize + 1]);
+            window.touched[window.n_touched] = (t, from, to);
+            window.n_touched += (*word == 0) as usize;
             *word |= 1 << (id % 64);
         });
         // A phrase never spans two documents: seq holds this doc only.

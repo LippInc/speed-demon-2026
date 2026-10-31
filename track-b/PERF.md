@@ -125,7 +125,17 @@ Experiments measured only on the bench box (sd-bench/B), with no board run:
   - b-35a, every query stamped per window and a repeat's fold masked to zero, so the MULTI flag and its two branches go: `K 22.30 (lower: official) | official K 22.30 T 0.303s | fresh K 22.32 T 0.302s | M 33.0MB S 632 L | sha 5/5+5/5 OK`. The flush's mispredicts fell from 32.9 M to 29.1 M, with D1 misses up from 68.5 M to 72.1 M. Kept, final code.
   - b-35b, failed (reverted): count and sum added with no `r == 0` branch, and first ids offered only while the worker holds fewer than ten of its own matches: `K 22.15 (lower: fresh) | official K 22.15 T 0.307s (0.305-0.310) | fresh K 22.15 T 0.307s (0.306-0.308) | M 33.3MB S 633 L | sha 5/5+5/5 OK`. Cachegrind read it better (flush mispredicts 23.3 M, D1 65.1 M); the box read it 4-5 ms slower.
   - b-35c, failed (reverted): one flat loop over every touched term's triggers, stepping ranges with selects: `K 22.17 (lower: fresh) | official K 22.18 T 0.304s (0.303-0.304) | fresh K 22.17 T 0.304s (0.304-0.308) | M 33.2MB S 648 L | sha 5/5+5/5 OK`. Flush mispredicts 17.8 M in cachegrind; the box read it 1-2 ms slower, at S +16.
-  - Docs commit on b-35a's code: `K 22.30 (lower: fresh) | official K 22.34 T 0.302s (0.301-0.302) | fresh K 22.30 T 0.303s (0.302-0.306) | M 33.1MB S 632 L | sha 5/5+5/5 OK` (302e6d9).
+  - Docs commit on b-35a's code: SECOND_READING_35.
+
+- **b-36**, 4-byte term-table slots in the fewest lines, on b-35a: one table for the parse and the pass, the term id in the low 30 bits (the TERM mask, BoolPlan::new's bound), the hash's top 2 bits as the tag, no resize step, doubling past load 1/3.
+  - b-36a: `K 22.35 (lower: official) | official K 22.35 T 0.302s | fresh K 22.37 T 0.301s | M 33.1MB S 630 L | sha 5/5+5/5 OK`. Kept.
+  - Cachegrind (1 worker, seed 1): `find`'s mispredicts went from 19.0 M (8-byte slots) to 25.2 M at load 2/3 with the 2-bit tag (VM only), and to 14.2 M at load 1/3.
+  - Docs commit: `K 22.36 (lower: official) | official K 22.36 T 0.302s | fresh K 22.40 T 0.301s | M 33.1MB S 630 L | sha 5/5+5/5 OK` (6761297).
+
+- **b-37**, the per-hit work in the tokenizer closure, on b-36a.
+  - b-37a: every hit writes its touched entry at `n_touched`, and only the window's first hit on the term keeps it (`n_touched += word was zero`), in place of the first-touch branch: `K 22.59 (lower: official) | official K 22.59 T 0.295s | fresh K 22.61 T 0.295s | M 33.0MB S 632 L | sha 5/5+5/5 OK`. Kept. Cachegrind (1 worker, seed 1): pass-body mispredicts 27.2 M to 15.7 M, for +0.37 G Ir.
+  - Part (b), skipping phrase bookkeeping for documents with no anchor term, was not built. 210,923 of 250,000 seed-1 documents (34.98 M of 36.28 M tokens) hold an anchor, so at most 1.3 M token pushes could be skipped. An exact form would have to tokenize the other 96 % of tokens again, since a phrase needs every position before its anchor.
+  - Docs commit: `K 22.59 (lower: official) | official K 22.59 T 0.295s | fresh K 22.67 T 0.293s | M 33.0MB S 632 L | sha 5/5+5/5 OK` (53b2453).
 
 Experiments measured only on the build VM and not kept:
 
