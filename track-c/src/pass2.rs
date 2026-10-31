@@ -37,7 +37,7 @@ pub struct Pass2 {
 
 /// Runs pass 2 on `workers` threads over the records from `first` to the end, cut into `chunk`-byte
 /// pieces at record starts.
-pub fn run<L: Lookup + ?Sized + Sync>(
+pub fn run<L: Lookup + Sync>(
     b: &[u8],
     first: usize,
     chunk: usize,
@@ -52,64 +52,64 @@ pub fn run<L: Lookup + ?Sized + Sync>(
     let route: Vec<(usize, u32)> = (0..groups).map(|g| (g % workers, (g / workers) as u32)).collect();
     let inbox: Vec<Mutex<Vec<Vec<(u32, u32)>>>> = (0..workers).map(|_| Mutex::default()).collect();
     let pool: Mutex<Vec<Vec<(u32, u32)>>> = Mutex::default();
-    let take = || pool.lock().unwrap().pop().unwrap_or_else(|| Vec::with_capacity(BUCKET));
-    let (next, flushed, exact) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicBool::new(true));
+    let take = || pool.lock().unwrap().pop().unwrap_or_default();
+    let next = AtomicUsize::new(0);
+    let flushed = AtomicUsize::new(0);
+    let exact = AtomicBool::new(true);
     // Per worker, the intern era it last reached between chunks (`Intern::quiesce`).
     let seen: Vec<AtomicU64> = (0..workers).map(|_| AtomicU64::new(0)).collect();
 
+    // One worker's whole run; the closure holds only shared references, so every thread copies it.
+    let worker = |w: usize| {
+        let mut slots = vec![Slot::new(); groups];
+        // A group's set sits at its owner, at index group / workers.
+        let mut owned = vec![NameSet::default(); groups.div_ceil(workers)];
+        // Sets the bits of every bucket in this worker's inbox, and returns the buckets to the pool.
+        let drain = |owned: &mut Vec<NameSet>| {
+            for mut bucket in std::mem::take(&mut *inbox[w].lock().unwrap()) {
+                bucket.iter().for_each(|&(local, id)| owned[local as usize].insert(id));
+                bucket.clear();
+                pool.lock().unwrap().push(bucket);
+            }
+        };
+        let mut out: Vec<Vec<(u32, u32)>> = (0..workers).map(|_| take()).collect();
+        loop {
+            let k = next.fetch_add(1, Ordering::Relaxed);
+            intern.quiesce(&seen, w, k >= chunks);
+            if k >= chunks {
+                break;
+            }
+            let (mut i, end) = (start(k), start(k + 1));
+            let hashed = |at, len| intern.prefetch(b, at, len);
+            let on_name = |g: usize, at, len, h| {
+                let (owner, local) = route[g];
+                out[owner].push((local, intern.id(b, at, len, h)));
+                if out[owner].len() == BUCKET {
+                    let full = std::mem::replace(&mut out[owner], take());
+                    inbox[owner].lock().unwrap().push(full);
+                }
+            };
+            parse_range(b, &mut i, end, lookup, &mut slots, hashed, on_name);
+            // Pairwise end check (e1): the parse must stop exactly on the next chunk's start.
+            exact.fetch_and(i == end, Ordering::Relaxed);
+            drain(&mut owned);
+        }
+        for (owner, bucket) in out.into_iter().enumerate() {
+            inbox[owner].lock().unwrap().push(bucket);
+        }
+        // Once every worker has flushed (each flush is under the inbox locks, before its
+        // count), no bucket can arrive any more: one last drain empties this inbox for good.
+        flushed.fetch_add(1, Ordering::Release);
+        while flushed.load(Ordering::Acquire) < workers {
+            drain(&mut owned);
+            std::thread::yield_now();
+        }
+        drain(&mut owned);
+        (slots, owned)
+    };
     let results: Vec<(Vec<Slot>, Vec<NameSet>)> = std::thread::scope(|s| {
-        let handles: Vec<_> = (0..workers)
-            .map(|w| {
-                let (route, inbox, pool, take, next, flushed, exact, seen) =
-                    (&route, &inbox, &pool, &take, &next, &flushed, &exact, &seen);
-                s.spawn(move || {
-                    let mut slots = vec![Slot::default(); groups];
-                    let mut owned: Vec<NameSet> = (w..groups).step_by(workers).map(|_| NameSet::default()).collect();
-                    // Sets the bits of every bucket in this worker's inbox, and returns the buckets to the pool.
-                    let drain = |owned: &mut Vec<NameSet>| {
-                        for mut bucket in std::mem::take(&mut *inbox[w].lock().unwrap()) {
-                            bucket.iter().for_each(|&(local, id)| owned[local as usize].insert(id));
-                            bucket.clear();
-                            pool.lock().unwrap().push(bucket);
-                        }
-                    };
-                    let mut out: Vec<Vec<(u32, u32)>> = (0..workers).map(|_| take()).collect();
-                    loop {
-                        let k = next.fetch_add(1, Ordering::Relaxed);
-                        intern.quiesce(seen, w, k >= chunks);
-                        if k >= chunks {
-                            break;
-                        }
-                        let (mut i, end) = (start(k), start(k + 1));
-                        parse_range(b, &mut i, end, lookup, &mut slots, |g, at, len| {
-                            let (owner, local) = route[g];
-                            out[owner].push((local, intern.id(b, at, len)));
-                            if out[owner].len() == BUCKET {
-                                let full = std::mem::replace(&mut out[owner], take());
-                                inbox[owner].lock().unwrap().push(full);
-                            }
-                            true
-                        });
-                        // Pairwise end check (e1): the parse must stop exactly on the next chunk's start.
-                        exact.fetch_and(i == end, Ordering::Relaxed);
-                        drain(&mut owned);
-                    }
-                    for (owner, bucket) in out.into_iter().enumerate() {
-                        inbox[owner].lock().unwrap().push(bucket);
-                    }
-                    // Once every worker has flushed (each flush is under the inbox locks, before its
-                    // count), no bucket can arrive any more: one last drain empties this inbox for good.
-                    flushed.fetch_add(1, Ordering::Release);
-                    while flushed.load(Ordering::Acquire) < workers {
-                        drain(&mut owned);
-                        std::thread::yield_now();
-                    }
-                    drain(&mut owned);
-                    (slots, owned)
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().expect("parse worker panicked")).collect()
+        let handles: Vec<_> = (0..workers).map(|w| s.spawn(move || worker(w))).collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
     let distinct = (0..groups).map(|g| results[g % workers].1[g / workers].len()).collect();

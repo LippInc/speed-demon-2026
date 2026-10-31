@@ -1,6 +1,8 @@
 //! regions.csv: `region_id,country` lines, LF-terminated, ids unique and ascending, country `[A-Z]{3}`
 //! (c-join.md:58-59). Parsed into a dense table region id -> group index; group 0 is `_UNMATCHED`.
 
+use crate::records::uint_until;
+
 /// Region id -> group index. One byte per region while the file names at most 255 countries,
 /// two bytes beyond that.
 pub enum RegionTable {
@@ -15,7 +17,7 @@ pub trait Lookup {
 
 /// The u8 and u16 tables share one impl: a group index fits either element type, and `get` is
 /// None past the table's end, which is the group-0 default.
-impl<T: Copy + Into<usize>> Lookup for [T] {
+impl<T: Copy + Into<usize>> Lookup for Vec<T> {
     fn group(&self, region_id: usize) -> usize {
         self.get(region_id).map_or(0, |&g| g.into())
     }
@@ -27,15 +29,10 @@ pub struct Regions {
     pub keys: Vec<Vec<u8>>,
 }
 
-fn parse_uint(digits: &[u8]) -> usize {
-    digits.iter().fold(0, |n, &d| n * 10 + (d - b'0') as usize)
-}
-
 /// `region_id,country` -> (region id, country code bytes).
 fn split(line: &[u8]) -> (usize, &[u8]) {
-    let comma = line.iter().position(|&b| b == b',');
-    let comma = comma.expect("regions.csv: line without a comma");
-    (parse_uint(&line[..comma]), &line[comma + 1..])
+    let (id, country) = uint_until(line, 0, b',');
+    (id as usize, &line[country..])
 }
 
 pub fn parse(bytes: &[u8]) -> Regions {

@@ -18,19 +18,21 @@ pub struct Slot {
 }
 
 impl Slot {
+    /// An empty slot: the minimum and maximum start at the extremes, so the first amount replaces both
+    /// and an empty slot merges as a no-op.
+    pub fn new() -> Slot {
+        Slot { amount_min: i64::MAX, amount_max: i64::MIN, ..Default::default() }
+    }
+
     /// Folds another worker's slot for the same group into this one.
     pub fn merge(&mut self, other: &Slot) {
-        if self.count == 0 {
-            *self = other.clone();
-        } else if other.count > 0 {
-            self.count += other.count;
+        self.count += other.count;
         self.id_sum += other.id_sum;
         self.amount_sum += other.amount_sum;
         self.amount_min = self.amount_min.min(other.amount_min);
         self.amount_max = self.amount_max.max(other.amount_max);
         self.name_bytes += other.name_bytes;
         self.note_bytes += other.note_bytes;
-        }
     }
 }
 
@@ -39,7 +41,6 @@ impl Slot {
 /// read past its end. Measured (this VM, 12 workers, full seed 1, interleaved medians): pass2+names
 /// 294 -> 244 ms (c-10).
 fn find(b: &[u8], mut i: usize, c: u8) -> usize {
-    #[cfg(target_feature = "avx2")]
     while i + 32 <= b.len() {
         use std::arch::x86_64::*;
         // SAFETY: the 32 bytes at i lie inside `b`; AVX2 is on at compile time (x86-64-v3).
@@ -81,7 +82,7 @@ fn text_field(b: &[u8], i: usize) -> (usize, usize, u64, usize) {
 }
 
 /// An unsigned decimal ending at `stop`; returns it and the index just past `stop`.
-fn uint_until(b: &[u8], mut i: usize, stop: u8) -> (u64, usize) {
+pub(crate) fn uint_until(b: &[u8], mut i: usize, stop: u8) -> (u64, usize) {
     let mut n = 0u64;
     while let Some(&d) = b.get(i).filter(|&&d| d != stop) {
         n = n * 10 + (d - b'0') as u64;
@@ -91,22 +92,30 @@ fn uint_until(b: &[u8], mut i: usize, stop: u8) -> (u64, usize) {
 }
 
 /// Parses the records that start in `*i..end` (`*i` is a record start; the last record may run past
-/// `end`) into `slots`, indexed by the lookup's group, and calls `on_name(group, raw_start, raw_len)`
-/// with each record's raw name. Stops after a record whose `on_name` returns false, leaving `*i` at
-/// the next record start, so the caller can resume.
-pub fn parse_range<L: Lookup + ?Sized>(
+/// `end`) into `slots`, indexed by the lookup's group. For each record's raw name it calls
+/// `on_name_start(raw_start, raw_len)` as soon as the name is parsed, then `on_name(group, raw_start,
+/// raw_len, started)` with that call's result once the record is done. Leaves `*i` at the next record
+/// start.
+pub fn parse_range<L: Lookup, P>(
     b: &[u8],
     i: &mut usize,
     end: usize,
     lookup: &L,
     slots: &mut [Slot],
-    mut on_name: impl FnMut(usize, usize, usize) -> bool,
+    mut on_name_start: impl FnMut(usize, usize) -> P,
+    mut on_name: impl FnMut(usize, usize, usize, P),
 ) {
     while *i < end {
         // A BOM directly after a terminator is skipped (c-join.md:36).
         let at = if b[*i..].starts_with(BOM) { *i + 3 } else { *i };
         let (id, next) = uint_until(b, at, b',');
         let (name_start, name_raw_len, name_len, next) = text_field(b, next);
+        // Started as soon as the name is known, so its lookup can begin while the rest is parsed. A
+        // garbage record's name span may not lie inside the mapping (the record is dropped below):
+        // the hook then sees an empty span at its end.
+        let inside = b.get(name_start..).is_some_and(|r| name_raw_len <= r.len());
+        let (span_start, span_len) = if inside { (name_start, name_raw_len) } else { (b.len(), 0) };
+        let started = on_name_start(span_start, span_len);
         let (_, _, note_len, next) = text_field(b, next);
         let (region_id, next) = uint_until(b, next, b',');
         // `-?[0-9]+\.[0-9]{2}` as integer cents (c-join.md:24, 37).
@@ -131,21 +140,14 @@ pub fn parse_range<L: Lookup + ?Sized>(
 
         let group = lookup.group(region_id as usize);
         let s = &mut slots[group];
-        // min and max start from the slot's first amount, never from 0.
-        let first = s.count == 0;
         s.count += 1;
         s.id_sum += id;
         s.amount_sum += cents;
-        (s.amount_min, s.amount_max) = if first {
-            (cents, cents)
-        } else {
-            (cents.min(s.amount_min), cents.max(s.amount_max))
-        };
+        s.amount_min = s.amount_min.min(cents);
+        s.amount_max = s.amount_max.max(cents);
         s.name_bytes += name_len;
         s.note_bytes += note_len;
-        if !on_name(group, name_start, name_raw_len) {
-            break;
-        }
+        on_name(group, name_start, name_raw_len, started);
     }
 }
 

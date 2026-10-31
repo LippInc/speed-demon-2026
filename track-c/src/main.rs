@@ -6,7 +6,7 @@ mod pass2;
 mod records;
 mod regions;
 
-use std::{ffi::c_void, fs::File, io::Write, os::fd::AsRawFd};
+use std::{fs::File, io::Write, os::fd::AsRawFd};
 
 use crate::{names::Intern, records::BOM, records::Slot, regions::RegionTable};
 
@@ -25,7 +25,7 @@ fn push_money(out: &mut Vec<u8>, cents: i64) {
 
 // Read-only file mappings through libc's mmap (std links libc; no crate needed).
 unsafe extern "C" {
-    fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
+    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
 }
 
 /// Maps a whole file read-only; pages fault in as they are touched (probe P2: no MAP_POPULATE).
@@ -38,7 +38,7 @@ fn map_file(path: &str) -> &'static [u8] {
         // prot 1 = PROT_READ, flags 2 = MAP_PRIVATE (mmap(2)); -1 (all bits set) is MAP_FAILED.
         let ptr = mmap(std::ptr::null_mut(), len, 1, 2, file.as_raw_fd(), 0);
         assert!(ptr as usize != usize::MAX, "mmap {path} failed");
-        std::slice::from_raw_parts(ptr as *const u8, len)
+        std::slice::from_raw_parts(ptr, len)
     });
     map.unwrap_or(&[])
 }
@@ -64,8 +64,8 @@ fn main() {
     let lf = b[bom..].iter().position(|&c| c == b'\n');
     let first = lf.map_or(b.len(), |p| p + bom + 1);
     let run = |workers: usize, chunk: usize, intern: &Intern| match &regions.table {
-        RegionTable::Narrow(t) => pass2::run(b, first, chunk, workers, t.as_slice(), groups, intern),
-        RegionTable::Wide(t) => pass2::run(b, first, chunk, workers, t.as_slice(), groups, intern),
+        RegionTable::Narrow(t) => pass2::run(b, first, chunk, workers, t, groups, intern),
+        RegionTable::Wide(t) => pass2::run(b, first, chunk, workers, t, groups, intern),
     };
     // Starting slots per intern shard (256 shards, so 16K slots, 128 KiB, before any growth).
     // SD_INTERN_SLOTS is a test-only override: forcing a tiny table (e.g. 2) runs the growth path
@@ -80,9 +80,11 @@ fn main() {
         pass2 = run(1, b.len(), &intern);
     }
 
-    let mut totals = vec![Slot::default(); groups];
+    let mut totals = vec![Slot::new(); groups];
     for slots in &pass2.slots {
-        totals.iter_mut().zip(slots).for_each(|(total, slot)| total.merge(slot));
+        for (total, slot) in totals.iter_mut().zip(slots) {
+            total.merge(slot);
+        }
     }
     // One line per group with records, sorted by key bytewise (c-join.md:127-129).
     let mut lines: Vec<usize> = (0..groups).filter(|&g| totals[g].count > 0).collect();

@@ -40,37 +40,21 @@ pub fn hash(b: &[u8], start: usize, len: usize) -> (u64, u64, u64) {
     (sig, lo, hi)
 }
 
-/// One slot: 0 while empty, else `(16 hash bits) << 48 | the record's address`, the record being the
-/// name's entry in the arena (`Arena`; x86-64 user addresses fit in 48 bits, checked on insert). 8
+/// A slot array (a power of two of 8-byte slots), all zero. A slot is 0 while empty, else `(16 hash bits) << 48 | the record's
+/// address`, the record being the name's entry in the arena (`Arena`; x86-64 user addresses fit in 48 bits). 8
 /// bytes, where c-6's slot was 16 (meta plus a name pointer): measured (sdrig, this VM) M 19.5 ->
 /// 15.6 MiB, T unchanged (c-7). Holding the address rather than an arena offset (c-7 to c-11) spares a hit
 /// the offset's block arithmetic and directory load before the record; this VM could not resolve it
 /// (interleaved medians of pass2+names: +9 % in one run, -7 % in the next), so the box decides (c-12.1). The hash bits
 /// filter probes before the compare; growth finds a name's home slot again by rehashing its record.
-struct Slots {
-    mask: usize,
-    slots: Box<[AtomicU64]>,
+fn new_slots(len: usize) -> Box<[AtomicU64]> {
+    (0..len).map(|_| AtomicU64::new(0)).collect()
 }
 
-impl Slots {
-    fn new(len: usize) -> Box<Slots> {
-        Box::new(Slots {
-            mask: len - 1,
-            slots: (0..len).map(|_| AtomicU64::new(0)).collect(),
-        })
-    }
-
-    fn find(&self, key: (&[u8], u64, u64), h: u64) -> Result<u32, usize> {
-        find(&self.slots, key, h)
-    }
-
-    /// The word readers load to reach this generation: the slot array's address, and log2 of its
-    /// length in the top byte (user addresses fit in 48 bits), so a lookup needs no load of `Slots`.
-    fn packed(&self) -> u64 {
-        let addr = self.slots.as_ptr().expose_provenance() as u64;
-        assert!(addr >> 48 == 0, "a slot array above 48 bits");
-        addr | (self.slots.len().trailing_zeros() as u64) << 56
-    }
+/// The word readers load to reach a generation: the slot array's address, and log2 of its
+/// length in the top byte (user addresses fit in 48 bits), so a lookup needs no load of the array's header.
+fn packed(slots: &[AtomicU64]) -> u64 {
+    slots.as_ptr().expose_provenance() as u64 | (slots.len().trailing_zeros() as u64) << 56
 }
 
 /// Probes `slots` (a power of two of them) for `key` from its home slot. Returns its id, or the index
@@ -141,6 +125,7 @@ unsafe fn matches(p: *const u8, (key, lo, hi): (&[u8], u64, u64)) -> Option<u32>
 /// time under the arena's lock and writes its records there under its own lock, so the arena lock is
 /// taken about once per 50 inserts: with it taken on every insert, T rose 10-17 % on this VM (12
 /// workers inserting most names in the first round). It is always taken after a shard's lock.
+#[derive(Default)]
 struct Arena {
     blocks: [AtomicPtr<u8>; 32],
     writer: ArenaWriter,
@@ -148,6 +133,7 @@ struct Arena {
 
 /// The arena's insert side, on its own cache line so inserts do not disturb readers of `blocks`.
 #[repr(align(64))]
+#[derive(Default)]
 struct ArenaWriter(Mutex<ArenaBlocks>);
 
 /// The blocks the directory points into, owned here so they are freed with the Intern, and the next
@@ -182,7 +168,6 @@ impl Arena {
         while a.used + len > block_start(block_of(a.used) + 1) {
             a.used = block_start(block_of(a.used) + 1);
         }
-        assert!(a.used + len < u32::MAX as usize, "names over 4 GiB");
         let k = block_of(a.used);
         // A block is allocated when a reservation first lands in it, decided by block k's own
         // directory pointer. The skip above can pass over several blocks (a reservation longer than
@@ -205,7 +190,7 @@ impl Arena {
 struct Writer {
     /// The current generation of slots, alone: a grown-out one moves to `Intern::retired`, because a
     /// lock-free reader may still be probing it.
-    generations: Vec<Box<Slots>>,
+    slots: Box<[AtomicU64]>,
     names: usize,
     /// The shard's current arena reservation: records go at `next`, up to `end`.
     next: usize,
@@ -241,25 +226,24 @@ impl Writer {
 
     /// Doubles the slots: copies every published slot into a new generation (only this thread
     /// writes slots, so plain loads suffice) and publishes it; readers still on the old generation
-    /// find every name it held, and a miss there sends them to the locked re-check.
-    fn grow(&mut self, current: &AtomicU64) {
-        let old = self.generations.last().unwrap();
-        let new = Slots::new(old.slots.len() * 2);
-        for entry in old.slots.iter().filter(|s| s.load(Ordering::Relaxed) != 0) {
+    /// find every name it held, and a miss there sends them to the locked re-check. Returns the old one.
+    fn grow(&mut self, current: &AtomicU64) -> Box<[AtomicU64]> {
+        let new = new_slots(self.slots.len() * 2);
+        for entry in self.slots.iter().filter(|s| s.load(Ordering::Relaxed) != 0) {
             let slot = entry.load(Ordering::Relaxed);
             // SAFETY: a published slot names a complete record (`Writer::store`).
             let p = record(slot);
             let len = u32::from_le_bytes(unsafe { *(p as *const [u8; 4]) }) as usize;
             let name = unsafe { std::slice::from_raw_parts(p.add(8), len) };
-            let mut pos = hash(name, 0, name.len()).0 as usize & new.mask;
-            while new.slots[pos].load(Ordering::Relaxed) != 0 {
-                pos = (pos + 1) & new.mask;
+            let mut pos = hash(name, 0, name.len()).0 as usize & (new.len() - 1);
+            while new[pos].load(Ordering::Relaxed) != 0 {
+                pos = (pos + 1) & (new.len() - 1);
             }
-            new.slots[pos].store(slot, Ordering::Relaxed);
+            new[pos].store(slot, Ordering::Relaxed);
         }
         // Release: a reader that loads this pointer (Acquire) sees every slot copied above.
-        current.store(new.packed(), Ordering::Release);
-        self.generations.push(new);
+        current.store(packed(&new), Ordering::Release);
+        std::mem::replace(&mut self.slots, new)
     }
 }
 
@@ -271,7 +255,7 @@ const SHARD_BITS: u32 = 8;
 /// seed 1), so the lock and its cache-line traffic leave the common path.
 #[repr(align(64))]
 struct Shard {
-    /// The current generation, as `Slots::packed`.
+    /// The current generation, as `packed`.
     current: AtomicU64,
     writer: Mutex<Writer>,
 }
@@ -279,12 +263,13 @@ struct Shard {
 /// Raw name bytes (between the quotes, escapes kept) -> dense id. `""` -> `"` is one to one, so raw
 /// bytes are distinct exactly when the unescaped values are; `""` and an empty unquoted field are
 /// both the empty key. Every hit is an exact byte compare against the copy in the arena.
+#[derive(Default)]
 pub struct Intern {
     shards: Vec<Shard>,
     arena: Arena,
     next_id: AtomicU32,
     /// Retired slot generations, each with the era it was retired in, freed by `quiesce`.
-    retired: Mutex<Vec<(u64, Box<Slots>)>>,
+    retired: Mutex<Vec<(u64, Box<[AtomicU64]>)>>,
     era: AtomicU64,
 }
 
@@ -294,23 +279,11 @@ impl Intern {
         let len = slots_per_shard.next_power_of_two().max(2);
         let shards = (0..1 << SHARD_BITS)
             .map(|_| {
-                let first = Slots::new(len);
-                Shard {
-                    current: AtomicU64::new(first.packed()),
-                    writer: Mutex::new(Writer { generations: vec![first], ..Default::default() }),
-                }
+                let slots = new_slots(len);
+                Shard { current: AtomicU64::new(packed(&slots)), writer: Mutex::new(Writer { slots, ..Default::default() }) }
             })
             .collect();
-        Intern {
-            shards,
-            arena: Arena {
-                blocks: std::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
-                writer: ArenaWriter(Mutex::new(ArenaBlocks::default())),
-            },
-            next_id: AtomicU32::new(0),
-            retired: Mutex::default(),
-            era: AtomicU64::new(0),
-        }
+        Intern { shards, ..Default::default() }
     }
 
     /// Worker `me` is between chunks, holding no slot generation (a lookup holds one only until it
@@ -321,14 +294,31 @@ impl Intern {
     /// one. Freed per chunk instead of at the end, as pass 2 has no barrier: sdrig M 15.8 -> 15.2 MiB
     /// on this VM (c-19a2 -> c-19a3), box in the commit log.
     pub fn quiesce(&self, seen: &[AtomicU64], me: usize, done: bool) {
-        seen[me].store(if done { u64::MAX } else { self.era.load(Ordering::SeqCst) }, Ordering::SeqCst);
-        let safe = seen.iter().map(|s| s.load(Ordering::SeqCst)).min().unwrap_or(u64::MAX);
+        let reached = if done { u64::MAX } else { self.era.load(Ordering::SeqCst) };
+        seen[me].store(reached, Ordering::SeqCst);
+        let safe = seen.iter().fold(u64::MAX, |lowest, s| lowest.min(s.load(Ordering::SeqCst)));
         self.retired.lock().unwrap().retain(|&(era, _)| era >= safe);
     }
 
+    /// Hashes the name `b[start..start + len]` for `id` and prefetches its home slot, while the parse
+    /// goes on with the rest of the record (note, region, amount), so the slot's cache miss overlaps
+    /// that work instead of stalling the lookup. One prefetch per record, issued from the parse: unlike
+    /// c-8's ring, no queue and no extra state. Only a hint; it never faults. Measured on box 2: T 0.061 ->
+    /// 0.057 s, K 22.09 -> 22.76 (c-22).
+    pub fn prefetch(&self, b: &[u8], start: usize, len: usize) -> (u64, u64, u64) {
+        let hashed = hash(b, start, len);
+        let shard = &self.shards[(hashed.0 >> (64 - SHARD_BITS)) as usize];
+        let c = shard.current.load(Ordering::Acquire);
+        let slot = (c as usize & ((1 << 56) - 1)) + (hashed.0 as usize & ((1 << (c >> 56)) - 1)) * 8;
+        // SAFETY: a prefetch is a hint; it reads nothing architecturally and never faults.
+        unsafe {
+            std::arch::x86_64::_mm_prefetch(slot as *const i8, std::arch::x86_64::_MM_HINT_T0)
+        };
+        hashed
+    }
+
         /// The id of `b[start..start + len]`, inserting it if it is new.
-    pub fn id(&self, b: &[u8], start: usize, len: usize) -> u32 {
-        let (h, lo, hi) = hash(b, start, len);
+    pub fn id(&self, b: &[u8], start: usize, len: usize, (h, lo, hi): (u64, u64, u64)) -> u32 {
         let key = (&b[start..start + len], lo, hi);
         let shard = &self.shards[(h >> (64 - SHARD_BITS)) as usize];
         let c = shard.current.load(Ordering::Acquire);
@@ -336,15 +326,15 @@ impl Intern {
         // SAFETY: `current` always holds a generation owned by the shard's writer or retired to
         // `Intern::retired`, and one is freed only by `quiesce`, after every worker has passed a chunk
         // boundary since its retirement, so not while this lookup can hold it. Reaching the slots from
-        // this one word instead of through `Slots` measured on box 2: T 0.064 -> 0.061-0.062 s (c-20a).
-        if let Ok(id) = find(unsafe { std::slice::from_raw_parts(base, 1 << (c >> 56)) }, key, h) {
+        // this one word instead of through the array's header measured on box 2: T 0.064 -> 0.061-0.062 s (c-20a).
+        let slots = unsafe { std::slice::from_raw_parts(base, 1 << (c >> 56)) };
+        if let Ok(id) = find(slots, key, h) {
             return id;
         }
         // Miss: take the lock, re-check the current generation (another worker may have inserted
         // it, or grown the table), then insert and publish.
         let mut w = shard.writer.lock().unwrap();
-        let mut last = w.generations.last().unwrap();
-        let mut pos = match last.find(key, h) {
+        let mut pos = match find(&w.slots, key, h) {
             Ok(id) => return id,
             Err(pos) => pos,
         };
@@ -352,28 +342,24 @@ impl Intern {
         // reach then keeps an empty slot, which is what ends a lock-free probe for a name it lacks: a
         // full retired generation (2 slots, both used) made such a probe spin forever, found by the
         // stress runs at SD_INTERN_SLOTS=2.
-        if (w.names + 1) * 2 > last.slots.len() {
-            w.grow(&shard.current);
-            let old = w.generations.remove(0);
-            self.retired.lock().unwrap().push((self.era.fetch_add(1, Ordering::SeqCst), old));
-            last = w.generations.last().unwrap();
-            pos = last.find(key, h).expect_err("name absent before the grow");
+        if (w.names + 1) * 2 > w.slots.len() {
+            let old = w.grow(&shard.current);
+            let era = self.era.fetch_add(1, Ordering::SeqCst);
+            self.retired.lock().unwrap().push((era, old));
+            pos = find(&w.slots, key, h).expect_err("name absent before the grow");
         }
         // New name: its id is taken under the shard lock, so ids stay dense across shards.
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        assert!(id < u32::MAX, "more than 2^32 - 1 distinct names");
         let addr = w.store(&self.arena, key.0, id).expose_provenance() as u64;
-        assert!(addr >> 48 == 0, "a record address above 48 bits");
         // Release: a reader that sees this slot (Acquire) sees the record and its block pointer.
-        let last = w.generations.last().unwrap();
-        last.slots[pos].store((h >> 32 & 0xFFFF) << 48 | addr, Ordering::Release);
+        w.slots[pos].store((h >> 32 & 0xFFFF) << 48 | addr, Ordering::Release);
         w.names += 1;
         id
     }
 }
 
 /// A set of name ids, grown on demand.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct NameSet(Vec<u64>);
 
 impl NameSet {

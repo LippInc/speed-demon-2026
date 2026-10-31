@@ -40,8 +40,13 @@ Every step from the reference to your final version, each with the live-board ru
 | 33 | re-run of step 24 (another push) | 9224ad7 · Track C (run-280a11b1a137) | 0.08 | 16 | 64.5 | KNOWN | 0.07-0.10 s, 10 runs | re-run |
 | 34 | c-17: a range cut inside a quoted field ends early instead of aborting | 6ba03de · Track C (run-0d1a65d51b10) | 0.08 | 16 | 64.8 | OURS | 0.08 s, 2 runs | kept |
 | 35 | re-run of step 34 (another push) | 8604c2c · Track C (run-c2311de2ab18) | 0.08 | 16 | 64.8 | OURS | 0.08 s, 2 runs | re-run |
-| 36 | s2 + s2b: the same program in fewer lines (8765712); README and PERF.md | 67c71f1 · Track C (run-5b8cc04ed3d8) | 0.07 | 16 | 65.5 | KNOWN | 0.07-0.08 s, 2 runs | kept |
-| 37 | re-run of step 36 (another push) | 6b8f071 · Track C (run-36d9a0094bd8) | 0.08 | 16 | 64.8 | KNOWN | 0.07-0.08 s, 2 runs | re-run |
+| 36 | s2 + s2b: the same program in fewer lines (8765712); README and PERF.md | 67c71f1 · Track C (run-5b8cc04ed3d8) | 0.07 | 16 | 65.5 | KNOWN | 0.07-0.08 s, 4 runs | kept |
+| 37 | re-run of step 36 (another push) | 6b8f071 · Track C (run-36d9a0094bd8) | 0.08 | 16 | 64.8 | KNOWN | 0.07-0.08 s, 4 runs | re-run |
+| 38 | re-run of step 36 (another push) | da6f278 · Track C (run-c60b67f889bb) | 0.08 | 16 | 65.3 | KNOWN | 0.07-0.08 s, 4 runs | re-run |
+| 39 | re-run of step 36 (another push) | c54220e · Track C (run-cc2a0b3ec2c9) | 0.08 | 16 | 64.9 | KNOWN | 0.07-0.08 s, 4 runs | re-run |
+| 40 | c-19a + c-19a3 + c-20a: pass 2 hands out chunks to free workers, owner inboxes, retired name-table generations freed at chunk boundaries, one packed word per shard; README and PERF.md (c-24) | e2c4246 · Track C (run-7971e1f1642f) | 0.06 | 18 | 66.1 | OURS | 0.06-0.07 s, 3 runs | kept |
+| 41 | re-run of step 40 (another push) | 5a559a8 · Track C (run-782829ac98a7) | 0.06 | 15 | 66.9 | OURS | 0.06-0.07 s, 3 runs | re-run |
+| 42 | re-run of step 40 (another push) | 2fd5fd7 · Track C (run-f2fa240567f9) | 0.07 | 16 | 66.4 | OURS | 0.06-0.07 s, 3 runs | re-run |
 
 Spread: the range of board T over every run of the same code; each board run is a single run. Box K below is the lower of the official and fresh-seed readings on box 2 (5 runs each), with T's min-max.
 
@@ -123,6 +128,29 @@ Each experiment's numbers are added here once the live board has measured it and
   (T 0.061-0.062 s). It attacked the pass 2 name lookups.
 - c-20b line-aligned arena records, commit 415717a: records that would straddle a cache line moved to the next line.
   Verdict FAILED, reverted: speed unchanged on the box, memory up on the fresh dataset.
+- c-23p owner-local name sets, commit ff75859: each country's name set kept by its owner, keyed by country and
+  name-hash pairs. Built to a wrong spec, so its readings are void: box K 11.75 official / 11.73 fresh
+  (T 0.120-0.126 s), M 62.5 MB, S 665. Verdict VOID.
+- c-23q owner-local name sets, commit 835b27e: one set entry per name with the country marks packed into it, instead
+  of one bitset per country. Box K 20.27 official / 20.33 fresh (T 0.058 s), M 24.1 MB, S 715. Verdict DROP.
+- c-23r slot prefetch from the parse, commit 1a6b8bc: the parse's prefetch hook hashed the name and the lookup hashed
+  it again. Box K 22.60 official / 22.52 fresh (T 0.058-0.059 s), M 15.0 MB, S 650. Verdict SUPERSEDED by c-22, which
+  hands the hash to the lookup instead of computing it twice.
+- c-22 slot prefetch in the parse, commit de1a7fb: the parse calls a hook as soon as a record's name is parsed; it
+  hashes the name and prefetches its slot, and the lookup runs once the rest of the record is parsed, so the slot's
+  cache miss overlaps that work. Box K 22.76 official / 22.96 fresh (T 0.057 s), M 15.2 MB, S 657, against the base
+  7a0c756's 22.14 / 22.09 (T 0.061-0.062 s, M 15.1 MB). Verdict KEEP. The structural parse it replaced as this step's
+  plan was not built: its unfinished version gave a wrong full-data hash on the box.
+- c-25 structural parse, commit c74cefd: each 64-byte block classified once into quote, comma and LF masks with the
+  quote parity carried as a prefix XOR, fields walked by bit position; the per-field AVX2 search went. Box K 22.23
+  official / 22.17 fresh (T 0.059 s), M 15.0 MB, S 712, against the base 6f01659's 22.93 / 22.85 (T 0.056-0.057 s,
+  S 657): T 2-3 ms slower, S up. Verdict FAILED, reverted (52c0cf1).
+- c-26 S cut, commit a13436c: the same program in fewer code lines (S 657 -> 582, rustfmt defaults): names.rs
+  277 -> 241, pass2.rs 123 -> 97, records.rs 123 -> 118, regions.rs 52 -> 49, main.rs 74 -> 70, Dockerfile 8 -> 7.
+  The slot array lost its wrapper struct and one-element generation list, the worker body became a closure outside
+  the thread scope, a slot starts with min and max at the extremes (no first-amount branch), unreachable asserts and
+  an always-true hook result went. Box K 23.70 official / 23.68 fresh (T 0.054-0.055 s), M 15.0 MB, against c-22 tip
+  6f01659's 22.93 / 22.85. Verdict KEEP.
 
 ## Decisions
 
@@ -139,4 +167,4 @@ Each experiment's numbers are added here once the live board has measured it and
   with the record count), a prefetch ring for the lookups (c-8: no gain on the box), bitsets set by atomic OR from any
   worker (cache lines bounce between cores), and counting by hash alone (not exact).
 
-Final result: box K 21.95 on 7cb92a6 (the code of this tip); best board run so far: step 36, run-5b8cc04ed3d8, 65.5 points.
+Final result: box K 23.68 on a13436c (official 23.70, fresh 23.68; T 0.055 s, M 15.0 MB, S 582); best board run so far: step 41, run-782829ac98a7, 66.9 points.
