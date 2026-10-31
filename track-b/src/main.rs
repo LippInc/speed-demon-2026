@@ -381,13 +381,12 @@ const OP_AND: u32 = 0;
 const OP_OR: u32 = 1;
 const OP_NOT: u32 = 2;
 const OP_KEEP: u32 = 3; // pads a trigger's code to 3 words: r is left as it is
-const MULTI: u32 = 1 << 31; // Trigger::query flag: the query has several triggers, so one window can reach it twice
 
 /// One query listed under one of its trigger terms, with its code inline so a window's folds read the
 /// trigger list front to back instead of jumping to each query.
 #[derive(Clone, Copy, Default)]
 struct Trigger {
-    query: u32, // accumulator slot, | MULTI
+    query: u32, // accumulator slot
     code: Code,
 }
 
@@ -431,18 +430,18 @@ impl BoolPlan {
             let cover = cover(q, df);
             let mut code = *q;
             code[1..3].iter_mut().filter(|w| **w == NIL).for_each(|w| *w = OP_KEEP << OP_SHIFT | q[0]);
-            let trig = Trigger { query: qi as u32 | (cover.len() > 1) as u32 * MULTI, code };
+            let trig = Trigger { query: qi as u32, code };
             triggers.extend(cover.iter().map(|&t| (t, trig)));
         }
         let (trigger_start, mut triggers) = by_term(n_terms, &triggers);
         // Every query has a trigger, so every query gets a slot.
         let (mut slot, mut n_slots) = (vec![NIL; queries.len()], 0);
         for trig in &mut triggers {
-            let q = (trig.query & !MULTI) as usize;
+            let q = trig.query as usize;
             if slot[q] == NIL {
                 (slot[q], n_slots) = (n_slots, n_slots + 1);
             }
-            trig.query = slot[q] | trig.query & MULTI;
+            trig.query = slot[q];
         }
         let ids = FirstIds::new(queries.len());
         BoolPlan { trigger_start, triggers, slot, ids }
@@ -496,14 +495,14 @@ impl Window {
         let (base, stamp) = (self.base, self.base / 64 + 1);
         for &(_, from, to) in &self.touched {
             for trig in &plan.triggers[from as usize..to as usize] {
-                let q = (trig.query & !MULTI) as usize;
-                if trig.query & MULTI != 0 {
-                    if acc[q].done == stamp {
-                        continue;
-                    }
-                    acc[q].done = stamp;
-                }
-                let r = fold_window(&trig.code, &self.words);
+                // A query listed under several touched terms is reached once per term and counts once: every
+                // query is stamped and a repeat's result masked to zero, with no branch on a MULTI flag or the stamp
+                // (b-35: those were 8.9 M of the flush's mispredicts, cachegrind, 1 worker, seed 1). A query
+                // listed under one term is reached once per window, so its stamp never matches early.
+                let q = trig.query as usize;
+                let repeat = acc[q].done == stamp;
+                acc[q].done = stamp;
+                let r = fold_window(&trig.code, &self.words) & (repeat as u64).wrapping_sub(1);
                 if r == 0 {
                     continue;
                 }
@@ -526,7 +525,7 @@ impl Window {
     }
 }
 
-/// Per worker and BOOL query slot: the evaluation stamp (read only for MULTI queries) and the running count and sum.
+/// Per worker and BOOL query slot: the evaluation stamp and the running count and sum.
 #[derive(Clone, Copy, Default)]
 struct BoolAcc {
     done: u32, // last window index + 1 this query was folded for

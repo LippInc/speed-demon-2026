@@ -31,6 +31,14 @@ Every step from the reference to your final version, each with the live-board ru
 | 24 | push 83d39fc6cbd2, scored ok | 83d39fc · Track B (run-d3665ae71770) | 0.38 | 33 | 64.0 |
 | 25 | push e71baea09250, scored ok | e71baea · Track B (run-243ba550bb65) | 0.39 | 33 | 63.9 |
 | 26 | push c32fd6a3502d, scored ok | c32fd6a · Track B (run-458067610cc9) | 0.38 | 33 | 64.0 |
+| 27 | b-21 again: a C push re-ran the same B folder (kit 92d0a12) | 2979028 · Track B (run-721cdfcab188) | 0.39 | 33 | 63.9 |
+| 28 | b-27: b-24's S trim with b-21's static C runtime (kit 6f66339) | 0c42543 · Track B (run-25fdad391ad8) | 0.39 | 28 | 64.8 |
+| 29 | b-28: every BOOL query folded per 64-document window (kit 8fed7f2) | b581408 · Track B (run-0e68675834d6) | 0.38 | 34 | 65.2 |
+| 30 | b-28 again: a D push re-ran the same B folder (kit 8fed7f2) | e2b846c · Track B (run-4e5ca7d3ed9a) | 0.38 | 34 | 65.2 |
+| 31 | b-30: trigger ranges carried in the touched list (kit 232155c) | 5d16aa8 · Track B (run-66a6690ad61e) | 0.38 | 35 | 65.3 |
+| 32 | b-30 again: a D push re-ran the same B folder (kit 232155c) | dc1cab8 · Track B (run-0edc17d32962) | 0.38 | 34 | 65.4 |
+| 33 | b-31c: AVX2 tokenizer, word-wide hash, 32-byte compare (kit ecb8f26) | 5c78ab8 · Track B (run-afd9ddaba664) | 0.33 | 35 | 66.6 |
+| 34 | b-33a: the fold in two fixed steps, then a loop over terms 4 to 6 only (kit 9a562a6) | 59a4bfa · Track B (run-40a2f3fa1b0a) | 0.31 | 34 | 67.1 |
 
 What each push carried (the board re-runs the same code on every push):
 
@@ -49,6 +57,12 @@ What each push carried (the board re-runs the same code on every push):
 - **Steps 18-19: experiment b-11.** The serial prologue and epilogue are cut: lines are deduplicated in FNV tables that grow, the df sample is spread over the workers, the term table is renumbered in place, the two plans are built in parallel, and the output uses a small decimal writer with an exit right after the write.
 - **Steps 20-25: experiment b-13**, the S trim: one term table for interning and the probe, plus the removal of a duplicate enum and a debug counter.
 - **Step 26: experiment b-21**, the C runtime linked statically (`+crt-static` in the Dockerfile's RUSTFLAGS), so no dynamic loader runs before main, built by a spec-driven builder. On b-13's code the box read K 19.22 and 19.20 (the lower of each reading), above every b-13 reading (19.14-19.18), at T 0.376-0.377 s; its board run read K 19.09.
+- **Step 27: b-21 again.** A track C push re-ran the same B folder.
+- **Step 28: experiment b-27**, b-24's S trim (S 827 to 595) with b-21's static C runtime.
+- **Steps 29-30: experiment b-28**, every BOOL query folded per 64-document window from per-term window words; step 30 is a track D push re-running the same B folder.
+- **Steps 31-32: experiment b-30**, each term's trigger range read at the hit that first sets its window word; step 32 is a track D push re-running the same B folder.
+- **Step 33: experiment b-31c**, the tokenizer classifying 32 bytes at a time with AVX2, the token hashed as four 64-bit words, and one 32-byte compare per hash match.
+- **Step 34: experiment b-33a**, the fold in two fixed steps (codes of 1 or 2 terms padded with a step that keeps the result), then a loop over terms 4 to 6 only.
 
 Experiments measured only on the bench box (sd-bench/B), with no board run:
 
@@ -100,6 +114,18 @@ Experiments measured only on the bench box (sd-bench/B), with no board run:
   - Grouping each term's triggers by code length was tried first on the VM only. The flush's mispredicts moved from 41.5 M to 41.1 M, since most terms trigger one or two queries, so the runs are too short to train the exit.
   - b-33b, failed (reverted): 8-byte accumulators (count, low 32 bits of the sum), with the high 32 bits and the MULTI stamp in arrays of their own: `K 22.06 (lower: fresh) | official K 22.09 T 0.306s (0.305-0.307) | fresh K 22.06 T 0.307s (0.306-0.308) | M 31.9MB S 649 L | sha 5/5+5/5 OK`. T was level at S +12. The flush's D1 misses rose from 68.5 M to 73.0 M.
   - Second reading on the docs commit: `K 22.12 (lower: fresh) | official K 22.13 T 0.307s (0.306-0.308) | fresh K 22.12 T 0.307s (0.306-0.309) | M 33.2MB S 637 L | sha 5/5+5/5 OK` (6cf0987).
+
+- **b-34**, 4-byte term-table slots (hash tag | term id, the id width from the query file's term count), on b-33a. All parts read level or worse in K and were reverted.
+  - b-34a, failed (reverted): a second, 4-byte table for the pass beside the 8-byte parse table: `K 22.09 (lower: fresh) | official K 22.11 T 0.302s (0.301-0.303) | fresh K 22.09 T 0.302s (0.302-0.305) | M 32.6MB S 676 L | sha 5/5+5/5 OK`. 5 ms faster, but S +39.
+  - b-34b, failed (reverted): one 4-byte table for the parse and the pass (ids take 30 bits while parsing, then the width the term count needs): `K 22.07 (lower: fresh) | official K 22.16 T 0.304s (0.304-0.307) | fresh K 22.07 T 0.307s (0.305-0.307) | M 32.6MB S 650 L | sha 5/5+5/5 OK`.
+  - b-34c, failed (reverted together with b-34b): the 4-byte table at load 1/3, the 1 MB that 8-byte slots took: `K 22.10 (lower: fresh) | official K 22.16 T 0.304s (0.304-0.305) | fresh K 22.10 T 0.306s (0.304-0.307) | M 33.1MB S 650 L | sha 5/5+5/5 OK`. `find`'s mispredicts fell from 19.0 M to 13.6 M (cachegrind, 1 worker, seed 1), and T fell 1-3 ms, which the 13 lines of S cancel in K.
+  - Docs commit on b-33a's code: `K 22.11 (lower: fresh) | official K 22.15 T 0.306s (0.306-0.308) | fresh K 22.11 T 0.308s (0.307-0.308) | M 33.2MB S 637 L | sha 5/5+5/5 OK` (ddccd60).
+
+- **b-35**, the flush's three branch sources, on b-33a (e7c8ef8).
+  - b-35a, every query stamped per window and a repeat's fold masked to zero, so the MULTI flag and its two branches go: `K 22.30 (lower: official) | official K 22.30 T 0.303s | fresh K 22.32 T 0.302s | M 33.0MB S 632 L | sha 5/5+5/5 OK`. The flush's mispredicts fell from 32.9 M to 29.1 M, with D1 misses up from 68.5 M to 72.1 M. Kept, final code.
+  - b-35b, failed (reverted): count and sum added with no `r == 0` branch, and first ids offered only while the worker holds fewer than ten of its own matches: `K 22.15 (lower: fresh) | official K 22.15 T 0.307s (0.305-0.310) | fresh K 22.15 T 0.307s (0.306-0.308) | M 33.3MB S 633 L | sha 5/5+5/5 OK`. Cachegrind read it better (flush mispredicts 23.3 M, D1 65.1 M); the box read it 4-5 ms slower.
+  - b-35c, failed (reverted): one flat loop over every touched term's triggers, stepping ranges with selects: `K 22.17 (lower: fresh) | official K 22.18 T 0.304s (0.303-0.304) | fresh K 22.17 T 0.304s (0.304-0.308) | M 33.2MB S 648 L | sha 5/5+5/5 OK`. Flush mispredicts 17.8 M in cachegrind; the box read it 1-2 ms slower, at S +16.
+  - Docs commit on b-35a's code: `K 22.30 (lower: fresh) | official K 22.34 T 0.302s (0.301-0.302) | fresh K 22.30 T 0.303s (0.302-0.306) | M 33.1MB S 632 L | sha 5/5+5/5 OK` (302e6d9).
 
 Experiments measured only on the build VM and not kept:
 
