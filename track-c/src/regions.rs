@@ -1,8 +1,6 @@
 //! regions.csv: `region_id,country` lines, LF-terminated, ids unique and ascending, country `[A-Z]{3}`
 //! (c-join.md:58-59). Parsed into a dense table region id -> group index; group 0 is `_UNMATCHED`.
 
-use crate::records::uint_until;
-
 /// Region id -> group index. One byte per region while the file names at most 255 countries,
 /// two bytes beyond that.
 pub enum RegionTable {
@@ -12,14 +10,17 @@ pub enum RegionTable {
 
 pub trait Lookup {
     /// Group of a record's region id; ids the table does not hold (holes, or above its range) are group 0.
-    fn group(&self, region_id: usize) -> usize;
+    fn group(&self, region_id: u64) -> usize;
 }
 
-/// The u8 and u16 tables share one impl: a group index fits either element type, and `get` is
-/// None past the table's end, which is the group-0 default.
+/// The u8 and u16 tables share one impl: a group index fits either element type. The table's last
+/// entry (one past the largest region id) is group 0, and every id above the range is clamped to it:
+/// a `min` (one cmov) instead of a bounds check and its branch.
 impl<T: Copy + Into<usize>> Lookup for Vec<T> {
-    fn group(&self, region_id: usize) -> usize {
-        self.get(region_id).map_or(0, |&g| g.into())
+    #[inline(always)]
+    fn group(&self, region_id: u64) -> usize {
+        // SAFETY: the table is never empty (`parse` sizes it largest id + 2), so the clamp is in bounds.
+        unsafe { (*self.get_unchecked((region_id as usize).min(self.len() - 1))).into() }
     }
 }
 
@@ -31,8 +32,9 @@ pub struct Regions {
 
 /// `region_id,country` -> (region id, country code bytes).
 fn split(line: &[u8]) -> (usize, &[u8]) {
-    let (id, country) = uint_until(line, 0, b',');
-    (id as usize, &line[country..])
+    let comma = line.iter().position(|&c| c == b',').expect("regions.csv: no comma");
+    let id = line[..comma].iter().fold(0, |n, &d| n * 10 + (d - b'0') as usize);
+    (id, &line[comma + 1..])
 }
 
 pub fn parse(bytes: &[u8]) -> Regions {
@@ -44,7 +46,8 @@ pub fn parse(bytes: &[u8]) -> Regions {
     // Country code [A-Z]{3} (c-join.md:59) -> group index, through a dense 26^3 table.
     let mut code_group = vec![0u16; 26 * 26 * 26];
     let mut keys: Vec<Vec<u8>> = vec![b"_UNMATCHED".to_vec()];
-    let mut table = RegionTable::Narrow(vec![0u8; max_id + 1]);
+    // Ids 0..=max_id, plus the group-0 entry every larger id is clamped to (`Lookup::group`).
+    let mut table = RegionTable::Narrow(vec![0u8; max_id + 2]);
     for line in lines().skip(1) { // skip the header `region_id,country`
         let (id, code) = split(line);
         let valid = code.len() == 3 && code.iter().all(u8::is_ascii_uppercase);

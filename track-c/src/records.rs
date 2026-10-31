@@ -1,9 +1,21 @@
-//! records.csv: the grammar of c-join.md:17-30, parsed one byte range per worker. Each record folds
-//! into the worker's own per-group slot, and its name is handed to the caller (pass2.rs).
+//! records.csv: the grammar of c-join.md:17-30, parsed one chunk per call over the padded mapping
+//! (main.rs `map_padded`). Each record folds into the worker's own per-group slot.
+//!
+//! Every load here is unchecked: the mapping is followed by GUARD bytes repeating `"` `,` LF, so a
+//! quote or comma search started anywhere up to the guard's middle stops inside it, and a digit run
+//! stops at its first `"`. A record that would run past the end of the file (only a garbage record,
+//! from a cut inside a quoted field) is caught once per record, by its end position, never per byte.
+
+use std::arch::x86_64::*;
 
 use crate::regions::Lookup;
 
 pub(crate) const BOM: &[u8] = b"\xEF\xBB\xBF";
+
+/// Guard bytes after the file's last byte (`"` `,` LF repeated). A record's six searches each start at
+/// most 3 bytes past the previous one's stop, so from the end of the file they stay within 24 bytes;
+/// 96 leaves every 32-byte search a hit, and the reservation behind it (4 KiB) covers every load.
+pub const GUARD: usize = 96;
 
 /// One worker's running aggregates of one output line (c-join.md:109-118), names_distinct aside.
 #[derive(Default, Clone)]
@@ -36,16 +48,23 @@ impl Slot {
     }
 }
 
-/// Index of the first `c` at or after `i`. Compares 32 bytes a step (AVX2 compare, movemask, trailing
-/// zeros) instead of one byte a step; the last 31 bytes of the mapping go byte by byte, so nothing is
-/// read past its end. Measured (this VM, 12 workers, full seed 1, interleaved medians): pass2+names
-/// 294 -> 244 ms (c-10).
-fn find(b: &[u8], mut i: usize, c: u8) -> usize {
-    while i + 32 <= b.len() {
-        use std::arch::x86_64::*;
-        // SAFETY: the 32 bytes at i lie inside `b`; AVX2 is on at compile time (x86-64-v3).
+/// An unaligned little-endian load of `T` at `p + i`.
+///
+/// # Safety
+/// `p + i .. p + i + size_of::<T>()` must lie inside the padded mapping.
+#[inline(always)]
+pub(crate) unsafe fn load<T>(p: *const u8, i: usize) -> T {
+    unsafe { std::ptr::read_unaligned(p.add(i) as *const T) }
+}
+
+/// Index of the first `c` at or after `i`: 32 bytes per step (AVX2 compare, movemask, trailing zeros).
+/// Names and notes nearly always fit one step (c-join.md 2.2), so this is one load and one branch.
+#[inline(always)]
+unsafe fn find(p: *const u8, mut i: usize, c: u8) -> usize {
+    loop {
+        // SAFETY (caller's): a `c` (quote or comma, both in the guard) lies before the reservation's end.
         let m = unsafe {
-            let block = _mm256_loadu_si256(b.as_ptr().add(i) as *const __m256i);
+            let block = _mm256_loadu_si256(p.add(i) as *const __m256i);
             _mm256_movemask_epi8(_mm256_cmpeq_epi8(block, _mm256_set1_epi8(c as i8))) as u32
         };
         if m != 0 {
@@ -53,117 +72,186 @@ fn find(b: &[u8], mut i: usize, c: u8) -> usize {
         }
         i += 32;
     }
-    // Not found (only in a range cut inside a quoted field): the end of the mapping.
-    let found = b.get(i..).and_then(|r| r.iter().position(|&x| x == c));
-    found.map_or(b.len(), |p| i + p)
 }
 
-/// One text field (name or note) starting at `i`, which is followed by a comma.
-/// Returns where the raw bytes between the quotes start and how many there are (escapes kept),
-/// the value's length once `""` is unescaped, and the index just past the comma.
-fn text_field(b: &[u8], i: usize) -> (usize, usize, u64, usize) {
-    if b.get(i) != Some(&b'"') {
-        // Unquoted: everything up to the comma (c-join.md:28).
-        let end = find(b, i, b',');
-        return (i, end - i, (end - i) as u64, end + 1);
-    }
-    // Quoted: ends at the first `"` not part of a `""` pair (c-join.md:33). Commas, LF and BOM
-    // bytes inside are data, so they never stop the scan.
-    let (start, mut j) = (i + 1, i + 1);
-    let mut escapes = 0u64;
-    loop {
-        let q = find(b, j, b'"');
-        if b.get(q + 1) != Some(&b'"') {
-            return (start, q - start, (q - start) as u64 - escapes, q + 2);
+/// One text field (name or note) at `i`: where its raw bytes start (after the opening quote, escapes
+/// kept), how many there are, the value's length once `""` is unescaped, and the index past its comma.
+#[inline(always)]
+unsafe fn text(p: *const u8, i: usize) -> (usize, usize, u64, usize) {
+    unsafe {
+        if *p.add(i) != b'"' {
+            // Unquoted: everything up to the comma (c-join.md:28); about 1 % of names, 3 % of notes.
+            let end = find(p, i, b',');
+            return (i, end - i, (end - i) as u64, end + 1);
         }
-        escapes += 1;
-        j = q + 2;
+        // Quoted: ends at the first `"` not part of a `""` pair (c-join.md:33). Commas, LF and BOM
+        // bytes inside are data. The loop runs again only on an escape.
+        let start = i + 1;
+        let mut q = find(p, start, b'"');
+        let mut escapes = 0;
+        while *p.add(q + 1) == b'"' {
+            escapes += 1;
+            q = find(p, q + 2, b'"');
+        }
+        (start, q - start, (q - start - escapes) as u64, q + 2)
     }
 }
 
-/// An unsigned decimal ending at `stop`; returns it and the index just past `stop`.
-pub(crate) fn uint_until(b: &[u8], mut i: usize, stop: u8) -> (u64, usize) {
+/// The 8 bytes at `i` with each digit turned into its value, and the number of digits they start with
+/// (8 when all are digits): a byte is a digit iff, XORed with `0`, it is 0..=9 (no high bit, none
+/// after adding 0x76).
+#[inline(always)]
+unsafe fn digits(p: *const u8, i: usize) -> (u64, u32) {
+    let x = unsafe { load::<u64>(p, i) } ^ 0x3030_3030_3030_3030;
+    (x, ((x.wrapping_add(0x7676_7676_7676_7676) | x) & 0x8080_8080_8080_8080).trailing_zeros() / 8)
+}
+
+/// Folds the `len` (0 to 8) digit values at the bottom of `x` into their number. The digits move
+/// to the top bytes (two shifts, so `len` 0 gives 0 instead of an over-wide shift) and the zeros
+/// below read as leading zeros; then SSE multiply-adds pair them up: digit pairs (x10 + 1), pairs of
+/// those (x100 + 1), then the two 4-digit halves (x10000 + 1). Six vector instructions where the
+/// scalar fold (three multiplies, shifts and masks) took about 13 and three 64-bit constants.
+#[inline(always)]
+fn fold(x: u64, len: u32) -> u64 {
+    // SAFETY: SSE4.1 and SSSE3 are on at compile time (x86-64-v3).
+    unsafe {
+        let v = _mm_cvtsi64_si128(((x << 1) << (63 - 8 * len)) as i64);
+        let v = _mm_maddubs_epi16(v, _mm_set1_epi16(0x010A)); // bytes 10, 1 per digit pair
+        let v = _mm_madd_epi16(v, _mm_set1_epi32(0x0001_0064)); // 100, 1 per pair of pairs
+        let v = _mm_madd_epi16(_mm_packus_epi32(v, v), _mm_set1_epi32(0x0001_2710)); // 10000, 1
+        _mm_cvtsi128_si32(v) as u32 as u64
+    }
+}
+
+/// An unsigned decimal at `i` ending at `stop`; returns it and the index past `stop`. One load
+/// parses up to 7 digits and their `stop` (id and region id always fit: c-join.md 2.2); anything
+/// else goes to `slow`, off the hot path. The stop byte is read from the loaded word: shifted out
+/// of range (8 digits) the word's first digit is never a stop byte.
+#[inline(always)]
+unsafe fn uint(p: *const u8, i: usize, stop: u8, slow: unsafe fn(*const u8, usize) -> (u64, usize)) -> (u64, usize) {
+    let (x, len) = unsafe { digits(p, i) };
+    if x.wrapping_shr(8 * len) as u8 == stop ^ b'0' {
+        return (fold(x, len), i + len as usize + 1);
+    }
+    unsafe { slow(p, i) }
+}
+
+/// `uint`'s slow path: digits one by one up to the first non-digit, which the caller's grammar
+/// makes the stop byte (a garbage record may end elsewhere; its end check catches it).
+#[cold]
+#[inline(never)]
+unsafe fn uint_long(p: *const u8, mut i: usize) -> (u64, usize) {
     let mut n = 0u64;
-    while let Some(&d) = b.get(i).filter(|&&d| d != stop) {
-        n = n * 10 + (d - b'0') as u64;
+    // SAFETY: a digit run ends at the guard's `"` at the latest.
+    while let d @ b'0'..=b'9' = unsafe { *p.add(i) } {
+        n = n.wrapping_mul(10).wrapping_add((d - b'0') as u64);
         i += 1;
     }
     (n, i + 1)
 }
 
-/// Parses the records that start in `*i..end` (`*i` is a record start; the last record may run past
-/// `end`) into `slots`, indexed by the lookup's group. For each record's raw name it calls
-/// `on_name_start(raw_start, raw_len)` as soon as the name is parsed, then `on_name(group, raw_start,
-/// raw_len, started)` with that call's result once the record is done. Leaves `*i` at the next record
-/// start.
-pub fn parse_range<L: Lookup, P>(
+/// The id's slow path, which is also where a BOM before a record lands (its first byte is no digit):
+/// a BOM directly after a terminator is skipped (c-join.md:36). Moving the BOM test here took it off
+/// every record: 777 BOMs in 3.32M records (c-join.md:200).
+#[cold]
+#[inline(never)]
+unsafe fn id_long(p: *const u8, i: usize) -> (u64, usize) {
+    let bom = unsafe { load::<u32>(p, i) } & 0xFF_FFFF == 0xBF_BBEF;
+    unsafe { uint_long(p, i + 3 * bom as usize) }
+}
+
+/// An amount `-?[0-9]+\.[0-9]{2}` at `i` as integer cents (c-join.md:24, 37); returns it and the index
+/// past it. Up to 5 whole digits (the generator's range, c-join.md 2.2) one load holds the whole
+/// part, the point and both fraction digits: by the grammar the first non-digit is the point, whose
+/// byte is cut out (the bytes above it shifted down one) so the rest folds as one number. 6 or more
+/// whole digits take the cold path.
+#[inline(always)]
+unsafe fn amount(p: *const u8, i: usize) -> (i64, usize) {
+    let negative = unsafe { *p.add(i) } == b'-';
+    let at = i + negative as usize;
+    let (x, len) = unsafe { digits(p, at) };
+    let (cents, next) = if len <= 5 {
+        let below = unsafe { _bzhi_u64(!0, 8 * len) };
+        (fold(x & below | (x >> 8) & !below, len + 2), at + len as usize + 3)
+    } else {
+        unsafe { amount_long(p, at) }
+    };
+    // The sign without a branch: two's complement negation when `negative` is 1.
+    let n = negative as i64;
+    ((cents as i64 ^ -n) + n, next)
+}
+
+/// `amount`'s slow path: the whole part digit by digit, then the two fraction digits.
+#[cold]
+#[inline(never)]
+unsafe fn amount_long(p: *const u8, at: usize) -> (u64, usize) {
+    let (whole, next) = unsafe { uint_long(p, at) };
+    let frac = unsafe { load::<u16>(p, next) }.wrapping_sub(0x3030);
+    (whole.wrapping_mul(100) + (frac & 0xFF) as u64 * 10 + (frac >> 8) as u64, next + 2)
+}
+
+/// Parses the records that start in `i..end` (`i` is a record start, the last record may run past
+/// `end`) of the file `b[..len]` into `slots`. Each record's raw name goes to `on_name(start, raw
+/// length)` as soon as it is parsed (to start its lookup), and that call's result to
+/// `on_record(group, it)` once the record is done. Returns where it stopped: the next record start,
+/// or `usize::MAX` when a record ran past the end of the file (garbage from a wrong cut, so the
+/// caller's end check fails and main reruns on one worker). Both hooks are closures inlined here.
+pub fn parse_chunk<L: Lookup, K>(
     b: &[u8],
-    i: &mut usize,
+    len: usize,
+    mut i: usize,
     end: usize,
     lookup: &L,
     slots: &mut [Slot],
-    mut on_name_start: impl FnMut(usize, usize) -> P,
-    mut on_name: impl FnMut(usize, usize, usize, P),
-) {
-    while *i < end {
-        // A BOM directly after a terminator is skipped (c-join.md:36).
-        let at = if b[*i..].starts_with(BOM) { *i + 3 } else { *i };
-        let (id, next) = uint_until(b, at, b',');
-        let (name_start, name_raw_len, name_len, next) = text_field(b, next);
-        // Started as soon as the name is known, so its lookup can begin while the rest is parsed. A
-        // garbage record's name span may not lie inside the mapping (the record is dropped below):
-        // the hook then sees an empty span at its end.
-        let inside = b.get(name_start..).is_some_and(|r| name_raw_len <= r.len());
-        let (span_start, span_len) = if inside { (name_start, name_raw_len) } else { (b.len(), 0) };
-        let started = on_name_start(span_start, span_len);
-        let (_, _, note_len, next) = text_field(b, next);
-        let (region_id, next) = uint_until(b, next, b',');
-        // `-?[0-9]+\.[0-9]{2}` as integer cents (c-join.md:24, 37).
-        let negative = b.get(next) == Some(&b'-');
-        let (whole, next) = uint_until(b, next + negative as usize, b'.');
-        let digits = b.get(next..next + 2);
-        let frac = digits.map_or(0, |d| (d[0] - b'0') * 10 + (d[1] - b'0'));
-        let cents = whole as i64 * 100 + frac as i64;
-        let (cents, next) = (if negative { -cents } else { cents }, next + 2);
-        // Terminator: CRLF or LF (c-join.md:21), skipped without a branch: one byte, plus one for a CR.
-        // At the end of a file without a final terminator this is one past the end, which ends the
-        // range all the same. Measured (this VM, 12 workers, full seed 1, interleaved medians of 9):
-        // pass2+names 259 -> 255 ms (c-10), inside the noise; it is kept for being four lines shorter.
-        *i = next + 1 + (b.get(next) == Some(&b'\r')) as usize;
-        // A record that ran past the end of the file is garbage from a range cut inside a quoted
-        // field (c-join.md 2.1 allows LF + digit there): it is dropped and `*i` is past `end`, so
-        // pass 2's exact check fails and main reruns the file on one worker. Every read above is
-        // bounds-checked for this case, so such a range ends here instead of aborting.
-        if next > b.len() {
-            break;
-        }
+    mut on_name: impl FnMut(usize, usize) -> K,
+    mut on_record: impl FnMut(usize, K),
+) -> usize {
+    assert!(b.len() >= len + GUARD && end <= len);
+    let p = b.as_ptr();
+    // SAFETY: every load starts at most a few bytes past the guard's start (see GUARD) or inside the file.
+    unsafe {
+        while i < end {
+            let (id, next) = uint(p, i, b',', id_long);
+            let (name_start, name_raw, name_len, next) = text(p, next);
+            let name = on_name(name_start, name_raw);
+            let (_, _, note_len, next) = text(p, next);
+            let (region, next) = uint(p, next, b',', uint_long);
+            let (cents, after) = amount(p, next);
+            // Checked by builds with debug assertions (the guard plant): no scan stopped past the guard's middle.
+            debug_assert!(after <= len + GUARD / 2, "a scan left the guard");
+            // A record past the end of the file is garbage (see the module comment): stop here.
+            if after > len {
+                return usize::MAX;
+            }
+            // Terminator: CRLF or LF (c-join.md:21), one byte plus one for a CR, no branch.
+            i = after + 1 + (*p.add(after) == b'\r') as usize;
 
-        let group = lookup.group(region_id as usize);
-        let s = &mut slots[group];
-        s.count += 1;
-        s.id_sum += id;
-        s.amount_sum += cents;
-        s.amount_min = s.amount_min.min(cents);
-        s.amount_max = s.amount_max.max(cents);
-        s.name_bytes += name_len;
-        s.note_bytes += note_len;
-        on_name(group, name_start, name_raw_len, started);
+            let group = lookup.group(region);
+            let s = slots.get_unchecked_mut(group);
+            s.count += 1;
+            s.id_sum += id;
+            s.amount_sum += cents;
+            s.amount_min = s.amount_min.min(cents);
+            s.amount_max = s.amount_max.max(cents);
+            s.name_bytes += name_len;
+            s.note_bytes += note_len;
+            on_record(group, name);
+        }
     }
+    // A last record without a terminator ends at the file's end (c-join.md:21): its terminator skip
+    // above stepped one past it.
+    i.min(len)
 }
 
 /// The first record start at or after `from` (`from` itself excluded unless it follows an LF), or the
-/// end of the file: where a chunk of pass 2 begins (and its predecessor ends).
+/// end of the file: where a chunk begins (and its predecessor ends).
 ///
 /// e1: by the grammar (c-join.md:17-36) a record opens with a digit (the id) or a BOM right after
 /// its terminator (CRLF or LF, both ending in LF). The generator's files (c-join.md 2.2) never hold
 /// an LF followed by a digit or BOM inside a quoted field (names hold no LF at all, notes are
-/// lowercase words), so LF + digit/BOM marks a record start and each start is one short search from
-/// the chunk's offset instead of pass 1's full quote-parity scan of every byte. The grammar alone
-/// (2.1) allows one inside quotes; then the cut is wrong, the previous chunk does not stop exactly
-/// on it, and main reruns the whole file on one worker, so a wrong cut can never change the answer
-/// (parse_range drops a garbage record that runs past the end of the file instead of aborting).
-/// Measured (this VM, full data, 12 workers, interleaved medians of 11, warm page cache): pass1 7.3
-/// -> 0.1 ms, total 112.6 -> 109.4 ms.
+/// lowercase words), so LF + digit/BOM marks a record start. The grammar alone (2.1) allows one
+/// inside quotes; then the cut is wrong, the previous chunk (whose start is right) does not stop
+/// exactly on it, and main reruns the whole file on one worker, so a wrong cut never changes the answer.
 pub fn record_start(b: &[u8], from: usize) -> usize {
     (from.max(1)..b.len())
         .find(|&p| b[p - 1] == b'\n' && (b[p].is_ascii_digit() || b[p..].starts_with(BOM)))
