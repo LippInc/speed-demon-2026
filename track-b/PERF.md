@@ -60,6 +60,7 @@ How to read this, in plain words:
 | 45 | b-38a + b-38b, re-run (same code) | 2fd5fd7 · Track B (run-530519d7e31b) | 0.29 | 35 | 67.7 | OURS | 0.279-0.284 s | kept |
 | 46 | b-38a + b-38b, re-run (same code) | 63c975d · Track B (run-52cb41ba0444) | 0.30 | 36 | 67.7 | OURS | 0.279-0.284 s | kept |
 | 47 | b-55 + b-56 + b-59 + b-59r: token starts and ends as two masks, phrases checked at their anchor's byte offsets, one tokenizer loop, the phrase-check clamp for a docs line with no TAB (kit 0720fc9) | c8760d4 · Track B (run-11f0e517f808) | 0.28 | 34 | 68.2 | OURS | 0.267-0.269 s | kept |
+| 48 | b-68: BOOL queries per 1,024-document chunk, rows for the common terms and a radix-sorted log of the rarer terms' hits (kit 1c5da0d) | 19e5d85 · Track B (run-8137ab547262) | 0.25 | 41 | 69.0 | OURS | 0.236-0.239 s | kept |
 
 Keeps are decided on the box (5 runs on each of two seeds), because one board run of unchanged code varies by about 4 % (steps 38-46: T 0.284-0.295 s). Step 36 is the one step where the board moved the other way by more than that (0.310 → 0.345 s, then 0.32 s on a re-run); we kept it on the box's reading (0.302 → 0.295 s).
 
@@ -269,6 +270,13 @@ Experiments read on the bench box (sd-bench/B); the lifted ones also have their 
 - **b-68** (OURS), BOOL queries per 1,024-document chunk: a common term's hits set bits in its 16-word row, every other term's hits are appended to a log that is radix-sorted per chunk, and each triggered query is folded once per chunk; it replaces the 64-document window, its touched list and its flush (a129cda, on b-64).
   - Box K 24.49 official / 24.55 fresh, T 0.238 / 0.237 s, M 39.9 MB, S 753, against b-64's K 24.38 / 24.43, T 0.250 / 0.249 s. Its floor probe (e0a9f5f) put the hits and the sort at 33 / 34 ms over the scan floor, against the window's 22 / 23 ms; the chunk folds 3.64 M (query, chunk) pairs where the window folded 18.84 M (seed 1, 12 workers). Cachegrind (1 worker, seed 1): D1 misses 161.6 M → 91.5 M, instructions 8.32 G → 9.18 G. Kept.
 - **b-70** (OURS), b-67's docs merged onto b-68 and brought up to date; no code change.
+- **b-69** (OURS), the prologue: `queries.txt` cut in one AVX2 pass with no allocation per line, the term table pre-sized from the file's length, a phrase's terms in one flat list (852cc60, on b-64r 3a7af1f).
+  - Box K 24.56 official / 24.56 fresh, T 0.244 s, M 31.9 MB, S 681, against b-64r's K 24.37 / 24.39, T 0.251 / 0.250 s.
+- **b-70a**, b-70's README limit line dated (1c5da0d); no code change. Lifted as 19e5d85 (step 48).
+- **b-74** (OURS), the per-token hash: CRC32-C of the folded token's two halves XOR-ed, in place of four 64-bit multiplies, and the slot index computed once in `hold` and carried to `find` (5e223a5, on b-68).
+  - Box K 25.01 official / 25.07 fresh, T 0.229 / 0.228 s, M 39.6 MB, S 745 (two more readings of the same code: 25.00 / 25.06, 24.98 / 25.09), against b-68's K 24.47-24.51 / 24.55-24.59, T 0.238 / 0.237 s. The lookup's instructions fell 19.5 % (callgrind, one worker) while a one-worker laptop floor fell only 3.5 %. A fix round with a length-mask table read 5 ms slower and was reverted (4d8093d, 045bb14).
+- **b-76** (OURS), b-69 ported onto b-74 (238cef2), and the chunk log's dedupe now starts from the complement of the first entry instead of the sentinel, so an entry equal to the sentinel is kept: the top key at local document 1023, reachable only with over 4 million sparse terms, far outside the spec's query file (acaa379).
+  - Box K 25.19 official / 25.29 fresh, T 0.224 / 0.222 s, M 38.5 MB, S 767.
 
 ## Decisions
 
@@ -308,6 +316,9 @@ Rejected:
 - b-63 (OURS): BOOL count and id sum by inclusion-exclusion; box T 0.282 s at best (b-63a) against b-59's 0.267 s, with M 47.5 MB; not kept.
 - b-65 (OURS): an exact 48-bit key table for tokens of up to 8 bytes; the VM's scan floor rose 8-13 ms per worker on the length branch; dropped.
 - b-66 (OURS): per-512-doc rows plus doc-end stamps (design A); its hit path read 28 ms over the scan floor on the box against the window's 22-23 ms and a 25 ms KILL line; not built.
+- b-71 (OURS): the time split on the box (evaluation about 65 ms, token lookup about 60 ms, setup 32 ms) and an index-then-query probe; the probe's CPU rose 114 / 130 ms at 4 workers; killed, not built.
+- b-72 (OURS): shape-specialised BOOL folds; a callgrind gate found the code loop and operator table at 15.3 % of the evaluation's instructions and 16.4 % of its mispredicts against a 50 % go line; killed at the gate, not built.
+- b-73 (OURS): phrase checks from a ring of the last token ids instead of the bytes; exact on both seeds, but per-worker CPU on the laptop moved -1.5 to +13.9 ms over four versions against a -8 ms go line, because the ring moves work from 1.1 M anchor checks to all 36.3 M tokens; killed.
 
 Experiments measured only on the build VM and not kept:
 
@@ -315,4 +326,4 @@ Experiments measured only on the build VM and not kept:
 - **b-17** (KNOWN), tokenizing 64 bytes at a time with AVX2 class masks, lower-casing in the vector and hashing each token a word at a time. A second variant kept the byte loop and changed only the hash. Both were slower on the VM at 1, 4 and 12 workers, and both ran more instructions per docs byte (cachegrind). The byte loop's FNV multiply costs almost nothing, because it overlaps the scan. No code was committed.
 - **b-22** (KNOWN), answering AND queries of rare terms by intersecting doc lists instead of per-document triggers. It was not built, because the VM count showed too little to gain: such queries hold 0.9 % of the 10.7 M per-document evaluations at "rarer than 1 in 1,024 docs", and 3 % at 1 in 256. No code was committed.
 
-Final result (this tip, code a129cda): box K 24.49 (lower of two seeds), T 0.238 s, M 39.9 MB, S 753. The board's latest run, run-11f0e517f808 (c8760d4 · Track B), measured the code before b-64 and b-68 (5668086): T 0.279 s, M 34.4 MB, S 646, D 1, K 23.15, points 68.2, against the reference's T 56.35 s and M 2,200 MB.
+Final result (this tip, code acaa379): box K 25.19 (lower of two seeds), T 0.224 s, M 38.5 MB, S 767. The board's latest run, run-8137ab547262 (19e5d85 · Track B), measured b-68 (a129cda): T 0.249 s, M 41.4 MB, S 753, D 1, K 23.95, points 69.0, against the reference's T 56.35 s and M 2,200 MB.

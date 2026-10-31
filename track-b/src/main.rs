@@ -50,10 +50,16 @@ impl Chunk {
         }
     }
 
+    /// Bit k: byte k is `b`.
+    #[inline(always)]
+    fn eq_mask(&self, b: u8) -> u32 {
+        unsafe { _mm256_movemask_epi8(_mm256_cmpeq_epi8(self.0, _mm256_set1_epi8(b as i8))) as u32 }
+    }
+
     /// Bit k: byte k ends the doc, an LF or the end of `data` (a last line without LF ends there).
     #[inline(always)]
     fn lf(&self, data: &[u8], i: usize) -> u32 {
-        let lf = unsafe { _mm256_movemask_epi8(_mm256_cmpeq_epi8(self.0, _mm256_set1_epi8(b'\n' as i8))) as u32 };
+        let lf = self.eq_mask(b'\n');
         let past_end = data.len().saturating_sub(i);
         if past_end < 32 {
             return lf | 1 << past_end;
@@ -103,15 +109,15 @@ fn parallel<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
     })
 }
 
-/// The hash of a term zero-padded to 32 bytes: its four words multiplied by odd constants and xor-ed, high and low
-/// halves folded. A fixed amount of work per token, with no loop whose exit depends on the token's length.
-/// (b-31b) The byte loop's mispredicts fell to 13.4 M (cachegrind, 1 worker, seed 1).
+/// The hash of a term zero-padded to 32 bytes: CRC32-C (SSE4.2, part of x86-64-v3) of its two 16-byte halves xor-ed,
+/// a word at a time. A fixed amount of work per token, with no loop whose exit depends on the token's length (b-31b).
+/// The bytes decide every match, so the hash only spreads the slots. (b-74) Two `crc32` replaced four 64-bit
+/// multiplies whose constants were reloaded at every token: the lookup's instructions fell by 0.66 G, its misses
+/// and mispredicts unchanged (cachegrind, 1 worker, seed 1).
 #[inline(always)]
 fn hash32(t: &[u8; MAX_TERM]) -> u32 {
-    const K: [u64; 4] = [0x9e37_79b9_7f4a_7c15, 0xc2b2_ae3d_27d4_eb4f, 0x1656_67b1_9e37_79f9, 0x27d4_eb2f_1656_67c5];
-    let w = |k: usize| u64::from_le_bytes(t[8 * k..8 * k + 8].try_into().unwrap()).wrapping_mul(K[k]);
-    let h = w(0) ^ w(1) ^ w(2) ^ w(3);
-    (h >> 32) as u32 ^ h as u32
+    let w = |k: usize| u64::from_le_bytes(t[8 * k..8 * k + 8].try_into().unwrap());
+    unsafe { _mm_crc32_u64(_mm_crc32_u64(0, w(0) ^ w(2)), w(1) ^ w(3)) as u32 }
 }
 
 /// The query terms: interned into it while queries.txt is parsed, then probed for every token of the pass. A 4-byte
@@ -139,7 +145,7 @@ impl TermTable {
         let mut padded = [0u8; MAX_TERM];
         padded[..term.len()].copy_from_slice(term);
         let h = hash32(&padded);
-        if let Some(t) = self.find(&padded, h) {
+        if let Some(t) = self.find(&padded, h, self.slot(h)) {
             return t;
         }
         if 3 * (self.bytes.len() + 1) > self.slots.len() {
@@ -182,10 +188,10 @@ impl TermTable {
 
     /// The tag only filters; the bytes decide. Token and entry are both zero-padded to 32 bytes, so one 32-byte
     /// compare settles the bytes and the length (it replaced a memcmp call and a length test per hash match).
-    /// (b-31c) box T 0.330 → 0.318 s.
+    /// (b-31c) box T 0.330 → 0.318 s. The probe starts at slot i = `slot(h)`, which the pass already computed for
+    /// its prefetch (b-74).
     #[inline]
-    fn find(&self, token: &[u8; MAX_TERM], h: u32) -> Option<u32> {
-        let mut i = self.slot(h);
+    fn find(&self, token: &[u8; MAX_TERM], h: u32, mut i: usize) -> Option<u32> {
         loop {
             let s = self.slots[i];
             if s == 0 {
@@ -210,20 +216,21 @@ impl TermTable {
     /// Looks up the token held back by `hold`, if any, and reports it. (b-64)
     #[rustfmt::skip]
     #[inline(always)]
-    fn settle(&self, pend: &mut Option<(usize, Option<([u8; MAX_TERM], u32)>)>, f: &mut impl FnMut(usize, Option<u32>)) {
-        if let Some((s, tok)) = pend.take() { f(s, tok.and_then(|(t, h)| self.find(&t, h))); }
+    fn settle(&self, pend: &mut Option<(usize, Option<([u8; MAX_TERM], u32, usize)>)>, f: &mut impl FnMut(usize, Option<u32>)) {
+        if let Some((s, tok)) = pend.take() { f(s, tok.and_then(|(t, h, i)| self.find(&t, h, i))); }
     }
 
     /// Folds and hashes the token at from..to and prefetches its slot, then settles the token before it and holds this
     /// one back: the slot's read overlaps the previous token's probe and hit work. Box T 0.268 -> 0.251 s. (b-64)
     #[rustfmt::skip]
     #[inline(always)]
-    fn hold(&self, data: &[u8], from: usize, to: usize, pend: &mut Option<(usize, Option<([u8; MAX_TERM], u32)>)>, f: &mut impl FnMut(usize, Option<u32>)) {
+    fn hold(&self, data: &[u8], from: usize, to: usize, pend: &mut Option<(usize, Option<([u8; MAX_TERM], u32, usize)>)>, f: &mut impl FnMut(usize, Option<u32>)) {
         let tok = (to - from <= MAX_TERM).then(|| {
             let t = Chunk::load(data, from).folded(to - from);
             let h = hash32(&t);
-            unsafe { _mm_prefetch(self.slots.as_ptr().add(self.slot(h)) as *const i8, _MM_HINT_T0) };
-            (t, h)
+            let i = self.slot(h);
+            unsafe { _mm_prefetch(self.slots.as_ptr().add(i) as *const i8, _MM_HINT_T0) };
+            (t, h, i)
         });
         self.settle(pend, f);
         *pend = Some((from, tok));
@@ -306,17 +313,18 @@ struct PhrasePlan {
 }
 
 impl PhrasePlan {
-    fn new(patterns: &[Vec<u32>], n_terms: usize, df: &[u32]) -> Self {
+    /// Pattern p's terms are `terms[ends[p - 1]..ends[p]]` (from 0 for p = 0).
+    fn new(terms: Vec<u32>, ends: &[u32], n_terms: usize, df: &[u32]) -> Self {
         let mut anchor_bits = vec![0u64; n_terms.div_ceil(64)];
         let (mut anchors, mut lo) = (Vec::new(), 0);
-        for (pi, p) in patterns.iter().enumerate() {
+        for (pi, &hi) in ends.iter().enumerate() {
+            let p = &terms[lo as usize..hi as usize];
             let j = (0..p.len()).min_by_key(|&j| df[p[j] as usize]).unwrap();
             anchor_bits[p[j] as usize / 64] |= 1 << (p[j] % 64);
-            anchors.push((p[j], (pi as u32, j as u32, lo, lo + p.len() as u32)));
-            lo += p.len() as u32;
+            anchors.push((p[j], (pi as u32, j as u32, lo, hi)));
+            lo = hi;
         }
         let (anchor_start, anchors) = by_term(n_terms, &anchors);
-        let terms = patterns.concat();
         PhrasePlan { terms, anchor_bits, anchor_start, anchors }
     }
 
@@ -461,34 +469,35 @@ fn df_sum(terms: &[u32], df: &[u32]) -> u64 {
     terms.iter().map(|&t| df[t as usize] as u64).sum()
 }
 
-/// Trigger terms of a query: every doc in R contains one of them. {first} holds for R = S(first); OR adds its
-/// operand; AND narrows R to S(t), so it may replace the cover by {t} when t is estimated rarer; NOT keeps it.
-fn cover(q: &Code, df: &[u32]) -> Vec<u32> {
-    let mut cover = vec![q[0]];
+/// Trigger terms of a query, written to `cover` (reused, so a query allocates nothing): every doc in R contains one
+/// of them. {first} holds for R = S(first); OR adds its operand; AND narrows R to S(t), so it may replace the cover by
+/// {t} when t is estimated rarer; NOT keeps it.
+fn cover(q: &Code, df: &[u32], cover: &mut Vec<u32>) {
+    cover.clear();
+    cover.push(q[0]);
     for &w in q[1..].iter().take_while(|&&w| w != NIL) {
         let t = w & TERM;
         match w >> OP_SHIFT {
             OP_OR => cover.push(t),
-            OP_AND if df_sum(&[t], df) < df_sum(&cover, df) => cover = vec![t],
+            OP_AND if df_sum(&[t], df) < df_sum(cover, df) => *cover = vec![t],
             _ => {}
         }
     }
     cover.sort_unstable();
     cover.dedup();
-    cover
 }
 
 impl BoolPlan {
     fn new(queries: &[Code], n_dense: usize, n_bool: usize, df: &[u32]) -> Self {
         assert!(n_bool < 1 << OP_SHIFT && n_bool - n_dense < 1 << (32 - LOCAL_BITS));
-        let (mut every_chunk, mut triggers) = (Vec::new(), Vec::new());
+        let (mut every_chunk, mut triggers, mut terms) = (Vec::new(), Vec::new(), Vec::new());
         for (qi, q) in queries.iter().enumerate() {
-            let cover = cover(q, df);
+            cover(q, df, &mut terms);
             let trig = Trigger { query: qi as u32, code: *q };
-            if cover[0] < n_dense as u32 {
+            if terms[0] < n_dense as u32 {
                 every_chunk.push(trig); // sorted: a dense term, if any, comes first
             } else {
-                triggers.extend(cover.iter().map(|&t| (t - n_dense as u32 + 1, trig)));
+                triggers.extend(terms.iter().map(|&t| (t - n_dense as u32 + 1, trig)));
             }
         }
         let (trigger_start, mut triggers) = by_term(n_bool - n_dense + 1, &triggers);
@@ -623,8 +632,9 @@ impl ChunkLog {
         pass(&self.tmp, &mut self.log[..n], LOCAL_BITS + half);
         let log = &mut self.log[..n];
         // Each entry is written at m and kept when it differs from the one before; its key's span is rewritten
-        // at every entry, with no branch.
-        let (mut m, mut prev, mut start) = (0, NIL, 0);
+        // at every entry, with no branch. prev starts as the complement of the first entry, so the first entry
+        // always counts as new: a sentinel such as NIL can equal a real entry (the top key at local doc 1023).
+        let (mut m, mut prev, mut start) = (0, !log.first().copied().unwrap_or(0), 0);
         for i in 0..n {
             let e = log[i];
             start = if e >> LOCAL_BITS != prev >> LOCAL_BITS { m } else { start };
@@ -786,38 +796,64 @@ fn main() {
         _ => std::thread::available_parallelism().map_or(1, |n| n.get()),
     };
 
-    // Queries: intern every term; every line is its own query, with no line dedupe: removing it took the VM's
-    // parse from 32 ms to 22.7 ms, for 349 repeated lines of seed 1's 50,000; a repeated line now only costs its
-    // own evaluation (b-38, b-38a).
-    let mut terms = TermTable { slots: vec![0; 2], shift: 31, bytes: Vec::new() };
-    let (mut bools, mut patterns): (Vec<Code>, Vec<Vec<u32>>) = (Vec::new(), Vec::new());
-    let parse = |line: &[u8]| {
-        if let Some(body) = line.strip_prefix(b"PHRASE \"") {
-            let phrase = body[..body.len() - 1].split(|&b| b == b' ');
-            patterns.push(phrase.map(|t| terms.intern(t)).collect());
-            return Query::Phrase(patterns.len() - 1);
+    // Queries: intern every term; every line is its own query. A line dedupe (whole lines as keys of a std
+    // HashMap) was 70 M of the parse's 110 M instructions; removing it took the VM's parse from 32 ms to 22.7 ms,
+    // for 349 repeated lines of seed 1's 50,000; a repeated line now only costs its own evaluation (b-38, b-38a).
+    let qtext = map_file(&format!("{data_dir}/queries.txt"));
+    // The table starts at the size its doublings reach for one distinct term per 24 bytes of queries.txt (seed 1:
+    // 75,747 in 1.76 MB, the same 2^18 slots), sized from the input as a speed hint only: more terms still double
+    // it. The doublings up to there, each a rehash and a copy of the term bytes into fresh pages, were 4 ms of the
+    // VM's 17 ms parse (medians of 21 runs, seed 1). (b-69)
+    let n_slots = (qtext.len() / 8).next_power_of_two().max(2);
+    let (shift, bytes) = (32 - n_slots.trailing_zeros(), Vec::with_capacity(n_slots / 3));
+    let mut terms = TermTable { slots: vec![0; n_slots], shift, bytes };
+    // A phrase's terms go to one flat list, so a line allocates nothing.
+    let (mut bools, mut phrase_terms, mut phrase_ends) = (Vec::<Code>::new(), Vec::new(), Vec::new());
+    let mut parse = |words: &[&[u8]]| {
+        if words[0] == b"PHRASE" {
+            phrase_terms.extend(words[1..].iter().map(|t| terms.intern(t)));
+            phrase_ends.push(phrase_terms.len() as u32);
+            return Query::Phrase(phrase_ends.len() - 1);
         }
-        // spec 2.3: "BOOL" term *(op term), single spaces; op is AND (OP_AND = 0), OR or NOT.
-        let words: Vec<&[u8]> = line[5..].split(|&b| b == b' ').collect();
+        // spec 2.3: "BOOL" term *(op term); op is AND (OP_AND = 0), OR or NOT.
         let mut code = [NIL; MAX_BOOL_TERMS];
-        code[0] = terms.intern(words[0]);
-        for (w, pair) in code[1..].iter_mut().zip(words[1..].chunks(2)) {
+        code[0] = terms.intern(words[1]);
+        for (w, pair) in code[1..].iter_mut().zip(words[2..].chunks(2)) {
             let op = (pair[0] == b"OR") as u32 * OP_OR + (pair[0] == b"NOT") as u32 * OP_NOT;
             *w = op << OP_SHIFT | terms.intern(pair[1]);
         }
         bools.push(code);
         Query::Bool(bools.len() - 1)
     };
-    let qtext = map_file(&format!("{data_dir}/queries.txt"));
-    let lines = qtext.split(|&b| b == b'\n').filter(|l| !l.is_empty());
-    let queries: Vec<Query> = lines.map(parse).collect();
+    // One pass cuts queries.txt at every space, double quote and LF, 32 bytes per compare (`Chunk`); the empty
+    // pieces are dropped, so a PHRASE line is its keyword and terms (spec 2.3: terms are a-z and 0-9). It replaces
+    // a split per line and per word, byte by byte, and a Vec per line: the parse fell from 76 M to 37 M
+    // instructions (cachegrind, seed 1) and from 22.4 ms to 16.6 ms on the VM (medians of 15 runs). (b-69)
+    let (mut queries, mut words, mut from) = (Vec::new(), Vec::new(), 0);
+    // `<=`: a chunk at the end itself marks the end (`lf`) when the length is a multiple of 32.
+    for i in (0..=qtext.len()).step_by(32) {
+        let chunk = Chunk::load(qtext, i);
+        let lf = chunk.lf(qtext, i);
+        let mut cuts = lf | chunk.eq_mask(b' ') | chunk.eq_mask(b'"');
+        while cuts != 0 {
+            let at = i + cuts.trailing_zeros() as usize;
+            if at > from {
+                words.push(&qtext[from..at]);
+            }
+            if lf >> (at - i) & 1 != 0 && !words.is_empty() {
+                queries.push(parse(&words));
+                words.clear();
+            }
+            (from, cuts) = (at + 1, cuts & (cuts - 1));
+        }
+    }
     let n_terms = terms.bytes.len();
 
     let docs = map_file(&format!("{data_dir}/docs.txt"));
     let (df, n_sample) = estimate_df(docs, &terms, workers);
-    // Renumber the terms: BOOL terms first, so a window's words cover them only (53,444 of 75,747 terms on seed 1),
-    // each part by descending sampled df, so the terms most tokens hit have neighbouring ids and their per-term
-    // entries and words share a few hundred KB of cache lines. Only speed depends on the order.
+    // Renumber the terms: BOOL terms first, so a chunk's rows and log keys cover them only (53,444 of 75,747 terms
+    // on seed 1), each part by descending sampled df, so the terms most tokens hit have neighbouring ids and their
+    // per-term entries and rows share a few hundred KB of cache lines. Only speed depends on the order.
     let mut in_bool = vec![false; n_terms];
     bools.iter().flatten().filter(|&&w| w != NIL).for_each(|&w| in_bool[(w & TERM) as usize] = true);
     let n_bool = in_bool.iter().filter(|&&b| b).count();
@@ -830,12 +866,12 @@ fn main() {
     for w in bools.iter_mut().flatten().filter(|w| **w != NIL) {
         *w = *w & !TERM | new_id[(*w & TERM) as usize];
     }
-    for t in patterns.iter_mut().flatten() {
+    for t in &mut phrase_terms {
         *t = new_id[*t as usize];
     }
     // The two plans are independent: build them on two threads.
     let (plan, phrases) = std::thread::scope(|s| {
-        let phrases = s.spawn(|| PhrasePlan::new(&patterns, n_terms, &df));
+        let phrases = s.spawn(|| PhrasePlan::new(phrase_terms, &phrase_ends, n_terms, &df));
         // Dense: sampled in at least 1/64 of the sampled docs, so a chunk holds about CHUNK / 64 = ROW or more of
         // its docs and a row of ROW words is no larger than its log entries would be. BOOL ids are in descending
         // df, so the dense terms are the first n_dense. (b-68)
@@ -859,7 +895,7 @@ fn main() {
         }
     }
     // Shards are in doc order and each lists its matches in doc order, so every pattern's docs arrive ascending.
-    let mut phrase_results = vec![(0, 0, Vec::new()); patterns.len()];
+    let mut phrase_results = vec![(0, 0, Vec::new()); phrase_ends.len()];
     for &(p, d) in shards.iter().flat_map(|s| &s.1) {
         let r = &mut phrase_results[p as usize];
         (r.0, r.1) = (r.0 + 1, r.1 + d as u64);
