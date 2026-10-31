@@ -1,8 +1,9 @@
 //! Track B: answer the BOOL and PHRASE queries of /data/queries.txt over /data/docs.txt (spec: specs/b-index.md).
 //!
 //! Queries are read first, so only their terms are looked up. One parallel pass over the memory-mapped corpus
-//! tokenizes every document and decides every BOOL query (per document, or 64 documents at a time) and every
+//! tokenizes every document and decides every BOOL query 64 documents at a time and every
 //! PHRASE pattern (by anchor checks) for it; nothing is indexed.
+//! Main tricks: `fold_window` (b-28, b-33a), `PhrasePlan` (b-8), `TermTable` (b-36a), `Window` (b-4, b-35a), `estimate_df` (b-11).
 
 use std::arch::x86_64::*;
 use std::fs::File;
@@ -96,6 +97,7 @@ fn parallel<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
 
 /// The hash of a term zero-padded to 32 bytes: its four words multiplied by odd constants and xor-ed, high and low
 /// halves folded. A fixed amount of work per token, with no loop whose exit depends on the token's length.
+/// (b-31b) The byte loop's mispredicts fell from 71.1 M to 13.4 M (cachegrind, 1 worker, seed 1).
 #[inline(always)]
 fn hash32(t: &[u8; MAX_TERM]) -> u32 {
     const K: [u64; 4] = [0x9e37_79b9_7f4a_7c15, 0xc2b2_ae3d_27d4_eb4f, 0x1656_67b1_9e37_79f9, 0x27d4_eb2f_1656_67c5];
@@ -172,6 +174,7 @@ impl TermTable {
 
     /// The tag only filters; the bytes decide. Token and entry are both zero-padded to 32 bytes, so one 32-byte
     /// compare settles the bytes and the length (it replaced a memcmp call and a length test per hash match).
+    /// (b-31c) Official T fell from 0.330s (0.329-0.332, b-31b) to 0.318s (0.318-0.319), K 21.35 to 21.75. Kept, final code.
     #[inline]
     fn find(&self, token: &[u8; MAX_TERM], h: u32) -> Option<u32> {
         let mut i = self.slot(h);
@@ -194,7 +197,7 @@ impl TermTable {
     /// a query term and None for any other token; returns the index just past the LF. The text is classified 32 bytes
     /// at a time (`Chunk`), and tokens are cut where the token-byte mask changes, so no branch is taken per byte: the
     /// byte loop's two branches (separator skip, token end) were 71 M of the run's 161 M mispredicts (cachegrind,
-    /// 1 worker, seed 1).
+    /// 1 worker, seed 1). (b-31b, b-31c)
     #[inline(always)]
     fn tokenize(&self, data: &[u8], mut i: usize, mut on_token: impl FnMut(Option<u32>)) -> usize {
         let mut start = NIL as usize; // the token in progress, if any
@@ -257,7 +260,7 @@ fn by_term<T: Copy + Default>(n_terms: usize, items: &[(u32, T)]) -> (Vec<u32>, 
     (start, lists)
 }
 
-/// PHRASE matching by anchor checks. Each PHRASE line is one pattern and gets one anchor: its term with the
+/// PHRASE matching by anchor checks (b-8). Each PHRASE line is one pattern and gets one anchor: its term with the
 /// lowest estimated df (the df sample only picks the anchor; a term in no doc has df 0, so a phrase with an absent
 /// term is never even checked). Each doc records its token sequence as term ids (NIL for a token that is no query
 /// term, which no phrase can match across); every occurrence of an anchor term at position i is a candidate start
@@ -340,7 +343,7 @@ const SAMPLE_SHARE: usize = 128;
 fn estimate_df(docs: &[u8], dict: &TermTable, workers: usize) -> Vec<u32> {
     let (n_terms, window) = (dict.bytes.len(), docs.len() / SAMPLE_SHARE / SAMPLE_WINDOWS);
     // The windows are spread over the workers (window k on worker k % n) and their counts summed: the sample was
-    // 15 ms of serial prologue on the box.
+    // 15 ms of serial prologue on the box. (b-11)
     let n = workers.clamp(1, SAMPLE_WINDOWS);
     let parts = parallel(n, |w| {
         let (mut df, mut seen, mut stamp) = (vec![0u32; n_terms], vec![0u32; n_terms], 0u32);
@@ -452,7 +455,7 @@ impl BoolPlan {
 /// at once: bit j of a term's word says doc base + j contains it. AND, OR and NOT only combine bits that some term
 /// set, so docs missing from the range stay 0. Each step is r & (b ^ x | y) | b & o, with the operator's masks from
 /// OP_MASKS, so the operator takes no branch: its match was 16.9 M of the flush's mispredicts (cachegrind, 1
-/// worker, seed 1).
+/// worker, seed 1). (b-32b) The flush's mispredicts fell from 52.9 M to 41.5 M.
 #[inline]
 fn fold_window(code: &[u32; MAX_BOOL_TERMS], words: &[u64]) -> u64 {
     // (x, y, o) for AND, OR, NOT and KEEP
@@ -463,7 +466,7 @@ fn fold_window(code: &[u32; MAX_BOOL_TERMS], words: &[u64]) -> u64 {
     };
     // Two fixed steps (OP_KEEP pads codes of 1 or 2 terms), then a tail that only codes of 4 to 6 terms enter, so
     // the loop exit is not a per-fold guess between lengths 1, 2 and 3: the length test was 13.7 M of the flush's
-    // mispredicts (cachegrind, 1 worker, seed 1).
+    // mispredicts (cachegrind, 1 worker, seed 1). (b-33a) The flush's mispredicts fell from 41.5 M to 32.9 M, and its Ir from 2.56 G to 2.45 G.
     let r = step(step(words[code[0] as usize], code[1]), code[2]);
     code[3..].iter().take_while(|&&w| w != NIL).fold(r, |r, &w| step(r, w))
 }
@@ -534,7 +537,7 @@ struct BoolAcc {
     sum: u64,
 }
 
-/// The FIRST_IDS smallest matching ids of every BOOL query, shared by all workers. Keeping them per worker held
+/// The FIRST_IDS smallest matching ids of every BOOL query, shared by all workers (b-3). Keeping them per worker held
 /// 1.42 M (query, doc) entries (12.6 MB at 12 workers): every worker kept ten for each common query. `bound` is the
 /// largest id kept once ten are kept (NIL before), so a later, larger id is rejected by one relaxed load and only a
 /// candidate takes the lock; a stale bound only sends a few more ids to the lock, where the truncation drops them.
@@ -636,8 +639,8 @@ fn main() {
     };
 
     // Queries: intern every term; every line is its own query. A line dedupe (whole lines as keys of a std
-    // HashMap) was 70 M of the parse's 110 M instructions and most of its 32 ms of serial time on the VM, for 349
-    // repeated lines of seed 1's 50,000; a repeated line now only costs its own evaluation (b-38).
+    // HashMap) was 70 M of the parse's 110 M instructions; removing it took the VM's parse from 32 ms to 22.7 ms,
+    // for 349 repeated lines of seed 1's 50,000; a repeated line now only costs its own evaluation (b-38, b-38a).
     let mut terms = TermTable { slots: vec![0; 2], shift: 31, bytes: Vec::new() };
     let (mut bools, mut patterns): (Vec<Code>, Vec<Vec<u32>>) = (Vec::new(), Vec::new());
     let parse = |line: &[u8]| {
