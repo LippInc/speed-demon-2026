@@ -13,12 +13,14 @@ The reference takes 14.44 s (K 1).
 | join.c v27, organisers' harness on box 2 (run-a61e717c2817, run-2668ae2f706a, run-bcf351d7d996, run-7032e46a98b9, run-a6d1b79f12a2) | 22.74 ms | 10.74 MB | 443 | 41.3 |
 | join.c v27 on the board, run-ca7e7d104000 (commit ec1791c) | 26.56 ms | 10.65 MB | 443 | 38.31 |
 | join.c v39, organisers' harness on box 2 (run-79fdadd1aeb9, run-fcfa3f190b88, run-e74d4b5ca8fd, run-4e384d44fd78, run-46f27f0b1569) | 20.93 ms | 10.60 MB | 425 | 43.5 |
+| join.c v39 on the board, run-cc3a05552f65 (commit c04e8b3) | 21.74 ms | 10.39 MB | 425 | 42.83 |
+| join.c v43, organisers' harness on box 2 (run-b4d9fd8e3054, run-6d81c0998c5b, run-86f619fede63, run-7fa4f90964b6, run-fc7e98fbc4ad) | 20.78 ms | 10.69 MB | 417 | 43.6 |
 
-The board has run each version 3.3 to 3.8 ms slower than box 2; "Other processes on the scoring box" below has what we know about why.
+The board ran v21 and v27 3.3 to 3.8 ms slower than box 2, and v39 0.8 ms slower; "Other processes on the scoring box" below has what we know about why.
 
 ## Measuring
 
-- **The harness.** The organisers' run_submission.py (5 runs, median T, peak M) and static_axes.py (S) run on box 2 against the full seed-1 data.
+- **The harness.** The organisers' run_submission.py (5 runs: T is the mean of the middle three, M the peak) and static_axes.py (S) run on box 2 against the full seed-1 data.
 - **Fast loop.** A static build timed under `taskset 0-11`, 20 runs per round, median; A/B comparisons alternate the variants over 3 rounds. Validated against the harness: the Rust binary measured 27.4 ms this way against 28.1 ms on the board.
 - **Correctness.** Every variant is checked against 8 generated seeds (tiny, sample and full sizes) and the two published data sets before it is timed.
 - **Where the time goes.** `perf stat` instruction and cycle counts per variant; `perf record` on user and kernel code; variants with parts of the program switched off (the "split" rows below); a per-thread timeline from timestamps written into a copy of the program; and the cgroup's memory statistics sampled during a run, to split M into our pages and the kernel's.
@@ -59,8 +61,10 @@ Box 2, fast loop, median T; none of these were board runs.
 - v37, -0.3 ms: main writes the output while the other threads unmap.
 - v38, -0.13 ms: pieces 2 MB apart.
 - v39, 20.64 ms: one malloc arena.
+- v42, 20.45 ms: a new minimum or maximum amount is a branch, not a compare and store per record (a thread sees ~900 amounts per country, so the branch is almost never taken): -0.17 ms. `pthread_barrier_wait` instead of a spinning barrier: same speed, 7 fewer lines.
+- v43, 20.31 ms: each record's region table index lives in its record entry, not in an array of its own: one base register fewer in the first loop, which had kept 5 values on the stack (now 2). 1.02 G instructions.
 
-Wall time with parts switched off (v21): pass 1 alone 7.25 ms, the same as reading and scanning the file with nothing else (7.6 ms); then parsing and per-country sums +7.7, note lengths +0.8, name hash +0.85, sending names +3.0, owners filing them +4.5.
+Wall time with parts switched off (v39): pass 1 alone 6.4 ms; then the numbers and region index +3.5, per-country totals +1.6, name hash +1.55, note lengths +1.55, sending names +1.5 (owners that take messages off the ring without filing them: 16.15 ms), owners filing them +4.5. Filing costs 59 instructions and 37 cycles per message. The same at v21: pass 1 alone 7.25 ms, the same as reading and scanning the file with nothing else (7.6 ms); then parsing and per-country sums +7.7, note lengths +0.8, name hash +0.85, sending names +3.0, owners filing them +4.5.
 
 The timeline of v33, from timestamps the threads record: the region table is complete at 0.48 ms, parsing ends at 19.4 to 19.7 ms, then unmapping takes 0.4 ms and the output 0.3 (overlapped since v37), and the exit 0.6. A static binary that does nothing takes 0.16 ms; creating and joining 12 threads 0.41 ms.
 
@@ -75,6 +79,8 @@ With a busy loop on one of CPUs 0-11 for 1 ms in every 5 (box 2, fast loop, medi
 
 A busy loop on one CPU for the whole run made v24 25 times slower (546 ms) and v26 8 times (172 to 192 ms).
 
+On a quiet box, v27 and v39 each had 9 slow runs in 800 (more than 1.2 times the median), 4 or 5 of them between 60 and 180 ms: a thread that loses its CPU holds up the threads that send to it, with or without the overflow queue. The harness drops the slowest of 5 runs and repeats a batch whose middle three differ by more than 50 ms.
+
 v27 did not close the board gap: 3.8 ms slower on the board than on box 2, against 3.3 ms for v21, which had no defence against this noise. What matches the gap is another process using the shared L3: a cache-bound loop on the E-cores (CPUs 12-19) made v27 and the Rust version 3.3 to 3.8 ms slower alike, while a memory-bandwidth loop there cost nothing. Until the freeze the board's runs share the scoring machine; the final runs have it to themselves (organisers' FAQ), so v39 keeps the 2 ms it wins on a quiet box.
 
 ## What did not work (box 2)
@@ -87,6 +93,9 @@ v27 did not close the board gap: 3.8 ms slower on the board than on box 2, again
 - `_Alignas(64)` on the first field of the per-country totals: it aligns every field of the declaration, making the struct 512 bytes: 1.2 ms slower.
 - Name rows zeroed up front instead of when first used: no faster, M +0.4 MB. The threads adding up the per-country totals in parallel: no faster.
 - The output formatted by hand instead of with fprintf: 0.15 ms faster for 8 more lines, which is about even in K.
+- Counting each record's quotes in pass 1, so that pass 2 gets a note's unescaped length by arithmetic instead of reading the note (v40): 35 M more instructions, 0.27 ms slower.
+- Region ids read 8 digits at a time: 0.4 ms slower. Each line's start then waits on a vector compare, where the byte loop ran ahead. Threads that start each other in a tree instead of main starting all eleven: no faster, and more slow runs.
+- Pieces of 128 or 64 KB instead of 256 KB: no change (20.62-20.67 against 20.64 ms); when a thread runs out of pieces, its core's other thread speeds up. Mapping each piece in one call (`MADV_POPULATE_READ`): +0.05 ms. Prefetching the owners' buckets a loop ahead: no change.
 - Region table misses, before the prefetch: a probe without the lookup (wrong output) was 1.6 ms faster, but the same lookup into a 256 KB table recovered only 0.55 ms, so a compact table was not built.
 - Rings of 128 messages: 0.2 ms slower than 256. Pass 1 over 4 KB instead of 16 KB: 0.2 ms slower.
 - Without 64-byte message lines (one 8-byte store per message): 7 ms slower. Non-temporal stores for the lines: no change.

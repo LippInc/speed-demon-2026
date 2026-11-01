@@ -55,15 +55,15 @@ typedef struct { // one country's running totals, kept per thread
   long long n, ids, sum, min, max, nb, tb, names;
 } Agg;
 // What pass 2's first loop reads out of a record: the id, where the name
-// starts, the comma before the region, the amount in cents.
+// starts, the comma before the region, the region's table index, the amount
+// in cents.
 typedef struct {
-  u32 id, name, comma;
+  u32 id, name, comma, reg;
   int32_t cents;
 } Rec;
 typedef struct { // a thread's outgoing messages, totals and pass 2 records
   _Alignas(64) u64 batch[NT][BATCH]; // each owner's next messages, fill[o] used
   Rec rec[MAXREC];
-  u32 rr[MAXREC]; // each record's region table index
   u32 fill[NT];
   int t;
   Agg *agg;
@@ -86,7 +86,8 @@ static u8 *rtab;                      // region id -> country, 0 = unmatched
 static _Atomic u8 cidx[26 * 26 * 26]; // country code -> country number
 static int ncountry;
 static pthread_mutex_t cmu = PTHREAD_MUTEX_INITIALIZER;
-static atomic_int arrived, gen, finished;
+static atomic_int finished;
+static pthread_barrier_t meet; // all NT threads
 static _Atomic u64 piece; // the next piece of records.csv to parse
 typedef struct { // the messages from one thread to one owner, RING at most
   _Alignas(64) _Atomic u64 tail; // advanced by the sender
@@ -121,16 +122,6 @@ static inline __m256i load32(const u8 *p) {
 }
 static inline u32 eq32(const u8 *p, __m256i c) { // a bit per byte of p == c
   return _mm256_movemask_epi8(_mm256_cmpeq_epi8(load32(p), c));
-}
-
-static void barrier(void) { // all NT threads meet here
-  int g = gen;
-  if (atomic_fetch_add(&arrived, 1) == NT - 1) {
-    arrived = 0;
-    gen = g + 1;
-  } else
-    while (gen == g)
-      _mm_pause();
 }
 
 // Three numbers at once, each up to 8 digit values in the top bytes of a
@@ -329,7 +320,7 @@ static u64 drain(int t, Agg *a) {
   u64 done = 0;
   for (int from = 0; from < NT; from++) {
     Ring *r = &ring[from][t];
-    u64 *m = r->m, h = r->head, k = atomic_load_explicit(&r->tail, memory_order_acquire);
+    u64 *m = r->m, h = r->head, k = r->tail;
     done += k - h;
     for (u64 e; h < k; h = e) {
       e = k - h < 64 ? k : h + 64;
@@ -360,7 +351,7 @@ static u64 drain(int t, Agg *a) {
 static void post(Ctx *x, int o) {
   Ring *r = &ring[x->t][o];
   u64 n = x->fill[o], t = r->tail;
-  while (t + n - atomic_load_explicit(&r->head, memory_order_acquire) > RING)
+  while (t + n - r->head > RING)
     if (!drain(x->t, x->agg))
       _mm_pause();
   memcpy(r->m + t % RING, x->batch[o], 8 * n);
@@ -378,7 +369,6 @@ static void records(Ctx *x, Scan *z) {
   const u32 *ix = z->ix;
   u64 n = z->n, top = maxreg + 1; // top: unmatched
   Rec *rs = x->rec;
-  u32 *rr = x->rr;
   __m256i comma = _mm256_set1_epi8(',');
   for (u64 r = 0, s = z->start; r < n; s = ix[r++] + 1) {
     // A BOM at a record start is not data. The id: 8 digits at most.
@@ -398,20 +388,22 @@ static void records(Ctx *x, Scan *z) {
                         v & ~0ull << (64 - 8 * nd));
     u64 rid = _mm256_extract_epi64(num, 1);
     int32_t cents = _mm256_extract_epi64(num, 2);
-    rr[r] = rid < top ? rid : top;
-    _mm_prefetch((const char *)rt + rr[r], _MM_HINT_T0);
-    rs[r] = (Rec){_mm256_cvtsi256_si32(num), at + a + 1, c, neg ? -cents : cents};
+    rid = rid < top ? rid : top;
+    _mm_prefetch((const char *)rt + rid, _MM_HINT_T0);
+    rs[r] = (Rec){_mm256_cvtsi256_si32(num), at + a + 1, c, rid, neg ? -cents : cents};
   }
   Agg *ag = x->agg;
   for (u64 r = 0; r < n; r++) {
-    u64 cr = rt[rr[r]];
+    u64 cr = rt[rs[r].reg];
     Agg *g = ag + cr;
     int64_t cents = rs[r].cents;
     g->n++;
     g->ids += rs[r].id;
     g->sum += cents;
-    g->min = cents < g->min ? cents : g->min;
-    g->max = cents > g->max ? cents : g->max;
+    if (cents < g->min) // rarely: a thread sees ~900 amounts per country
+      g->min = cents;
+    if (cents > g->max)
+      g->max = cents;
     const u8 *b;
     u64 nl, h = name(f + rs[r].name, &nl, &b);
     g->nb += nl;
@@ -434,7 +426,7 @@ static void *worker(void *arg) {
   for (int c = 0; c < 256; c++)
     agg[t][c] = (Agg){.min = INT64_MAX, .max = INT64_MIN};
   regions(t);
-  barrier(); // the region table is complete
+  pthread_barrier_wait(&meet); // the region table is complete
   grow(&names[t]);
   u32 *ix = big(4 * (MAXREC + 2));
   // Piece i is the (i / n)th of the 2 MB stretch i % n: threads working at
@@ -461,7 +453,8 @@ static void *worker(void *arg) {
     if (!drain(t, x->agg))
       _mm_pause();
   drain(t, x->agg);
-  barrier(); // every total is final: main writes them out meanwhile
+  // Every total is final: main writes them out meanwhile
+  pthread_barrier_wait(&meet);
   // Every record is parsed: the other threads drop an eleventh of the
   // mapping each, or exit tears down all 49,000 page-table entries on one CPU.
   if (t) {
@@ -512,6 +505,7 @@ int main(void) {
   maxreg = strtoull((char *)memrchr(reg, '\n', regsize - 1) + 1, 0, 10);
   rtab = big(maxreg + 2); // the last entry: every id above the range
   pthread_t th[NT];
+  pthread_barrier_init(&meet, 0, NT);
   for (long t = 1; t < NT; t++)
     if (pthread_create(&th[t], 0, worker, (void *)t))
       die("pthread_create");
