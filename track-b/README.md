@@ -5,7 +5,7 @@ Reads `queries.txt` (50,000 BOOL and PHRASE queries) and `docs.txt` (254 MB, one
 ## For the judges, in one minute
 
 - **The code:** one file, [bindex.c](bindex.c), C17 with no dependencies. Its top comment gives the design in one paragraph, and each function's comment says why it is shaped the way it is.
-- **The result:** 56.35 s → 0.146 s (about 385×), 2.2 GB → 45 MB. On our copy of the scoring box with the organisers' harness (5 runs, seed 1 full): T 145.8-146.8 ms, M 45.3 MB, S 788, D 1, K about 31. The Rust version it replaced read T 0.218 s, K 25.19 on the board (run-21676903d119).
+- **The result:** 56.35 s → 0.139 s (about 405×), 2.2 GB → 45 MB. On our copy of the scoring box with the organisers' harness (5 runs, seed 1 full): T 138.1-139.1 ms, M 45.2 MB, S 825, D 1. The board measured the first C version at T 153.9 ms, K 30.12 (run-d36b02f5b879); the Rust version it replaced read T 0.218 s, K 25.19 (run-21676903d119).
 - **Where each criterion's evidence is:**
   - Code quality: bindex.c's header and function comments. Errors on open, map and write stop the program with the path or call that failed.
   - Technique: the table below, each trick linked to its line.
@@ -13,15 +13,15 @@ Reads `queries.txt` (50,000 BOOL and PHRASE queries) and `docs.txt` (254 MB, one
 
 | Trick | Where |
 |---|---|
-| Only the query terms are indexed. All workers parse the queries at once into one shared table; a new term is claimed with a compare-and-swap, no lock | [`intern`](bindex.c#L130), [`parse`](bindex.c#L184) |
-| A token of up to 8 bytes is its own key (its lowercased bytes as one 64-bit word), so a match needs no byte compare; buckets of 4 keys in one cache line, compared by one AVX2 instruction | [`key_at`](bindex.c#L110), [`lookup`](bindex.c#L121) |
-| Tokens cut 64 bytes at a time from AVX2 class masks; each token's bucket is prefetched a whole document before its lookup | [`tokenize`](bindex.c#L165), [`scan_part`](bindex.c#L294) |
-| Common terms (in over 1/16 of the sampled documents) get a bitmap row, built 64 documents at a time by 64×64 bit transposes; the rest get sorted 16-bit document lists | [`transpose64`](bindex.c#L274), [`scan_part`](bindex.c#L294) |
-| Term ids renumbered by sampled frequency: common terms first, then rare BOOL terms, then phrase-only terms | [`classify`](bindex.c#L234) |
-| Phrases checked during the scan at each occurrence of their rarest term, against the document's own token ids | [`match_phrases`](bindex.c#L254) |
-| BOOL queries answered per part, strictly left to right, on lists while the result is small and on bitmaps once a common term joins by OR; a short list against a long one binary-searches the long one | [`eval_part`](bindex.c#L409), [`isect`](bindex.c#L354) |
-| Counts by popcount, id sums by bit-sliced popcounts, and only as many ids as the query still lacks | [`emit`](bindex.c#L381) |
-| Each worker merges and formats the queries it parsed; one write per worker's slice | [`finish`](bindex.c#L473) |
+| Only the query terms are indexed. All workers parse the queries at once into one shared table; a new term is claimed with a compare-and-swap, no lock | [`intern`](bindex.c#L146), [`parse`](bindex.c#L205) |
+| A token of up to 8 bytes is its own key (its lowercased bytes as one 64-bit word), built with two masks picked by its length, so a match needs no byte compare. A bucket holds 5 keys and their values in one cache line, and a mark on each bucket a key was probed past ends almost every search at the first bucket, with one predictable branch. The table sits on one 2 MB page | [`key_at`](bindex.c#L125), [`lookup`](bindex.c#L136) |
+| Tokens cut 64 bytes at a time from AVX2 class masks; each token's bucket is prefetched a whole document before its lookup | [`tokenize`](bindex.c#L183), [`scan_part`](bindex.c#L298) |
+| Common terms (in over 1/16 of the sampled documents) get a bitmap row, built 64 documents at a time by 64×64 bit transposes; the rest get sorted 16-bit document lists | [`transpose64`](bindex.c#L278), [`scan_part`](bindex.c#L298) |
+| Term ids renumbered by sampled frequency: common terms first, then rare BOOL terms, then phrase-only terms. Every worker counts one slot range by class, and the counts' prefix sums give each range its first ids, so the renumbering runs on all threads and gives the serial order's ids | [`cls`](bindex.c#L255), [`worker`](bindex.c#L507) |
+| Phrases checked during the scan at each occurrence of their rarest term, against the document's own token ids | [`match_phrases`](bindex.c#L258) |
+| BOOL queries answered per part, strictly left to right, on lists while the result is small and on bitmaps once a common term joins by OR; a short list against a long one binary-searches the long one | [`eval_part`](bindex.c#L413), [`isect`](bindex.c#L358) |
+| Counts by popcount, id sums by bit-sliced popcounts, and only as many ids as the query still lacks | [`emit`](bindex.c#L385) |
+| Each worker merges and formats the queries it parsed; one write per worker's slice | [`finish`](bindex.c#L477) |
 
 ## The approach
 
@@ -52,7 +52,7 @@ Per token on one thread (box, 2.5 GHz): tokenize about 14 cycles, lookup 16, the
 
 - **The answer phase.** The list merges are its biggest share (`unite` 9 %, `isect` 8.5 % of cycles). Most folds are over short lists; merging them with SIMD compares instead of one element per step is next.
 - **The lookup.** One bucket line per token, prefetched a document ahead. A smaller table for the hot short tokens would keep it in L1.
-- **The serial setup.** Renumbering runs on one thread (about 4 ms) while the others wait; it can be split by slot range like the sample sum.
+- **The rare-term lists.** Counting and scattering the scan's stream into per-term lists is about a fifth of the scan's cycles, from random writes into 53,000 counters. Splitting the stream by term range first would keep each range's counters in L1.
 
 ## Reproduce
 

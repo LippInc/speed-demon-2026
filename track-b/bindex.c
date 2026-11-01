@@ -27,8 +27,8 @@ typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t
 #define NSUB 3            // parts per worker
 #define MAXPART 32768     // docs per part, so a part-local doc number fits a u16
 #define MAXTOK 65536      // tokens per doc; the spec's longest doc (999 units) has ~10,000
-#define BBITS 15          // term table: 2^15 buckets of 4 keys
-#define NSLOT (4u << BBITS)
+#define BBITS 15          // term table: 2^15 buckets of 5 keys
+#define NSLOT (5u << BBITS)
 #define SAMPLE_DIV 64     // each worker samples the first 1/64 of its first part
 #define DENSE_DIV 16      // a BOOL term in over 1/16 of the sample gets a bitmap row
 #define MAXQ 10           // ids printed per query
@@ -52,7 +52,7 @@ typedef struct { u32 q, gid; } Hit;            // phrase query q matches documen
 typedef struct {
     _Alignas(64) u64 *keys, *bm, *bt, *dm;     // aligned: no two workers share a cache line
     u8 *heap; size_t hsize;                    // the part arrays, unmapped before the merge
-    u32 *ids, *aps, *sdf, *off, *end, *docoff, *rec, nrec, nsd, w64, nhit, hcap;
+    u32 *ids, *aps, *sdf, *off, *end, *docoff, *rec, nrec, nsd, w64, nhit, hcap, cnt[3];
     u16 *la, *lb, *stream, *post;
     u8 *qdone;
     Hit *hit;
@@ -65,13 +65,22 @@ static const u8 *doc, *qtxt;
 static size_t dlen, qlen, qs[WMAX + 1], *pstart;
 static u32 ndocs, nq, ndense, nsparse, nterms, qcount[WMAX], qbase[WMAX + 1], *pfirst, *bound;
 static u8 *qkind, *qk, *qop, bflag[NSLOT];     // query q: terms at qterm[8q..], op before term i at qop[8q+i]
-static u32 *qterm, *sampdf, *newid, *aoff, *aq, *aj;
+static u32 *qterm, *sdfs, *sampdf, *newid, *aoff, *aq, *aj;
+static size_t sdfsize;
 static pthread_barrier_t bar;
 
 static void *arena(size_t n) {
     void *p = mmap(NULL, n + 64, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (p == MAP_FAILED) die("mmap");
     madvise(p, n + 64, MADV_NOHUGEPAGE);       // a huge page would charge its untouched rest to peak memory
+    return p;
+}
+
+static void *huge(size_t n) {                  // n bytes on 2 MB pages
+    u8 *p = mmap(NULL, n + (2u << 20), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) die("mmap");
+    p = (u8 *)(((uintptr_t)p + (2u << 20) - 1) & ~(uintptr_t)((2u << 20) - 1));
+    madvise(p, n, MADV_HUGEPAGE);
     return p;
 }
 
@@ -95,17 +104,23 @@ static const u8 *map_file(const char *dir, const char *name, size_t *len) {
 // A token's key is exact up to 8 bytes: the lowercased bytes as a little-endian
 // u64 (no token holds a NUL, so different lengths differ). Longer tokens XOR in
 // each further 8 bytes times an odd constant, so two tokens share a key only by
-// a 64-bit coincidence. Buckets of 4 keys fill in order, so a bucket with a
-// free slot that lacks the key ends the search. A slot's value is its own index
-// until classify() renumbers the terms.
-typedef struct { _Alignas(64) u64 key[4]; u32 val[4]; } Bucket;
-static Bucket tab[1u << BBITS];
+// a 64-bit coincidence. A bucket holds 5 keys and their values in one cache
+// line. Its slots fill in order, and ovf marks a bucket a key was probed past,
+// so a search ends at the first bucket that holds the key or has no ovf: almost
+// always the home bucket, so the branch is predictable. A slot's value is its
+// own index until the workers renumber the terms.
+typedef struct { _Alignas(64) u64 key[5]; u32 val[5], ovf; } Bucket;
+static Bucket *tab;                            // on one huge page: lookups take no TLB misses
 #define BMASK ((1u << BBITS) - 1)
 
 static inline u32 bucket_of(u64 k) { return (u32)((k * 0x9E3779B97F4A7C15ull) >> (64 - BBITS)); }
 
 static inline u64 ld64(const u8 *p) { u64 x; memcpy(&x, p, 8); return x; }
 #define LOWER 0x2020202020202020ull            // on token bytes, | 0x20 lowercases A-Z and keeps 0-9, a-z
+
+// KM[L]: the masks of a token's first and second 8 bytes, for L <= 16: the
+// same key as key_at with two ANDs in place of the length arithmetic.
+static u64 KM[17][2];
 
 static inline u64 key_at(const u8 *p, u32 L) {
     u32 a = L < 8 ? L : 8, b = L < 16 ? L - a : 8;
@@ -122,19 +137,22 @@ static inline u32 lookup(u64 k) {
     const __m256i kk = _mm256_set1_epi64x((long long)k);
     for (u32 b = bucket_of(k);; b = (b + 1) & BMASK) {
         __m256i e = _mm256_cmpeq_epi64(_mm256_load_si256((const __m256i *)tab[b].key), kk);
-        u32 m = (u32)_mm256_movemask_pd(_mm256_castsi256_pd(e)), v = tab[b].val[_tzcnt_u32(m) & 3];
-        if (m || !tab[b].key[3]) return m ? v : NONE;
+        u32 m = (u32)_mm256_movemask_pd(_mm256_castsi256_pd(e)) | (u32)(tab[b].key[4] == k) << 4;
+        u32 v = tab[b].val[_tzcnt_u32(m) & 7], r = m ? v : NONE;
+        if ((m != 0) | (tab[b].ovf == 0)) return r;   // one branch, taken unless the bucket overflowed
     }
 }
 
 static u32 intern(u64 k) {                     // called by all workers at once
-    for (u32 b = bucket_of(k);; b = (b + 1) & BMASK)
-        for (u32 i = 0; i < 4; i++) {
+    for (u32 b = bucket_of(k);; b = (b + 1) & BMASK) {
+        for (u32 i = 0; i < 5; i++) {
             u64 cur = __atomic_load_n(&tab[b].key[i], __ATOMIC_RELAXED);
             if (!cur && __atomic_compare_exchange_n(&tab[b].key[i], &cur, k, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
-                return tab[b].val[i] = b * 4 + i;
-            if (cur == k) return b * 4 + i;
+                return tab[b].val[i] = b * 5 + i;
+            if (cur == k) return b * 5 + i;
         }
+        __atomic_store_n(&tab[b].ovf, 1, __ATOMIC_RELAXED);
+    }
 }
 
 // ---------------------------------------------------------------- tokenizer
@@ -170,7 +188,10 @@ static const u8 *tokenize(const u8 *q, u64 *keys, u32 *pn) {
         u32 more = (u32)_tzcnt_u64(~m2);
         for (u64 s = mm & ~(mm << 1 | carry); s; s &= s - 1) {
             u32 st = (u32)_tzcnt_u64(s), L = (u32)_tzcnt_u64(~(mm >> st));
-            u64 k = key_at(q + st, st + L == 64 ? L + more : L);
+            const u8 *t = q + st;
+            L = st + L == 64 ? L + more : L;
+            u64 k = L <= 16 ? ((ld64(t) | LOWER) & KM[L][0]) ^ ((ld64(t + 8) | LOWER) & KM[L][1]) * 0x9E3779B97F4A7C15ull
+                            : key_at(t, L);
             _mm_prefetch((const char *)&tab[bucket_of(k)], _MM_HINT_T0);
             keys[n++] = k;
         }
@@ -208,7 +229,7 @@ static void parse(const u8 *p, const u8 *e, u32 q) {
 static void sample(Worker *me, int w) {
     int p = w * ppw;
     const u8 *q = doc + pstart[p], *end = q + (pstart[p + 1] - pstart[p]) / SAMPLE_DIV;
-    u32 d = 0, n, *sdf = me->sdf = arena(NSLOT * 4);
+    u32 d = 0, n, *sdf = me->sdf = sdfs + (size_t)w * NSLOT;
     while (q < end) {
         q = tokenize(skip_id(q), me->keys, &n);
         d++;
@@ -228,27 +249,10 @@ static u32 anchor_of(u32 q, u32 *pj) {         // the phrase term with the small
     return newid[t[j]];
 }
 
-// New term ids: BOOL terms with bitmap rows 0..ndense-1, the other BOOL terms
-// next (their posting lists), then the phrase-only terms. aoff/aq/aj list the
-// phrase queries (and the anchor's offset in each) per anchor term.
-static void classify(void) {
-    u32 nsamp = 0, nb = 0, nd = 0, nph = 0, j;
-    for (int w = 0; w < nw; w++) nsamp += wk[w].nsd;
-    u32 thr = nsamp / DENSE_DIV;
-    for (u32 s = 0; s < NSLOT; s++) if (tab[s >> 2].key[s & 3] && bflag[s]) nb++, nd += sampdf[s] > thr;
-    ndense = nd; nsparse = nb - nd;
-    if (nsparse > 65536) die("over 65,536 rare BOOL terms");
-    u32 next[3] = { 0, nd, nb };
-    for (u32 s = 0; s < NSLOT; s++)
-        if (tab[s >> 2].key[s & 3]) newid[s] = next[bflag[s] ? (sampdf[s] > thr ? 0 : 1) : 2]++;
-    nterms = next[2];
-    aoff = calloc(nterms + 1, 4);
-    for (u32 q = 0; q < nq; q++) if (qkind[q]) aoff[anchor_of(q, &j)]++, nph++;
-    for (u32 i = 1; i <= nterms; i++) aoff[i] += aoff[i - 1];
-    aq = malloc(nph * 4 + 4); aj = malloc(nph * 4 + 4);
-    for (u32 q = 0; q < nq; q++)
-        if (qkind[q]) { u32 e = --aoff[anchor_of(q, &j)]; aq[e] = q; aj[e] = j; }
-}
+// A term's class for the renumbering: 0 a BOOL term with a bitmap row (sampled
+// in over 1/DENSE_DIV of the documents), 1 another BOOL term (posting list),
+// 2 a phrase-only term. New ids run class by class, in slot order.
+static inline u32 cls(u32 s, u32 thr) { return bflag[s] ? (sampdf[s] > thr ? 0 : 1) : 2; }
 
 // ---------------------------------------------------------------- scan
 static void match_phrases(Worker *me, u32 n, u32 na, u32 gid) {
@@ -519,14 +523,39 @@ static void *worker(void *arg) {
     // 2. sample, sum the samples by slot range, renumber, rewrite the table
     sample(me, w);
     pthread_barrier_wait(&bar);
-    u32 lo = (u32)((u64)NSLOT * w / nw), hi = (u32)((u64)NSLOT * (w + 1) / nw);
-    for (u32 s = lo; s < hi; s++) { u32 t = 0; for (int i = 0; i < nw; i++) t += wk[i].sdf[s] & 0xFFFF; sampdf[s] = t; }
+    // Each worker sums the samples over one slot range and counts its terms by
+    // class; the counts' prefix sums give each range its first new ids.
+    u32 lo = (u32)((u64)NSLOT * w / nw), hi = (u32)((u64)NSLOT * (w + 1) / nw), thr = 0, pos;
+    u32 next[3] = { 0, 0, 0 }, tot[3] = { 0, 0, 0 };
+    for (int i = 0; i < nw; i++) thr += wk[i].nsd;
+    thr /= DENSE_DIV;
+    for (u32 s = lo; s < hi; s++) {
+        u32 t = 0;
+        for (int i = 0; i < nw; i++) t += wk[i].sdf[s] & 0xFFFF;
+        sampdf[s] = t;
+        if (tab[s / 5].key[s % 5]) me->cnt[cls(s, thr)]++;
+    }
     pthread_barrier_wait(&bar);
-    if (!w) { MARK("sampled\n"); classify(); MARK("classified: %u dense, %u rare BOOL terms\n", ndense, nsparse); }
+    for (int i = 0; i < nw; i++)
+        for (int c = 0; c < 3; c++) { tot[c] += wk[i].cnt[c]; if (i < w) next[c] += wk[i].cnt[c]; }
+    next[1] += tot[0]; next[2] += tot[0] + tot[1];
+    for (u32 s = lo; s < hi; s++) if (tab[s / 5].key[s % 5]) newid[s] = next[cls(s, thr)]++;
+    if (!w) {
+        ndense = tot[0]; nsparse = tot[1]; nterms = tot[0] + tot[1] + tot[2];
+        if (nsparse > 65536) die("over 65,536 rare BOOL terms");
+        MARK("classified: %u dense, %u rare BOOL terms\n", ndense, nsparse);
+    }
     pthread_barrier_wait(&bar);
-    munmap(me->sdf, NSLOT * 4 + 64);
+    // Phrase queries listed per anchor term: counted, offsets summed, filled.
+    for (u32 q = base; q < base + n; q++) if (qkind[q]) __atomic_fetch_add(&aoff[anchor_of(q, &pos)], 1, __ATOMIC_RELAXED);
+    pthread_barrier_wait(&bar);
+    if (!w) for (u32 i = 1; i <= nterms; i++) aoff[i] += aoff[i - 1];
+    pthread_barrier_wait(&bar);
+    for (u32 q = base; q < base + n; q++)
+        if (qkind[q]) { u32 e = __atomic_sub_fetch(&aoff[anchor_of(q, &pos)], 1, __ATOMIC_RELAXED); aq[e] = q; aj[e] = pos; }
+    pthread_barrier_wait(&bar);
     for (u32 s = lo; s < hi; s++)
-        if (tab[s >> 2].key[s & 3]) { u32 v = newid[s]; tab[s >> 2].val[s & 3] = v | (aoff[v + 1] > aoff[v] ? ANCHOR : 0); }
+        if (tab[s / 5].key[s % 5]) { u32 v = newid[s]; tab[s / 5].val[s % 5] = v | (aoff[v + 1] > aoff[v] ? ANCHOR : 0); }
     for (u32 q = base; q < base + n; q++) for (u32 j = 0; j < qk[q]; j++) qterm[8 * q + j] = newid[qterm[8 * q + j]];
     // 3. index and answer each part
     u32 maxnd = 1;
@@ -548,7 +577,7 @@ static void *worker(void *arg) {
     me->rec = arena((size_t)ppw * nq * (3 + MAXQ / 2) * 4);
     me->qdone = arena(nq);
     pthread_barrier_wait(&bar);
-    if (!w) munmap(sampdf, NSLOT * 4 + 64), munmap(newid, NSLOT * 4 + 64);
+    if (!w) munmap(sdfs, sdfsize);
     for (int p = w * ppw; p < (w + 1) * ppw; p++) {
         scan_part(me, p);
         if (!w || w == nw - 1) MARK("w%d part %d scanned\n", w, p);
@@ -581,7 +610,12 @@ int main(int argc, char **argv) {
         qs[w] = o;
     }
     size_t maxq = qlen / 7 + 1;                // the shortest query line is `BOOL a` + LF
-    sampdf = arena(NSLOT * 4); newid = arena(NSLOT * 4);
+    tab = huge(sizeof(Bucket) << BBITS);
+    for (u32 L = 0, a; L <= 16; L++)
+        a = L < 8 ? L : 8, KM[L][0] = a == 8 ? ~0ull : (1ull << 8 * a) - 1, KM[L][1] = L - a == 8 ? ~0ull : (1ull << 8 * (L - a)) - 1;
+    sdfs = huge(sdfsize = (size_t)(nw + 2) * NSLOT * 4);   // each worker's sample counts, their sums, the new ids
+    sampdf = sdfs + (size_t)nw * NSLOT; newid = sampdf + NSLOT;
+    aoff = arena((size_t)NSLOT * 4 + 4); aq = arena(maxq * 4); aj = arena(maxq * 4);
     qterm = arena(maxq * 32); qop = arena(maxq * 8); qk = arena(maxq); qkind = arena(maxq);
     size_t t = dlen - 1;
     while (t > 0 && doc[t - 1] != '\n') t--;
