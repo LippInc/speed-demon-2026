@@ -100,7 +100,11 @@ impl<'a> Build<'a> {
             }
             self.done.fetch_add(to - from, Release);
         }
-        while self.done.load(Acquire) < b.len() {}
+        // c-106: the pause hint keeps a waiting worker from taking issue slots from its hyperthread
+        // sibling, which may still be parsing its piece (the run uses 6 P-cores x 2 threads).
+        while self.done.load(Acquire) < b.len() {
+            std::hint::spin_loop();
+        }
         &self.table
     }
 }
