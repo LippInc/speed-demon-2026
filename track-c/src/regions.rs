@@ -9,10 +9,9 @@ use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering::*};
 /// range is clamped to it: a `min` (one cmov) instead of a bounds check and its branch. Read only
 /// after `Build::ready`, so the relaxed load is a plain load.
 #[inline(always)]
-pub fn group(table: &[AtomicU8], region_id: u64) -> usize {
+pub fn group(table: &[AtomicU8], id: u64) -> usize {
     // SAFETY: the table is never empty (sized largest id + 2), so the clamp is in bounds.
-    let cell = unsafe { table.get_unchecked((region_id as usize).min(table.len() - 1)) };
-    cell.load(Relaxed) as usize
+    unsafe { table.get_unchecked((id as usize).min(table.len() - 1)) }.load(Relaxed) as usize
 }
 
 /// The start of the first line that begins after `at`: just past the first LF at or after it.
@@ -28,9 +27,7 @@ fn line_start(b: &[u8], at: usize) -> usize {
 /// is folded digit by digit, whatever its length (the spec's reach 6 digits, longer ones fold the
 /// same way): 200,000 lines, shared out over the workers.
 fn parse_line(line: &[u8]) -> (usize, u32, usize) {
-    let [digits @ .., b',', a, b, c, b'\n'] = line else {
-        panic!("bad regions.csv line");
-    };
+    let [digits @ .., b',', a, b, c, b'\n'] = line else { panic!("bad regions.csv line") };
     let id = digits.iter().fold(0, |n, &d| n * 10 + (d - b'0') as usize);
     let letter = |x: &u8| (*x - b'A') as usize;
     let code = (*a as u32) << 16 | (*b as u32) << 8 | *c as u32;
@@ -51,7 +48,7 @@ pub struct Build<'a> {
     code_group: Box<[OnceLock<u8>]>,
     /// Each group's output key as `parse_line` packs it, written once when the group is numbered;
     /// read only after the workers joined, so the relaxed loads are plain loads.
-    keys: Box<[AtomicU32]>,
+    pub(crate) keys: Box<[AtomicU32]>,
     /// The next group number to hand out (0 is `_UNMATCHED`).
     groups: AtomicUsize,
     /// The first byte of the next unclaimed piece, and how many bytes of pieces are filled in.
@@ -103,14 +100,7 @@ impl<'a> Build<'a> {
             }
             self.done.fetch_add(to - from, Release);
         }
-        while self.done.load(Acquire) < b.len() {
-            std::hint::spin_loop();
-        }
+        while self.done.load(Acquire) < b.len() {}
         &self.table
-    }
-
-    /// Each group's output key (index 0 is `_UNMATCHED`).
-    pub fn keys(self) -> Vec<u32> {
-        self.keys.iter().map(|c| c.load(Relaxed)).collect()
     }
 }
