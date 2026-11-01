@@ -16,23 +16,23 @@
 //     amount follow the last two commas, which the 32 bytes before the end
 //     always hold (that tail has no quotes). The id runs to the first comma.
 //     A quoted name ends at its first quote unless that quote is half of a
-//     "" (rare: a cold path). The note is what lies between. Region lookups
-//     run first, in a loop short enough for the cache misses on the 1 MB
-//     region table to overlap.
-//  4. Distinct names: a name is identified by 56 bits of a hash of its raw
+//     "" (rare: a cold path). The note is what lies between. A first loop
+//     reads the numbers and hashes the name, and prefetches what the second
+//     loop looks up: the region's country and the name's table bucket.
+//  4. Distinct names: a name is identified by 54 bits of a hash of its raw
 //     bytes (quoting is one-to-one, and spec 2.2 always quotes a non-empty
 //     name). Two of the ~100,000 names share those bits with odds of about
-//     1e-7 per run.
-//  5. Each name has one owner thread, picked by its hash. The reader sends
-//     the owner an 8-byte message (the hash, with the country in the low
-//     byte) through a lock-free ring, 128 messages at a time (8 at a time
-//     cost 1.5 ms more), and the owner keeps its names in a private table
-//     with one bit per country. One table shared by all
-//     threads took almost twice as long (PERF.md): every lookup missed the
-//     core's own cache. The owner's table needs no atomic instruction.
+//     3e-7 per run. One table shared by all threads maps the hash to the
+//     name's owner and row. It fills in the first few percent of the file
+//     and is only read after that, so each core keeps a copy in its cache.
+//     The thread that adds a name owns it.
+//  5. The reader sends the owner a 4-byte message (the row and the country)
+//     through a lock-free ring, 128 at a time (8 at a time cost 1.5 ms more),
+//     and the owner sets the country's bit in the row. Setting the bits in
+//     rows shared by all threads took almost twice as long (PERF.md): every
+//     write took the line from another core. The owner needs no atomics.
 #define _GNU_SOURCE
 #include <fcntl.h>
-#include <malloc.h>
 #include <immintrin.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -47,24 +47,26 @@ typedef uint64_t u64;
 typedef uint32_t u32;
 typedef uint8_t u8;
 // CHB: 64-byte blocks per pass 1; BATCH: messages staged per owner.
-// MAXREC: records per pass 1, each 11 bytes or more.
+// MAXREC: records per pass 1, each 11 bytes or more. TAB: name table slots,
+// 77% full with spec 2.2's pool of 100,000 names.
 enum { NT = 12, CHB = 256, BATCH = 128, RING = 2 * BATCH, PIECE = 1 << 18 };
-enum { MAXREC = 64 * CHB / 8 + 2 };
+enum { MAXREC = 64 * CHB / 8 + 2, TAB = 1 << 17 };
 
 // One country's running totals, kept per thread: records, id sum, amount
 // sum, min and max in cents, name and note bytes once unescaped, distinct names
 typedef struct {
   long long n, ids, sum, min, max, nb, tb, names;
 } Agg;
-// What pass 2's first loop reads out of a record: the id, where the name
-// starts, the comma before the region, the region's table index, the amount
-// in cents.
+// What pass 2's first loop reads out of a record: the id, the comma after
+// the name, the comma before the region, the region's table index, the name's
+// length once unescaped, the amount in cents, the name's hash.
 typedef struct {
-  u32 id, name, comma, reg;
+  u32 id, nend, comma, reg, nl;
   int32_t cents;
+  u64 h;
 } Rec;
 typedef struct { // a thread's outgoing messages, totals and pass 2 records
-  _Alignas(64) u64 batch[NT][BATCH]; // each owner's next messages, fill[o] used
+  _Alignas(64) u32 batch[NT][BATCH]; // each owner's next messages, fill[o] used
   Rec rec[MAXREC];
   u32 fill[NT];
   int t;
@@ -76,9 +78,8 @@ typedef struct { // a thread's part of records.csv, parsed in two passes
   u32 *ix, n;         // the record ends pass 1 found that pass 2 has not used
 } Scan;
 typedef struct { // one owner's names
-  u64 *slot, mask, n; // 4-slot buckets (mask: their number - 1), see find()
-  uint16_t *lo;       // id -> its message's bits 8-23, to refile on grow
-  u64 (*row)[4];      // id -> a bit per country
+  _Alignas(64) u64 (*row)[4]; // a bit per country
+  u64 n;                      // rows used
 } Names;
 
 static u8 *rec;                       // records.csv, mapped
@@ -94,11 +95,12 @@ static _Atomic u64 piece; // the next piece of records.csv to parse
 typedef struct { // the messages from one thread to one owner, RING at most
   _Alignas(64) _Atomic u64 tail; // advanced by the sender
   _Alignas(64) _Atomic u64 head; // advanced by the owner
-  _Alignas(64) u64 m[RING];      // message i is m[i % RING]
+  _Alignas(64) u32 m[RING];      // message i is m[i % RING]
 } Ring;
 static Ring ring[NT][NT]; // [sender][owner]
 static Agg agg[NT][256];
 static Names names[NT];
+static _Atomic u64 *tab; // the names, see intern()
 static const u8 KEEP[64] = {[0 ... 31] = 0xFF}; // KEEP + 32 - n: n bytes kept
 
 static void die(const char *what) {
@@ -210,48 +212,39 @@ static inline u64 text(const u8 *p, u64 n) {
   return n - q / 2 - (q > 0);
 }
 
-// The slot of the name of message msg, or the free slot where it goes. A slot
-// holds message bits 20-63 (the tag) and the name's id + 1. The walk starts
-// at the 4-slot bucket that message bits 8-19 pick and goes on past full
-// buckets; slots fill in order and never empty, so a name that is there comes
-// before the walk's first free slot. Bucket and tag together are 56 bits.
-static inline u64 *find(u64 *slot, u64 mask, u64 msg) {
-  __m256i tag = _mm256_set1_epi64x(msg >> 20), zero = _mm256_setzero_si256();
-  for (u64 b = msg >> 8 & mask;; b = (b + 1) & mask) {
-    __m256i v = _mm256_load_si256((const __m256i *)(slot + 4 * b));
-    u32 m = _mm256_movemask_pd(_mm256_castsi256_pd(
-        _mm256_or_si256(_mm256_cmpeq_epi64(_mm256_srli_epi64(v, 20), tag),
-                        _mm256_cmpeq_epi64(v, zero))));
-    if (m)
-      return slot + 4 * b + _tzcnt_u32(m);
+// The table slot of the name with hash h. A slot holds h's top 40 bits (the
+// tag), the name's row at its owner (bits 4-23) and the owner + 1 (bits 0-3),
+// so a used slot is never 0. The walk starts at the 8-slot bucket that h's
+// low 14 bits pick and goes on past full buckets; slots fill in order and
+// never empty, so a name that is there comes before the walk's first free
+// slot. A name not there yet takes that slot, owned by thread t; of two
+// threads that add a name at once, one wins the slot and both use it.
+__attribute__((noinline)) static u64 intern(u64 h, int t) {
+  for (u64 i = 8 * (h & (TAB / 8 - 1));; i = (i + 1) & (TAB - 1)) {
+    u64 s = atomic_load_explicit(&tab[i], memory_order_relaxed);
+    if (!s) {
+      u64 mine = h >> 24 << 24 | names[t].n << 4 | (t + 1);
+      if (atomic_compare_exchange_strong(&tab[i], &s, mine)) {
+        names[t].n++;
+        return mine;
+      }
+    }
+    if (s >> 24 == h >> 24)
+      return s;
   }
 }
 
-// Doubles the table and refiles every name; ids and rows stay. lo[id] keeps
-// the message bits 8-19 that the slot lacks. add() grows the table at 5/8
-// full, so ids and rows need 5/8 of its slots.
-static void grow(Names *m) {
-  u64 *old = m->slot, n = old ? 4 * (m->mask + 1) : 0, size = old ? 2 * n : 1 << 14;
-  m->slot = aligned_alloc(32, size * 8);
-  m->lo = realloc(m->lo, size * 5 / 8 * sizeof *m->lo);
-  m->row = realloc(m->row, size * 5 / 8 * sizeof *m->row);
-  if (!m->slot || !m->lo || !m->row)
-    die("malloc");
-  memset(m->slot, 0, size * 8);
-  m->mask = size / 4 - 1;
-  for (u64 i = 0; i < n; i++)
-    if (old[i])
-      *find(m->slot, m->mask, old[i] >> 20 << 20 | (u64)(m->lo[(old[i] & 0xFFFFF) - 1] & 0xFFF) << 8) = old[i];
-  free(old);
-}
-
-// Files the name of message msg, seen for the first time; returns its slot.
-__attribute__((cold)) static u64 add(Names *m, u64 msg) {
-  if (8 * m->n >= 5 * 4 * (m->mask + 1))
-    grow(m);
-  memset(m->row[m->n], 0, 32); // rows are touched only once used
-  m->lo[m->n] = msg >> 8;
-  return *find(m->slot, m->mask, msg) = msg >> 20 << 20 | ++m->n;
+// intern(), when the name is in its first bucket (in ~19 of 20 lookups once
+// the table is full): a compare of all eight slots, which may see an old copy
+// of the bucket, but a slot found never changes
+static inline u64 lookup(u64 h, int t) {
+  const u64 *b = (const u64 *)tab + 8 * (h & (TAB / 8 - 1));
+  __m256i tag = _mm256_set1_epi64x(h >> 24);
+  u32 m = _mm256_movemask_pd(_mm256_castsi256_pd(
+              _mm256_cmpeq_epi64(_mm256_srli_epi64(load32((const u8 *)b), 24), tag))) |
+          _mm256_movemask_pd(_mm256_castsi256_pd(
+              _mm256_cmpeq_epi64(_mm256_srli_epi64(load32((const u8 *)(b + 4)), 24), tag))) << 4;
+  return m ? b[_tzcnt_u32(m)] : intern(h, t);
 }
 
 static int country(const u8 *p) { // numbers countries in order of first sight
@@ -323,30 +316,23 @@ static void ends(Scan *z, u64 to) {
   z->at = at, z->n = n;
 }
 
-// Files every message that has reached owner t, 64 at a time: first each
-// name's id (its slot and row mostly miss the cache, and these lookups
+// Files every message that has reached owner t, 64 at a time: first a
+// prefetch of each row (rows often miss the cache, and these misses
 // overlap), then each country bit. Returns the number of messages.
 static u64 drain(int t, Agg *a) {
-  Names *nm = &names[t];
-  u64 done = 0;
+  u64 (*row)[4] = names[t].row, done = 0;
   for (int from = 0; from < NT; from++) {
     Ring *r = &ring[from][t];
-    u64 *m = r->m, h = r->head, k = r->tail;
+    u32 *m = r->m;
+    u64 h = r->head, k = r->tail;
     done += k - h;
     for (u64 e; h < k; h = e) {
       e = k - h < 64 ? k : h + 64;
-      u32 id[64];
-      u64 *slot = nm->slot, mask = nm->mask, (*row)[4] = nm->row;
-      for (u64 j = h; j < e; j++) {
-        u64 msg = m[j % RING], s = *find(slot, mask, msg);
-        if (!s)
-          s = add(nm, msg), slot = nm->slot, mask = nm->mask, row = nm->row;
-        id[j - h] = (s & 0xFFFFF) - 1;
-        _mm_prefetch((const char *)row[id[j - h]], _MM_HINT_T0);
-      }
+      for (u64 j = h; j < e; j++)
+        _mm_prefetch((const char *)row[m[j % RING] >> 8], _MM_HINT_T0);
       for (u64 j = h; j < e; j++) {
         u64 c = m[j % RING] & 255, bit = 1ull << (c & 63);
-        u64 *w = &row[id[j - h]][c >> 6];
+        u64 *w = &row[m[j % RING] >> 8][c >> 6];
         a[c].names += !(*w & bit);
         *w |= bit;
       }
@@ -365,15 +351,15 @@ static void post(Ctx *x, int o) {
   while (t + n - r->head > RING)
     if (!drain(x->t, x->agg))
       _mm_pause();
-  memcpy(r->m + t % RING, x->batch[o], 8 * n);
+  memcpy(r->m + t % RING, x->batch[o], 4 * n);
   atomic_store_explicit(&r->tail, t + n, memory_order_release);
   x->fill[o] = 0;
 }
 
 // Pass 2: every record whose end pass 1 has found, in two loops. The first
-// reads the three numbers, from both ends of each record, and looks up the
-// region: it is short enough for the misses on the 1 MB region table to
-// overlap. The second does the totals, the name and the note.
+// reads the three numbers, from both ends of each record, and the name, and
+// prefetches the region's country and the name's bucket (both tables miss
+// the cache). The second does the totals, the note and the name's message.
 static void records(Ctx *x, Scan *z) {
   // Locals, not globals or z's fields: the stores below could alias those.
   const u8 *f = z->f, *rt = rtab;
@@ -403,7 +389,10 @@ static void records(Ctx *x, Scan *z) {
     int32_t cents = _mm256_extract_epi64(num, 2);
     rid = rid < top ? rid : top;
     _mm_prefetch((const char *)rt + rid, _MM_HINT_T0);
-    rs[r] = (Rec){_mm256_cvtsi256_si32(num), at + a + 1, c, rid, neg ? -cents : cents};
+    const u8 *b;
+    u64 nl, h = name(f + at + a + 1, &nl, &b);
+    _mm_prefetch((const char *)(tab + 8 * (h & (TAB / 8 - 1))), _MM_HINT_T0);
+    rs[r] = (Rec){_mm256_cvtsi256_si32(num), b - f, c, rid, nl, neg ? -cents : cents, h};
   }
   Agg *ag = x->agg;
   for (u64 r = 0; r < n; r++) {
@@ -417,12 +406,10 @@ static void records(Ctx *x, Scan *z) {
       g->min = cents;
     if (cents > g->max)
       g->max = cents;
-    const u8 *b;
-    u64 nl, h = name(f + rs[r].name, &nl, &b);
-    g->nb += nl;
-    g->tb += text(b + 1, f + rs[r].comma - b - 1);
-    u64 o = (h >> 32) * NT >> 32; // the name's owner: h's top half scaled to NT
-    x->batch[o][x->fill[o]] = (h & ~255ull) | co;
+    g->nb += rs[r].nl;
+    g->tb += text(f + rs[r].nend + 1, rs[r].comma - rs[r].nend - 1);
+    u64 s = lookup(rs[r].h, x->t), o = (s & 15) - 1;
+    x->batch[o][x->fill[o]] = (s >> 4 & 0xFFFFF) << 8 | co;
     if (++x->fill[o] == BATCH)
       post(x, o);
   }
@@ -440,7 +427,7 @@ static void *worker(void *arg) {
     agg[t][c] = (Agg){.min = INT64_MAX, .max = INT64_MIN};
   regions(t);
   pthread_barrier_wait(&meet); // the region table is complete
-  grow(&names[t]);
+  names[t].row = big(TAB * sizeof *names[t].row);
   u32 *ix = big(4 * (MAXREC + 2));
   // Piece i is the (i / n)th of the 2 MB stretch i % n: threads working at
   // once never share a stretch's page-table lock when they fault pages in.
@@ -500,7 +487,6 @@ static void report(FILE *o, const char *code, int c) {
 }
 
 int main(void) {
-  mallopt(M_ARENA_MAX, 1);
   int rfd = open("/data/records.csv", O_RDONLY);
   int gfd = open("/data/regions.csv", O_RDONLY);
   if (rfd < 0 || gfd < 0)
@@ -518,6 +504,7 @@ int main(void) {
   // the file's final LF.
   maxreg = strtoull((char *)memrchr(reg, '\n', regsize - 1) + 1, 0, 10);
   rtab = big(maxreg + 2); // the last entry: every id above the range
+  tab = big(TAB * 8);
   pthread_t th[NT];
   pthread_barrier_init(&meet, 0, NT);
   for (long t = 1; t < NT; t++)
