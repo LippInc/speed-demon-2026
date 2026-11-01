@@ -25,8 +25,9 @@
 //     1e-7 per run.
 //  5. Each name has one owner thread, picked by its hash. The reader sends
 //     the owner an 8-byte message (the hash, with the country in the low
-//     byte) through a lock-free ring, and the owner keeps its names in a
-//     private table with one bit per country. One table shared by all
+//     byte) through a lock-free ring, 128 messages at a time (8 at a time
+//     cost 1.5 ms more), and the owner keeps its names in a private table
+//     with one bit per country. One table shared by all
 //     threads took almost twice as long (PERF.md): every lookup missed the
 //     core's own cache. The owner's table needs no atomic instruction.
 #define _GNU_SOURCE
@@ -45,13 +46,14 @@ typedef uint64_t u64;
 typedef uint32_t u32;
 typedef uint16_t u16;
 typedef uint8_t u8;
-enum { NT = 12, CHB = 256, RING = 512, READ = 32768 }; // CHB: 64-byte blocks per pass 1
+// CHB: 64-byte blocks per pass 1; BATCH: messages staged per owner
+enum { NT = 12, CHB = 256, BATCH = 128, RING = 2 * BATCH };
 
 typedef struct { // one country's running totals, kept per thread
   int64_t n, ids, sum, min, max, nb, tb, names;
 } Agg;
 typedef struct { // a thread's outgoing messages and its totals
-  _Alignas(64) u64 line[NT][8]; // each owner's next 64 bytes, fill[o] used
+  _Alignas(64) u64 batch[NT][BATCH]; // each owner's next messages, fill[o] used
   u64 head[NT]; // each owner's ring head as last read: re-read only when full
   int t;
   u32 fill[NT];
@@ -69,8 +71,7 @@ typedef struct { // one owner's names
   u64 (*row)[4];      // id -> a bit per country
 } Names;
 
-static const u8 *rec; // records.csv mapped, read only where parts start
-static int rfd;       // records.csv, read with pread
+static const u8 *rec;                 // records.csv, mapped
 static u64 rsize, regsize, maxreg;    // file sizes, the largest region id
 static const u8 *reg;                 // regions.csv, mapped
 static u8 *rtab;                      // region id -> country, 0 = unmatched
@@ -82,7 +83,7 @@ static atomic_int arrived, gen, finished;
 typedef struct { // the messages from one thread to one owner, RING at most
   _Alignas(64) _Atomic u64 tail; // advanced by the sender
   _Alignas(64) _Atomic u64 head; // advanced by the owner
-  u64 *m;                        // one page; message i is m[i % RING]
+  u64 *m;                        // message i is m[i % RING]
 } Ring;
 static Ring ring[NT][NT]; // [sender][owner]
 static Agg agg[NT][256];
@@ -324,7 +325,7 @@ static u64 drain(int t, Agg *a) {
   return done;
 }
 
-// Sends x's partial line for owner o, waiting (and filing its own messages
+// Sends x's batch for owner o, waiting (and filing its own messages
 // meanwhile, so two full rings never wait on each other) while o's ring is full.
 static void post(Ctx *x, int o) {
   Ring *r = &ring[x->t][o];
@@ -333,7 +334,7 @@ static void post(Ctx *x, int o) {
          t + x->fill[o] - (x->head[o] = atomic_load_explicit(&r->head, memory_order_acquire)) > RING)
     if (!drain(x->t, x->agg))
       _mm_pause();
-  memcpy(r->m + t % RING, x->line[o], 8 * x->fill[o]); // lines never wrap
+  memcpy(r->m + t % RING, x->batch[o], 8 * x->fill[o]); // never wraps
   atomic_store_explicit(&r->tail, t + x->fill[o], memory_order_release);
   x->fill[o] = 0;
 }
@@ -372,8 +373,8 @@ static void records(Ctx *x, Scan *z) {
     g->nb += nl;
     g->tb += text(f + b + 1, c - b - 1);
     u64 o = (h >> 32) * NT >> 32; // the name's owner
-    x->line[o][x->fill[o]] = (h & ~255ull) | cc[r];
-    if (++x->fill[o] == 8) // a full line: one 64-byte write
+    x->batch[o][x->fill[o]] = (h & ~255ull) | cc[r];
+    if (++x->fill[o] == BATCH)
       post(x, o);
   }
   z->start = start, z->n -= n;
@@ -390,38 +391,25 @@ static void *worker(void *arg) {
   grow(&names[t]);
   u64 lo = record_start(rsize * t / NT);
   u64 hi = t + 1 < NT ? record_start(rsize * (t + 1) / NT) : rsize;
-  // The part is read in READ-byte pieces into buf, which keeps the bytes of
-  // the first unparsed record onwards; offsets count from buf. The reserve
-  // covers a part that is one record, plus the vector loads' overrun.
-  u8 *buf = big(hi - lo + READ + 128);
-  Scan z = {.f = buf, .end = hi - lo};
+  Scan z = {.f = rec + lo, .end = hi - lo};
   z.ix = big(4 * 64 * (CHB + 2));
-  for (u64 have = 0, pos = lo, k = 1; z.at < z.end;) {
-    u64 drop = z.start; // parsed: shift the rest to the front
-    memmove(buf, buf + drop, have - drop);
-    have -= drop, z.start = 0, z.at -= drop, z.end -= drop;
-    for (u32 i = 0; i < z.n; i++)
-      z.ix[i] -= drop;
-    u64 n = hi - pos < READ ? hi - pos : READ;
-    if (pread(rfd, buf + have, n, pos) != (ssize_t)n)
-      die("read records.csv");
-    have += n, pos += n;
-    // Pass 1 reads whole 64-byte blocks: all of them but the part's last
-    // wait until the bytes are in.
-    for (u64 top = pos == hi ? z.end : have - 63; z.at < top; k++) {
-      separators(&z, z.at + 64 * CHB < top ? z.at + 64 * CHB : top);
-      records(x, &z);
-      if (k % 4 == 0)
-        drain(t, x->agg);
-    }
+  for (int k = 1; z.at < z.end; k++) {
+    separators(&z, z.at + 64 * CHB < z.end ? z.at + 64 * CHB : z.end);
+    records(x, &z);
+    if (k % 8 == 0)
+      drain(t, x->agg);
   }
-  for (int o = 0; o < NT; o++) // the partial lines
+  for (int o = 0; o < NT; o++) // the partial batches
     post(x, o);
   atomic_fetch_add(&finished, 1); // after every send, so the last drain sees all
   while (finished < NT)
     if (!drain(t, x->agg))
       _mm_pause();
   drain(t, x->agg);
+  // Every record is parsed: drop this thread's twelfth of the mapping, or
+  // exit tears down all 49,000 page-table entries on one CPU.
+  u64 a = rsize * t / NT & ~4095ull, e = rsize * (t + 1) / NT & ~4095ull;
+  madvise((void *)(rec + a), e - a, MADV_DONTNEED);
   return 0;
 }
 
@@ -436,22 +424,27 @@ static char *money(char *o, int64_t v) { // cents as -?D+.DD
 }
 
 int main(void) {
-  rfd = open("/data/records.csv", O_RDONLY);
+  int rfd = open("/data/records.csv", O_RDONLY);
   int gfd = open("/data/regions.csv", O_RDONLY);
   if (rfd < 0 || gfd < 0)
     die("open /data");
   rsize = lseek(rfd, 0, SEEK_END);
   regsize = lseek(gfd, 0, SEEK_END);
-  rec = mmap(0, rsize, PROT_READ, MAP_PRIVATE, rfd, 0);
+  // records.csv is mapped over the start of a zeroed reservation one page
+  // longer, so the vector loads that run past its end read zeros.
+  u8 *f = big(rsize + 4096);
+  if (mmap(f, rsize, PROT_READ, MAP_PRIVATE | MAP_FIXED, rfd, 0) != f)
+    die("mmap records.csv");
+  rec = f;
   reg = mmap(0, regsize, PROT_READ, MAP_PRIVATE, gfd, 0);
-  if (rec == MAP_FAILED || reg == MAP_FAILED)
-    die("mmap /data");
+  if (reg == MAP_FAILED)
+    die("mmap regions.csv");
   u64 p = regsize - 1; // ids ascend (spec 2.3): the last line has the largest
   while (reg[p - 1] != '\n')
     p--;
   maxreg = strtoull((const char *)reg + p, 0, 10);
   rtab = big(maxreg + 2); // the last entry: every id above the range
-  u64 *m = big(8 * RING * NT * NT); // a page per ring
+  u64 *m = big(8 * RING * NT * NT);
   for (int i = 0; i < NT * NT; i++)
     (&ring[0][0])[i].m = m + RING * i;
   for (int t = 0; t < NT; t++)
