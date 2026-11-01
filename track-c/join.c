@@ -32,6 +32,7 @@
 //     core's own cache. The owner's table needs no atomic instruction.
 #define _GNU_SOURCE
 #include <fcntl.h>
+#include <malloc.h>
 #include <immintrin.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -44,7 +45,6 @@
 
 typedef uint64_t u64;
 typedef uint32_t u32;
-typedef uint16_t u16;
 typedef uint8_t u8;
 // CHB: 64-byte blocks per pass 1; BATCH: messages staged per owner.
 // MAXREC: records per pass 1, each 11 bytes or more.
@@ -75,11 +75,11 @@ typedef struct { // a thread's part of records.csv, parsed in two passes
 } Scan;
 typedef struct { // one owner's names
   u64 *slot, mask, n; // 4-slot buckets (mask: their number - 1), see find()
-  u16 *lo;            // id -> its message's bits 8-23, to refile on grow
+  uint16_t *lo;       // id -> its message's bits 8-23, to refile on grow
   u64 (*row)[4];      // id -> a bit per country
 } Names;
 
-static const u8 *rec;                 // records.csv, mapped
+static u8 *rec;                       // records.csv, mapped
 static u64 rsize, regsize, maxreg;    // file sizes, the largest region id
 static const u8 *reg;                 // regions.csv, mapped
 static u8 *rtab;                      // region id -> country, 0 = unmatched
@@ -87,7 +87,7 @@ static _Atomic u8 cidx[26 * 26 * 26]; // country code -> country number
 static int ncountry;
 static pthread_mutex_t cmu = PTHREAD_MUTEX_INITIALIZER;
 static atomic_int arrived, gen, finished;
-static _Atomic u64 piece; // the start of the next piece of records.csv to parse
+static _Atomic u64 piece; // the next piece of records.csv to parse
 typedef struct { // the messages from one thread to one owner, RING at most
   _Alignas(64) _Atomic u64 tail; // advanced by the sender
   _Alignas(64) _Atomic u64 head; // advanced by the owner
@@ -144,10 +144,6 @@ static inline __m256i fold3(u64 a, u64 b, u64 c) {
                           _mm256_srli_epi64(x, 32));         // 10000a + b
 }
 
-static inline u64 bits(__m256i lo, __m256i hi) { // byte masks -> 64 bits
-  return (u32)_mm256_movemask_epi8(lo) |
-         (u64)(u32)_mm256_movemask_epi8(hi) << 32;
-}
 static inline u64 quotes(const u8 *p) { // a bit per quote byte of p[0, 64)
   __m256i q = _mm256_set1_epi8('"');
   return eq32(p, q) | (u64)eq32(p + 32, q) << 32;
@@ -289,19 +285,19 @@ static void regions(int t) { // the lines that start in this thread's twelfth
 
 static u64 record_start(u64 q) { // the first record starting at or after q
   for (q = q ? q : 1; q < rsize; q++)
-    if (rec[q - 1] == '\n' && (rec[q] - '0' < 10u || rec[q] == 0xEF))
+    if (rec[q - 1] == '\n' && ((u8)(rec[q] - '0') < 10 || rec[q] == 0xEF))
       return q;
   return rsize;
 }
 
 // A bit per byte of p[0, 32) that ends a record: an LF that is not followed
 // by a lowercase letter or a quote.
-static inline __m256i ends32(const u8 *p) {
+static inline u32 ends32(const u8 *p) {
   __m256i next = load32(p + 1);
-  return _mm256_andnot_si256(
+  return _mm256_movemask_epi8(_mm256_andnot_si256(
       _mm256_or_si256(_mm256_cmpgt_epi8(next, _mm256_set1_epi8('a' - 1)),
                       _mm256_cmpeq_epi8(next, _mm256_set1_epi8('"'))),
-      _mm256_cmpeq_epi8(load32(p), _mm256_set1_epi8('\n')));
+      _mm256_cmpeq_epi8(load32(p), _mm256_set1_epi8('\n'))));
 }
 
 // Pass 1 over the blocks of z's part up to offset to: the offset of every
@@ -312,7 +308,7 @@ static void ends(Scan *z, u64 to) {
   u64 at = z->at, end = z->end, n = z->n;
   u32 *ix = z->ix;
   for (; at < to; at += 64) {
-    u64 s = bits(ends32(f + at), ends32(f + at + 32));
+    u64 s = ends32(f + at) | (u64)ends32(f + at + 32) << 32;
     if (end - at < 64) // the part's last block: the rest is the next part's
       s = _bzhi_u64(s, end - at);
     u64 k = n;
@@ -441,7 +437,13 @@ static void *worker(void *arg) {
   barrier(); // the region table is complete
   grow(&names[t]);
   u32 *ix = big(4 * (MAXREC + 2));
-  for (u64 c, k = 1; (c = atomic_fetch_add(&piece, PIECE)) < rsize;) {
+  // Piece i is the (i / n)th of the 2 MB stretch i % n: threads working at
+  // once never share a stretch's page-table lock when they fault pages in.
+  u64 n = (rsize >> 21) + 1;
+  for (u64 i, k = 1; (i = atomic_fetch_add(&piece, 1)) < 8 * n;) {
+    u64 c = i % n * 8 * PIECE + i / n * PIECE;
+    if (c >= rsize)
+      continue;
     u64 lo = record_start(c), hi = record_start(c + PIECE);
     Scan z = {.f = rec + lo, .end = hi - lo, .ix = ix};
     for (; z.at < z.end; k++) {
@@ -459,10 +461,13 @@ static void *worker(void *arg) {
     if (!drain(t, x->agg))
       _mm_pause();
   drain(t, x->agg);
-  // Every record is parsed: drop this thread's twelfth of the mapping, or
-  // exit tears down all 49,000 page-table entries on one CPU.
-  u64 a = rsize * t / NT & ~4095ull, e = rsize * (t + 1) / NT & ~4095ull;
-  madvise((void *)(rec + a), e - a, MADV_DONTNEED);
+  barrier(); // every total is final: main writes them out meanwhile
+  // Every record is parsed: the other threads drop an eleventh of the
+  // mapping each, or exit tears down all 49,000 page-table entries on one CPU.
+  if (t) {
+    u64 a = rsize * (t - 1) / (NT - 1) & ~4095ull, e = rsize * t / (NT - 1);
+    madvise(rec + a, (e & ~4095ull) - a, MADV_DONTNEED);
+  }
   return 0;
 }
 
@@ -489,34 +494,28 @@ static void report(FILE *o, const char *code, int c) {
 }
 
 int main(void) {
+  mallopt(M_ARENA_MAX, 1);
   int rfd = open("/data/records.csv", O_RDONLY);
   int gfd = open("/data/regions.csv", O_RDONLY);
   if (rfd < 0 || gfd < 0)
     die("open /data");
-  rsize = lseek(rfd, 0, SEEK_END);
-  regsize = lseek(gfd, 0, SEEK_END);
+  rsize = lseek(rfd, 0, SEEK_END), regsize = lseek(gfd, 0, SEEK_END);
   // records.csv is mapped over the start of a zeroed reservation one page
   // longer, so the vector loads that run past its end read zeros.
-  u8 *f = big(rsize + 4096);
-  if (mmap(f, rsize, PROT_READ, MAP_PRIVATE | MAP_FIXED, rfd, 0) != f)
+  rec = big(rsize + 4096);
+  if (mmap(rec, rsize, PROT_READ, MAP_PRIVATE | MAP_FIXED, rfd, 0) != rec)
     die("mmap records.csv");
-  rec = f;
   reg = mmap(0, regsize, PROT_READ, MAP_PRIVATE, gfd, 0);
   if (reg == MAP_FAILED)
     die("mmap regions.csv");
-  u64 p = regsize - 1; // ids ascend (spec 2.3): the last line has the largest
-  while (reg[p - 1] != '\n')
-    p--;
-  maxreg = strtoull((const char *)reg + p, 0, 10);
+  // Ids ascend (spec 2.3): the last line has the largest
+  maxreg = strtoull((char *)memrchr(reg, '\n', regsize - 1) + 1, 0, 10);
   rtab = big(maxreg + 2); // the last entry: every id above the range
   pthread_t th[NT];
   for (long t = 1; t < NT; t++)
     if (pthread_create(&th[t], 0, worker, (void *)t))
       die("pthread_create");
   worker(0);
-  for (int t = 1; t < NT; t++)
-    pthread_join(th[t], 0);
-
   FILE *o = fopen("/out/aggregates.txt", "w");
   if (!o)
     die("/out/aggregates.txt");
@@ -527,5 +526,7 @@ int main(void) {
   report(o, "_UNMATCHED", 0); // "_" sorts after every code
   if (fclose(o))
     die("/out/aggregates.txt");
+  for (int t = 1; t < NT; t++)
+    pthread_join(th[t], 0);
   return 0;
 }
