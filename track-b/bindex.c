@@ -30,7 +30,7 @@ typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t
 #define BBITS 15          // term table: 2^15 buckets of 5 keys
 #define NSLOT (5u << BBITS)
 #define SAMPLE_DIV 64     // each worker samples the first 1/64 of its first part
-#define DENSE_DIV 16      // a BOOL term in over 1/16 of the sample gets a bitmap row
+#define DENSE_DIV 32      // a BOOL term in over 1/16 of the sample gets a bitmap row
 #define MAXQ 10           // ids printed per query
 #define WMAX 64
 #define ANCHOR (1u << 31) // table value flag: phrases are checked at this term
@@ -366,6 +366,30 @@ static inline u32 lower(const u16 *p, u32 n, u16 x) {
 static u8 tbl[256][16];
 static inline __m128i ld128(const void *p) { return _mm_loadu_si128((const __m128i *)p); }
 
+// cnt and sum of the set bits' indexes of b[0..w), w a multiple of 4. Bit index =
+// 256 block + 8 byte + bit in byte: per byte a popcount and a sum of positions
+// from nibble tables, the bytes weighted by their index in the 32-byte block.
+static void bsum(const u64 *b, u32 w, u32 *cnt, u32 *sum) {
+    const __m256i PC = _mm256_broadcastsi128_si256(ld128("\0\1\1\2\1\2\2\3\1\2\2\3\2\3\3\4")),
+                  PS = _mm256_broadcastsi128_si256(ld128("\0\0\1\1\2\2\3\3\3\3\4\4\5\5\6\6")),
+                  PH = _mm256_add_epi8(PS, _mm256_slli_epi16(PC, 2)), M = _mm256_set1_epi8(15), Z = _mm256_setzero_si256(),
+                  WT = _mm256_loadu_si256((const __m256i *)"\0\1\2\3\4\5\6\7\10\11\12\13\14\15\16\17\20\21\22\23\24\25\26\27\30\31\32\33\34\35\36\37");
+    __m256i aC = Z, aB = Z, aQ = Z, aW = Z;
+    for (u32 t = 0; t < w / 4; t++) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(b + 4 * t)), lo = _mm256_and_si256(v, M), hi = _mm256_and_si256(_mm256_srli_epi64(v, 4), M);
+        __m256i pc = _mm256_add_epi8(_mm256_shuffle_epi8(PC, lo), _mm256_shuffle_epi8(PC, hi)), s = _mm256_sad_epu8(pc, Z);
+        aC = _mm256_add_epi64(aC, s);
+        aB = _mm256_add_epi64(aB, _mm256_mul_epu32(s, _mm256_set1_epi64x(t)));
+        aQ = _mm256_add_epi64(aQ, _mm256_sad_epu8(_mm256_add_epi8(_mm256_shuffle_epi8(PS, lo), _mm256_shuffle_epi8(PH, hi)), Z));
+        aW = _mm256_add_epi32(aW, _mm256_madd_epi16(_mm256_maddubs_epi16(pc, WT), _mm256_set1_epi16(1)));
+    }
+    u64 c[4], k[4], q[4]; u32 x[8];
+    _mm256_storeu_si256((__m256i *)c, aC); _mm256_storeu_si256((__m256i *)k, aB);
+    _mm256_storeu_si256((__m256i *)q, aQ); _mm256_storeu_si256((__m256i *)x, aW);
+    *cnt = (u32)(c[0] + c[1] + c[2] + c[3]);
+    *sum = (u32)(256 * (k[0] + k[1] + k[2] + k[3]) + q[0] + q[1] + q[2] + q[3]) + 8 * (x[0] + x[1] + x[2] + x[3] + x[4] + x[5] + x[6] + x[7]);
+}
+
 // AND (keep 1) or NOT (keep 0) of sorted lists. 8-value blocks are compared all
 // to all (SSE4.2); an a block collects its matches over every b block it meets
 // and is written once its last value <= b's last, so no later b can match it.
@@ -402,19 +426,12 @@ static u32 unite(const u16 *a, u32 an, const u16 *b, u32 bn, u16 *d) {
 // the docs' part-local numbers, then the smallest of those numbers as u16s, as
 // many as the worker still lacks.
 static void emit(Worker *me, u32 q, const u64 *rb, const u16 *rl, u32 rn) {
-    static const u64 BM[6] = { 0xAAAAAAAAAAAAAAAAull, 0xCCCCCCCCCCCCCCCCull, 0xF0F0F0F0F0F0F0F0ull,
-                               0xFF00FF00FF00FF00ull, 0xFFFF0000FFFF0000ull, 0xFFFFFFFF00000000ull };
     u32 *r = me->rec + me->nrec, room = MAXQ - me->qdone[q], nid = 0, cnt = 0, sum = 0;
     u16 *id = (u16 *)(r + 3);
     if (rb) {
-        for (u32 k = 0; k < me->w64; k++) {
-            u64 x = rb[k];
-            if (!x) continue;
-            u32 c = (u32)_mm_popcnt_u64(x);
-            cnt += c; sum += c * 64 * k;
-            for (int b = 0; b < 6; b++) sum += (u32)_mm_popcnt_u64(x & BM[b]) << b;   // sum of set bit indexes
-            for (; x && nid < room; x &= x - 1) id[nid++] = (u16)(64 * k + _tzcnt_u64(x));
-        }
+        bsum(rb, me->w64, &cnt, &sum);
+        for (u32 k = 0; k < me->w64 && nid < room; k++)
+            for (u64 x = rb[k]; x && nid < room; x &= x - 1) id[nid++] = (u16)(64 * k + _tzcnt_u64(x));
     } else {
         cnt = rn;
         for (u32 k = 0; k < rn; k++) sum += rl[k];
@@ -583,7 +600,7 @@ static void *worker(void *arg) {
         if (pfirst[p + 1] - pfirst[p] > maxnd) maxnd = pfirst[p + 1] - pfirst[p];
         if (pstart[p + 1] - pstart[p] > maxb) maxb = pstart[p + 1] - pstart[p];
     }
-    u32 W64 = me->w64 = (maxnd + 63) / 64;
+    u32 W64 = me->w64 = (maxnd + 255) / 256 * 4;   // whole 32-byte blocks for bsum
     for (int pass = 0; pass < 2; pass++) {     // pass 0 sizes the arena, pass 1 carves it
         u8 *h = me->heap = pass ? arena(me->hsize) : NULL;
         me->bm = take(&h, ((size_t)ndense + 2) * W64 * 8);
