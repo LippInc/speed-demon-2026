@@ -46,17 +46,24 @@
 typedef uint64_t u64;
 typedef uint32_t u32;
 typedef uint8_t u8;
-enum { NT = 12, BLK = 1 << 16, PAD = 192, ROUNDS = 64 };
+enum { NT = 12, CHB = 256, RING = 512 }; // CHB: 64-byte blocks per pass 1
 
 typedef struct { // one country's running totals, kept per thread
   int64_t n, ids, sum, min, max, nb, tb, names;
 } Agg;
 typedef struct { // a thread's outgoing messages and its totals
   _Alignas(64) u64 line[NT][8]; // each owner's next 64 bytes, fill[o] used
-  u64 *out[NT];
-  u8 fill[NT];
+  u64 head[NT]; // each owner's ring head as last read: re-read only when full
+  int t;
+  u32 fill[NT];
   Agg *agg;
 } Ctx;
+typedef struct { // a thread's part of records.csv, parsed in two passes
+  const u8 *f;        // its first byte; offsets count from here
+  u64 end, at, start; // its length, the next block, the next record
+  u64 inq, qb;        // all ones if inside quotes at at, quotes before at
+  u32 *ix, *qc, n;    // separators pass 1 found that no record has used
+} Scan;
 typedef struct { // one owner's names
   u64 *slot, mask, n; // 8-slot buckets; slot: message bits 24-63 | id + 1
   u64 *key;           // id -> its message's bits 8-63, to refile on grow
@@ -71,9 +78,13 @@ static _Atomic u8 cidx[26 * 26 * 26]; // country code -> country number
 static char codes[256][4];            // country number -> code
 static int ncountry;
 static pthread_mutex_t cmu = PTHREAD_MUTEX_INITIALIZER;
-static atomic_int arrived, gen;
-static u64 *box[NT][2][NT]; // messages [sender][round parity][owner]
-static int nbox[NT][2][NT];
+static atomic_int arrived, gen, finished;
+typedef struct { // the messages from one thread to one owner, RING at most
+  _Alignas(64) _Atomic u64 tail; // advanced by the sender
+  _Alignas(64) _Atomic u64 head; // advanced by the owner
+  u64 *m;                        // one page; message i is m[i % RING]
+} Ring;
+static Ring ring[NT][NT]; // [sender][owner]
 static Agg agg[NT][256];
 static Names names[NT];
 
@@ -105,14 +116,6 @@ static void barrier(void) { // all NT threads meet here
       _mm_pause();
 }
 
-// The 8 bytes at p with each digit turned into its value; *n gets how many
-// digits they start with. A byte is a digit iff, xored with '0', it is 0 to 9:
-// no high bit, and none after adding 0x76.
-static inline u64 digits(const u8 *p, u64 *n) {
-  u64 x = load(p) ^ 0x3030303030303030;
-  *n = _tzcnt_u64(((x + 0x7676767676767676) | x) & 0x8080808080808080) / 8;
-  return x;
-}
 // The first n (1 to 8) digit values of x as a number: they move to the top
 // bytes, the zeros below read as leading zeros, and pairs, quads and octets
 // combine in three multiplies.
@@ -144,9 +147,9 @@ static inline u32 eq4(__m256i v, u64 keep, u64 t) {
 // and never empty, so a key that is there comes before the walk's first free
 // slot. Tags are message bits 24-63: two of ~100,000 names pass for one with
 // odds of about 1e-6 per run.
-static u64 *find(Names *m, u64 k) {
-  for (u64 b = k & m->mask;; b = (b + 1) & m->mask) {
-    u64 *s = m->slot + 8 * b, tag = k >> 16 << 24, keep = ~0ull << 24;
+static u64 *find(u64 *slot, u64 mask, u64 k) {
+  for (u64 b = k & mask;; b = (b + 1) & mask) {
+    u64 *s = slot + 8 * b, tag = k >> 16 << 24, keep = ~0ull << 24;
     __m256i lo = _mm256_load_si256((__m256i *)s),
             hi = _mm256_load_si256((__m256i *)s + 1);
     u32 any = eq4(lo, keep, tag) | eq4(hi, keep, tag) << 4 | eq4(lo, ~0ull, 0) |
@@ -165,23 +168,20 @@ static void grow(Names *m) {
   if (!m->slot || !m->key || !m->row)
     die("malloc");
   memset(m->slot, 0, slots * 8);
-  memset(m->row + m->n, 0, (slots * 3 / 4 - m->n) * 32);
   m->mask = slots / 8 - 1;
   for (u64 id = 0; id < m->n; id++)
-    *find(m, m->key[id]) = m->key[id] >> 16 << 24 | (id + 1);
+    *find(m->slot, m->mask, m->key[id]) = m->key[id] >> 16 << 24 | (id + 1);
   free(old);
 }
 
-// The id of the name in message msg, filed on first sight.
-static u64 id(Names *m, u64 msg) {
-  u64 *s = find(m, msg >> 8);
-  if (!*s) {
-    if (4 * m->n >= 3 * 8 * (m->mask + 1))
-      return grow(m), id(m, msg);
-    m->key[m->n] = msg >> 8;
-    *s = msg >> 24 << 24 | ++m->n;
-  }
-  return (*s & 0xFFFFFF) - 1;
+// Files the name of message msg, seen for the first time, and returns its id.
+__attribute__((cold)) static u64 add(Names *m, u64 msg) {
+  if (4 * m->n >= 3 * 8 * (m->mask + 1))
+    grow(m);
+  memset(m->row[m->n], 0, 32); // rows are touched only once used
+  m->key[m->n] = msg >> 8;
+  *find(m->slot, m->mask, msg >> 8) = msg >> 24 << 24 | (m->n + 1);
+  return m->n++;
 }
 
 static int country(const u8 *p) { // numbers countries in order of first sight
@@ -215,122 +215,163 @@ static u64 record_start(u64 q) { // the first record starting at or after q
   return rsize;
 }
 
-static inline u64 quotes(const u8 *p) { // a bit per '"' in p[0, 64)
-  __m256i q = _mm256_set1_epi8('"');
-  return (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const void *)p), q)) |
-         (u64)(u32)_mm256_movemask_epi8(
-             _mm256_cmpeq_epi8(_mm256_loadu_si256((const void *)(p + 32)), q))
+static inline u64 eq(const u8 *p, char c) { // a bit per byte of p[0, 64) == c
+  __m256i v = _mm256_set1_epi8(c);
+  return (u32)_mm256_movemask_epi8(
+             _mm256_cmpeq_epi8(_mm256_loadu_si256((const void *)p), v)) |
+         (u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(
+             _mm256_loadu_si256((const void *)(p + 32)), v))
              << 32;
 }
 
-// A text field at p: empty and unquoted, or quoted (spec 2.2 quotes every
-// non-empty value). Its raw bytes (escapes kept) run from p + 1 to *e, and
-// *esc counts its "" pairs. Returns the byte after its comma.
-static inline const u8 *text(const u8 *p, const u8 **e, u64 *esc) {
-  *esc = 0;
-  if (*p != '"')
-    return *e = p + 1;
-  for (p++;;) {
-    u64 m = quotes(p);
-    if (!m) {
-      p += 64;
+// Pass 1 over the blocks of z's part up to offset to: the offset of every
+// comma and LF outside quotes (a record's four separators and its end) goes to
+// ix, and the count of quote bytes before it to qc. A carry-less multiply
+// turns the quote bits into "inside quotes" bits: every quote flips the state,
+// so an escaped "" flips it twice and changes nothing.
+static void separators(Scan *z, u64 to) {
+  // Locals, not z's fields: the stores to ix and qc could alias those.
+  u64 at = z->at, inq = z->inq, qb = z->qb, end = z->end, n = z->n;
+  u32 *ix = z->ix, *qc = z->qc;
+  for (; at < to; at += 64) {
+    const u8 *p = z->f + at;
+    u64 q = eq(p, '"'), s = eq(p, ',') | eq(p, '\n');
+    u64 in = _mm_cvtsi128_si64(_mm_clmulepi64_si128(
+                 _mm_set_epi64x(0, q), _mm_set1_epi8(-1), 0)) ^ inq;
+    inq = (u64)((int64_t)in >> 63);
+    s &= ~in & _bzhi_u64(~0ull, end - at < 64 ? end - at : 64);
+    u64 k = n;
+    n += _mm_popcnt_u64(s);
+    do // eight at a time, without a test per bit: a block holds about five
+      for (int i = 0; i < 8; i++, k++, s = _blsr_u64(s)) {
+        u64 o = _tzcnt_u64(s);
+        ix[k] = at + o, qc[k] = qb + _mm_popcnt_u64(_bzhi_u64(q, o));
+      }
+    while (s);
+    qb += _mm_popcnt_u64(q);
+  }
+  z->at = at, z->inq = inq, z->qb = qb, z->n = n;
+}
+
+// A text field between separators a and b holding q quote bytes: raw length
+// b - a - 1, less its two delimiters and one byte per "" (empty unquoted
+// fields hold no quotes).
+static inline u64 tlen(u64 a, u64 b, u64 q) { return b - a - 1 - q / 2 - (q > 0); }
+
+// Files every message that has reached owner t. A name's slot and its bit row
+// mostly miss the cache, so each message is looked up 8 messages before it is
+// applied, and its slot fetched 8 before that.
+static void drain(int t, Agg *a) {
+  Names *n = &names[t]; // its table in locals: the stores below could alias it
+  u64 *slot = n->slot, mask = n->mask, ids[8], (*row)[4] = n->row;
+  for (int from = 0; from < NT; from++) {
+    Ring *r = &ring[from][t];
+    u64 *m = r->m, h = r->head, k = atomic_load_explicit(&r->tail, memory_order_acquire);
+    if (h == k)
       continue;
+    for (u64 j = h - 8; j != k; j++) { // unsigned: j + 8 runs from h
+      if (j + 8 >= h + 8) { // apply message j: country m[j] & 255 has the name
+        u64 c = m[j % RING] & 255, bit = 1ull << (c & 63);
+        u64 *w = &row[ids[j & 7]][c >> 6];
+        a[c].names += !(*w & bit);
+        *w |= bit;
+      }
+      if (j + 8 < k) { // look up message j + 8, fetch its row
+        u64 msg = m[(j + 8) % RING], e = *find(slot, mask, msg >> 8);
+        if (e)
+          ids[j & 7] = (e & 0xFFFFFF) - 1;
+        else
+          ids[j & 7] = add(n, msg), slot = n->slot, mask = n->mask, row = n->row;
+        _mm_prefetch((const char *)row[ids[j & 7]], _MM_HINT_T0);
+        if (j + 16 < k)
+          _mm_prefetch((const char *)&slot[8 * (m[(j + 16) % RING] >> 8 & mask)], _MM_HINT_T0);
+      }
     }
-    p += _tzcnt_u64(m);
-    if (p[1] != '"')
-      return (*e = p) + 2;
-    p += 2, ++*esc;
+    atomic_store_explicit(&r->head, k, memory_order_release);
   }
 }
 
-// Parses the records that start in b[s, lim), stopping early at one that runs
-// past b[n) (the bytes after it are a guard of '"', ',' and LF, which stops
-// every search). Returns where it stopped: the start of the next record.
-static u64 parse(Ctx *x, const u8 *b, u64 s, u64 lim, u64 n) {
-  while (s < lim) {
-    const u8 *p = b + s + (b[s] == 0xEF ? 3 : 0), *name, *note, *ne, *te; // BOM
-    u64 l, v = digits(p, &l), id = fold(v, l), nq, tq;
-    note = text(name = p + l + 1, &ne, &nq);
-    p = text(note, &te, &tq);
-    v = digits(p, &l);
-    u64 rid = fold(v, l), neg = p[l + 1] == '-';
-    v = digits(p += l + 1 + neg, &l);
-    u64 lo = _bzhi_u64(~0ull, 8 * l); // cut out the point's byte
-    int64_t cents = fold((v & lo) | (v >> 8 & ~lo), l + 2);
-    p += l + 3;
-    p += 1 + (*p == '\r');
-    if (p > b + n)
-      break;
-    s = p - b;
-    Agg *g = x->agg + rtab[rid <= maxreg ? rid : maxreg + 1];
+// Sends x's partial line for owner o, waiting (and filing its own messages
+// meanwhile, so two full rings never wait on each other) while o's ring is full.
+static void post(Ctx *x, int o) {
+  Ring *r = &ring[x->t][o];
+  u64 t = r->tail;
+  while (t + x->fill[o] - x->head[o] > RING &&
+         t + x->fill[o] - (x->head[o] = atomic_load_explicit(&r->head, memory_order_acquire)) > RING)
+    drain(x->t, x->agg);
+  memcpy(r->m + t % RING, x->line[o], 8 * x->fill[o]); // lines never wrap
+  atomic_store_explicit(&r->tail, t + x->fill[o], memory_order_release);
+  x->fill[o] = 0;
+}
+
+// Pass 2: every record whose five separators pass 1 has found. Each record's
+// fields sit at known offsets, so records no longer wait on one another.
+static void records(Ctx *x, Scan *z) {
+  // Locals, not globals or z's fields: the stores below could alias those.
+  const u8 *f = z->f, *rt = rtab;
+  const u32 *ix = z->ix, *qc = z->qc;
+  u64 j = 0, n = z->n, start = z->start, top = maxreg + 1; // top: unmatched
+  Agg *ag = x->agg;
+  for (; j + 5 <= n; j += 5) {
+    if (j + 45 <= n) { // the region table (1 MB) mostly misses: fetch the
+      u64 c = ix[j + 42], d = ix[j + 43]; // entry 8 records ahead
+      u64 r = fold(load(f + c + 1) ^ 0x3030303030303030, d - c - 1);
+      _mm_prefetch((const char *)rt + (r < top ? r : top), _MM_HINT_T0);
+    }
+    const u8 *p = f + start;
+    p += *p == 0xEF ? 3 : 0; // a BOM at a record start is not data
+    u64 a = ix[j], b = ix[j + 1], c = ix[j + 2], d = ix[j + 3], e = ix[j + 4];
+    u64 id = fold(load(p) ^ 0x3030303030303030, f + a - p);
+    u64 rid = fold(load(f + c + 1) ^ 0x3030303030303030, d - c - 1);
+    u64 neg = f[d + 1] == '-', il = e - (f[e - 1] == '\r') - d - neg - 4;
+    u64 v = load(f + d + 1 + neg) ^ 0x3030303030303030;
+    u64 lo = _bzhi_u64(~0ull, 8 * il); // cut out the point's byte
+    int64_t cents = fold((v & lo) | (v >> 8 & ~lo), il + 2);
+    start = e + 1;
+    Agg *g = ag + rt[rid < top ? rid : top];
     cents = (cents ^ -neg) + neg;
     g->n++;
     g->ids += id;
     g->sum += cents;
     g->min = cents < g->min ? cents : g->min;
     g->max = cents > g->max ? cents : g->max;
-    g->nb += ne - name - 1 - nq;
-    g->tb += te - note - 1 - tq;
-    u64 h = hash(name + 1, ne - name - 1);
-    u64 o = (h >> 32) * NT >> 32; // the name's owner
-    x->line[o][x->fill[o]] = (h & ~255ull) | (g - x->agg);
-    if (++x->fill[o] == 8) { // a full line: one 64-byte write
-      __m256i *d = (__m256i *)x->out[o], *l = (__m256i *)x->line[o];
-      _mm256_store_si256(d, l[0]);
-      _mm256_store_si256(d + 1, l[1]);
-      x->out[o] += 8, x->fill[o] = 0;
-    }
+    g->nb += tlen(a, b, qc[j + 1] - qc[j]);
+    g->tb += tlen(b, c, qc[j + 2] - qc[j + 1]);
+    u64 h = hash(f + a + 2, b - a > 3 ? b - a - 3 : 0); // "" and empty: one
+    u64 o = (h >> 32) * NT >> 32;                        // the name's owner
+    x->line[o][x->fill[o]] = (h & ~255ull) | (g - ag);
+    if (++x->fill[o] == 8) // a full line: one 64-byte write
+      post(x, o);
   }
-  return s;
-}
-
-// Applies the messages sent to t. Both a name's slot and its bit row mostly
-// miss the cache, so each message is looked up 8 messages before it is
-// applied, and its slot fetched 8 before that.
-static void drain(int t, int par, Agg *a) {
-  Names *n = &names[t];
-  u64 ids[8];
-  for (int from = 0; from < NT; from++) {
-    u64 *m = box[from][par][t];
-    for (int j = -8, k = nbox[from][par][t]; j < k; j++) {
-      if (j >= 0) { // apply message j: country m[j] & 255 has the name
-        u64 c = m[j] & 255, *w = &n->row[ids[j & 7]][c >> 6], bit = 1ull << (c & 63);
-        a[c].names += !(*w & bit);
-        *w |= bit;
-      }
-      if (j + 8 < k) {
-        _mm_prefetch((const char *)n->row[ids[j & 7] = id(n, m[j + 8])], _MM_HINT_T0);
-        if (j + 16 < k)
-          _mm_prefetch((const char *)&n->slot[8 * (m[j + 16] >> 8 & n->mask)], _MM_HINT_T0);
-      }
-    }
-  }
+  z->start = start, z->n = n - j;
+  memmove(z->ix, ix + j, z->n * 4); // a record cut by the pass's end
+  memmove(z->qc, qc + j, z->n * 4);
 }
 
 static void *worker(void *arg) {
   int t = (int)(intptr_t)arg;
   static Ctx ctx[NT];
   Ctx *x = &ctx[t];
-  x->agg = agg[t];
+  x->agg = agg[t], x->t = t;
   regions(t);
   barrier(); // the region table is complete
   grow(&names[t]);
   u64 lo = record_start(rsize * t / NT);
   u64 hi = t + 1 < NT ? record_start(rsize * (t + 1) / NT) : rsize;
-  for (int r = 0; r <= ROUNDS; r++) {
-    for (int o = 0; o < NT; o++)
-      x->out[o] = box[t][r & 1][o];
-    if (r < ROUNDS)
-      lo = parse(x, rec, lo, lo + (hi - lo) / (ROUNDS - r), rsize);
-    for (int o = 0; o < NT; o++) { // send the partial lines
-      memcpy(x->out[o], x->line[o], 8 * x->fill[o]);
-      nbox[t][r & 1][o] = x->out[o] + x->fill[o] - box[t][r & 1][o];
-      x->fill[o] = 0;
-    }
-    if (r)
-      drain(t, (r - 1) & 1, x->agg);
-    barrier(); // this round's messages are sent, the last round's applied
+  Scan z = {.f = rec + lo, .end = hi - lo};
+  z.ix = big(4 * 64 * (CHB + 2)), z.qc = big(4 * 64 * (CHB + 2));
+  for (int k = 1; z.at < z.end; k++) {
+    separators(&z, z.at + 64 * CHB < z.end ? z.at + 64 * CHB : z.end);
+    records(x, &z);
+    if (k % 4 == 0)
+      drain(t, x->agg);
   }
+  for (int o = 0; o < NT; o++) // the partial lines
+    post(x, o);
+  atomic_fetch_add(&finished, 1); // after every send, so the last drain sees all
+  while (finished < NT)
+    drain(t, x->agg);
+  drain(t, x->agg);
   // Every record is parsed: drop this thread's twelfth of the mapping, or
   // exit tears down all 49,000 page-table entries on one CPU.
   u64 a = rsize * t / NT & ~4095ull, e = rsize * (t + 1) / NT & ~4095ull;
@@ -372,12 +413,9 @@ int main(void) {
     p--;
   maxreg = strtoull((const char *)reg + p, 0, 10);
   rtab = big(maxreg + 2); // the last entry: every id above the range
-  // A round's messages from one thread, if all went to one owner: records
-  // are at least 11 bytes ("1,,,1,0.00\n").
-  u64 cap = ((rsize / NT / ROUNDS + 3 * BLK) / 11 + 64) & ~7ull; // whole lines
-  u64 *m = big(8 * cap * NT * 2 * NT);
-  for (int i = 0; i < NT * 2 * NT; i++)
-    (&box[0][0][0])[i] = m + cap * i;
+  u64 *m = big(8 * RING * NT * NT); // a page per ring
+  for (int i = 0; i < NT * NT; i++)
+    (&ring[0][0])[i].m = m + RING * i;
   for (int t = 0; t < NT; t++)
     for (int c = 0; c < 256; c++)
       agg[t][c] = (Agg){.min = INT64_MAX, .max = INT64_MIN};
