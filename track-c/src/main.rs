@@ -9,8 +9,6 @@ mod regions;
 
 use std::{env, fs::File, io::Write, os::fd::AsRawFd};
 
-use crate::records::GUARD;
-
 /// Integer cents as `-?[0-9]+\.[0-9]{2}`, never `-0.00` (c-join.md:131).
 fn money(cents: i64) -> String {
     let abs = cents.unsigned_abs();
@@ -36,11 +34,13 @@ fn map_padded(path: &str) -> &'static [u8] {
     unsafe {
         // prot 3 = PROT_READ | PROT_WRITE; flags 2 = MAP_PRIVATE, 0x20 = MAP_ANONYMOUS, 0x10 = MAP_FIXED.
         let base = mmap(std::ptr::null_mut(), len + 4096, 3, 2 | 0x20, -1, 0);
+        // An empty file (outside 2.2, but kit case c14 madv-empty-* feeds one): the zeroed
+        // reservation alone is the file's bytes; mmap of length 0 would fail.
         if len != 0 {
             let at = mmap(base, len, 3, 2 | 0x10, file.as_raw_fd(), 0);
             assert!(at == base, "mmap failed");
         }
-        (0..GUARD).for_each(|k| *base.add(len + k) = b"\",\n"[k % 3]);
+        (0..records::GUARD).for_each(|k| *base.add(len + k) = b"\",\n"[k % 3]);
         std::slice::from_raw_parts(base, len)
     }
 }
@@ -55,15 +55,25 @@ fn main() -> std::io::Result<()> {
 
     // regions.csv is parsed by the workers together at their start (regions::Build).
     let regions = regions::Build::new(map_padded(&format!("{data}/regions.csv")));
-    let (totals, distinct) = pass2::run(map_padded(&format!("{data}/records.csv")), workers, &regions);
+    let (totals, distinct) = pass2::run(
+        map_padded(&format!("{data}/records.csv")),
+        workers,
+        &regions,
+    );
     let keys = regions.keys();
-    // One line per group with records, sorted by key bytewise (c-join.md:127-129).
+    // One line per group with records, sorted by key bytewise (c-join.md:127-129): the keys are
+    // packed big-endian (regions.rs), with `_UNMATCHED`'s (`_UN`) above every code, so u32 order is
+    // bytewise.
     let mut lines: Vec<usize> = (0..keys.len()).filter(|&g| totals[g].count > 0).collect();
-    lines.sort_unstable_by_key(|&g| &keys[g]);
+    lines.sort_unstable_by_key(|&g| keys[g]);
     let mut out = Vec::new();
     for g in lines {
         let t = &totals[g];
-        out.extend_from_slice(&keys[g]);
+        out.extend_from_slice(&keys[g].to_be_bytes()[1..]);
+        // Group 0 is `_UNMATCHED`: its packed key prints the `_UN` above, so append the rest.
+        if g == 0 {
+            out.extend_from_slice(b"MATCHED");
+        }
         write!(out, " {} {} ", t.count, t.id_sum)?;
         for cents in [t.amount_sum, t.amount_min, t.amount_max] {
             write!(out, "{} ", money(cents))?;
