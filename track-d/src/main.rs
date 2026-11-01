@@ -74,15 +74,22 @@ impl<T> Slots<T> {
     }
 }
 
-/// One CSR entry, 6 bytes: the head as two u16 halves, then the weight, or HEAVY for a weight of
-/// HEAVY or more (u32 weights, spec section 2), which Csr::heavy holds by edge index.
-/// Why: the two CSRs were 80 MB of u64 entries, most of the query phase's memory, while nearly all
-/// weights fit 16 bits (full seed 1: 50 of 5,000,000 do not). 6 bytes cut them to 60 MB.
-type Edge = [u16; 3];
-const HEAVY: u16 = u16::MAX;
+/// One CSR entry, 4 bytes (d-27 s4): head in top hb bits (from n - 1), weight in low 32 - hb bits.
+/// Weights >= the all-ones value escape to Csr::heavy by edge index.
+type Edge = u32;
 
-fn edge(head: u32, w: u32) -> Edge {
-    [head as u16, (head >> 16) as u16, w.min(HEAVY as u32) as u16]
+#[inline(always)]
+fn pack_edge(head: u32, w: u32, hb: u32) -> (Edge, bool) {
+    if hb >= 32 {
+        return (head, true);
+    }
+    let wb = 32 - hb;
+    let max_w = (1u32 << wb) - 1;
+    if w >= max_w {
+        ((head << wb) | max_w, true)
+    } else {
+        ((head << wb) | w, false)
+    }
 }
 
 /// Compressed adjacency: the edges of node u are edges[start(u)..end[u]].
@@ -90,11 +97,12 @@ struct Csr {
     end: Vec<u32>,
     edges: Vec<Edge>,
     heavy: Vec<(u32, u32)>,
+    hb: u32,
 }
 
 impl Csr {
-    fn new(n: usize, m: usize) -> Self {
-        Csr { end: vec![0; n], edges: vec![[0; 3]; m], heavy: Vec::new() }
+    fn new(n: usize, m: usize, hb: u32) -> Self {
+        Csr { end: vec![0; n], edges: vec![0; m], heavy: Vec::new(), hb }
     }
 
     #[inline(always)]
@@ -115,10 +123,23 @@ impl Csr {
     /// (head, weight) of each edge of u.
     #[inline(always)]
     fn row(&self, u: usize) -> impl Iterator<Item = (u32, u64)> + '_ {
+        let (hb, wb) = (self.hb, 32 - self.hb);
+        let max_w = if hb < 32 { (1u32 << wb) - 1 } else { 0 };
         (self.start(u)..self.end[u] as usize).map(move |i| {
-            let (e, heavy) = (self.edges[i], || self.heavy[self.heavy.partition_point(|h| h.0 < i as u32)].1);
-            let w = Some(e[2]).filter(|&w| w < HEAVY).map_or_else(heavy, u32::from);
-            (e[0] as u32 | (e[1] as u32) << 16, w as u64)
+            let e = self.edges[i];
+            if hb >= 32 {
+                let w = self.heavy[self.heavy.partition_point(|h| h.0 < i as u32)].1;
+                (e, w as u64)
+            } else {
+                let raw_w = e & max_w;
+                let head = e >> wb;
+                let w = if raw_w < max_w {
+                    raw_w as u64
+                } else {
+                    self.heavy[self.heavy.partition_point(|h| h.0 < i as u32)].1 as u64
+                };
+                (head, w)
+            }
         })
     }
 }
@@ -180,8 +201,9 @@ fn place(buckets: &[Vec<Vec<Record>>], first: usize, shift: u32, g: &mut Csr, th
             for r in records() {
                 let c = &mut cursor[r.0 as usize - lo];
                 // SAFETY: c walks this row's own slots inside partition p's slice of edges.
-                unsafe { edges.put(*c as usize, edge(r.1, r.2)) };
-                heavy.extend((r.2 >= HEAVY as u32).then_some((*c, r.2)));
+                let (e, is_heavy) = pack_edge(r.1, r.2, g.hb);
+                unsafe { edges.put(*c as usize, e) };
+                heavy.extend(is_heavy.then_some((*c, r.2)));
                 *c += 1;
             }
         }
@@ -237,13 +259,14 @@ fn relabel(old: Csr, threads: usize) -> (Csr, Csr, Vec<u32>) {
         }
         (order, degs)
     });
+    drop(flags);
     // The serial walk over the concatenated orders was ~23 ms of the relabel's ~55 ms on one thread
     // on the box (d-25 probe); each worker now fills its own block of new ids and row ends.
     let (mut x0, mut e0) = (vec![0usize; threads + 1], vec![0u32; threads + 1]);
     for (k, (order, degs)) in old_of.iter().enumerate() {
         (x0[k + 1], e0[k + 1]) = (x0[k] + order.len(), e0[k] + degs);
     }
-    let (mut new_id, mut g) = (vec![0u32; n], Csr::new(n, old.edges.len()));
+    let (mut new_id, mut g) = (vec![0u32; n], Csr::new(n, old.edges.len(), old.hb));
     let (ids, end) = (Slots(new_id.as_mut_ptr()), Slots(g.end.as_mut_ptr()));
     on_threads(threads, |k| {
         let mut at = e0[k];
@@ -254,6 +277,7 @@ fn relabel(old: Csr, threads: usize) -> (Csr, Csr, Vec<u32>) {
             unsafe { ids.put(o as usize, (x0[k] + i) as u32); end.put(x0[k] + i, at) };
         }
     });
+    drop(old_of);
     let edges = Slots(g.edges.as_mut_ptr());
     let heavy = on_threads(threads, |k| {
         let mut heavy = Vec::new();
@@ -263,8 +287,9 @@ fn relabel(old: Csr, threads: usize) -> (Csr, Csr, Vec<u32>) {
                 let at = g.start(x) + j;
                 // SAFETY: new_id is a bijection, so new row x is written only for old row u, and u is
                 // in exactly one worker's range of old ids: no two workers write the same slot.
-                unsafe { edges.put(at, edge(new_id[v as usize], w as u32)) };
-                heavy.extend((w >= HEAVY as u64).then_some((at as u32, w as u32)));
+                let (e, is_heavy) = pack_edge(new_id[v as usize], w as u32, g.hb);
+                unsafe { edges.put(at, e) };
+                heavy.extend(is_heavy.then_some((at as u32, w as u32)));
             }
         }
         heavy
@@ -302,7 +327,8 @@ fn build_graph(graph: &[u8], body: usize, n: usize, threads: usize, t: &mut Phas
     t.push(("parse", Instant::now()));
     let m = by_tail.iter().flatten().map(Vec::len).sum();
     assert!(m <= u32::MAX as usize, "CSR offsets are u32");
-    let mut fwd = Csr::new(n, m);
+    let hb = if n <= 1 { 1 } else { 32 - (n as u32 - 1).leading_zeros() };
+    let mut fwd = Csr::new(n, m, hb);
     place(&by_tail, 0, shift, &mut fwd, threads);
     drop(by_tail);
     t.push(("fwd", Instant::now()));
@@ -336,79 +362,117 @@ fn build_graph(graph: &[u8], body: usize, n: usize, threads: usize, t: &mut Phas
     (fwd, rev, new_id)
 }
 
-/// A heap entry: 12 bytes packed instead of the 16 a (u64, u32) tuple takes.
+const NB: usize = 2048;
+const WB: u64 = 32;
+
 #[derive(Clone, Copy)]
-#[repr(C, packed)]
 struct Entry {
-    key: u64,
     node: u32,
+    dist: u32,
 }
 
-/// Monotone radix heap (Ahuja, Mehlhorn, Orlin, Tarjan) over u64 keys. Entry k sits in bucket
-/// 64 - lzcnt(k ^ last), where last is the most recent minimum taken: bucket 0 holds keys equal to
-/// last, bucket b keys whose highest bit differing from last is b - 1, so 65 buckets cover the key
-/// width. Valid because Dijkstra only pushes keys >= the key it just popped. An entry moves only to
-/// lower buckets, at most 64 times, instead of paying log(len) compares per pop like a binary heap.
-/// Measured (local, full seed 1, interleaved with the floor's BinaryHeap): queries phase 1.09-1.10 s
-/// -> 0.85-0.87 s at 12 workers, 1.00-1.08 s -> 0.87-0.95 s at 4.
-struct RadixHeap {
-    buckets: [Vec<Entry>; 65],
-    last: u64,
-    len: usize,
+/// Monotone bucket queue (d-27 s1): ring of 2048 buckets of width 32 covering 65,536 distance.
+/// O(1) next bucket by bitmask trailing_zeros, a bucket's nodes relaxed together,
+/// label-correcting inside a bucket, and the exact stop rule (lower_f + lower_b >= best).
+struct BucketQueue {
+    buckets: Vec<Vec<Entry>>,
+    occupied: [u64; NB / 64],
+    overflow: std::collections::BinaryHeap<std::cmp::Reverse<(u64, u32)>>,
+    base_bucket: u64,
 }
 
-impl RadixHeap {
+impl BucketQueue {
     fn new() -> Self {
-        RadixHeap { buckets: std::array::from_fn(|_| Vec::new()), last: 0, len: 0 }
+        BucketQueue {
+            buckets: (0..NB).map(|_| Vec::new()).collect(),
+            occupied: [0; NB / 64],
+            overflow: std::collections::BinaryHeap::new(),
+            base_bucket: 0,
+        }
     }
 
     fn clear(&mut self) {
-        self.buckets.iter_mut().for_each(Vec::clear);
-        self.last = 0;
-        self.len = 0;
-    }
-
-    #[inline(always)]
-    fn bucket(&self, key: u64) -> usize {
-        64 - (key ^ self.last).leading_zeros() as usize
-    }
-
-    #[inline(always)]
-    fn push(&mut self, key: u64, node: u32) {
-        debug_assert!(key >= self.last, "keys must not go below the last minimum");
-        let b = self.bucket(key);
-        self.buckets[b].push(Entry { key, node });
-        self.len += 1;
-    }
-
-    /// The exact minimum key, the same value BinaryHeap::peek gives. When bucket 0 is empty this
-    /// advances last to the minimum of the lowest non-empty bucket and spreads that bucket into lower
-    /// ones; the set of entries does not change. Safe for later pushes: a side only pushes after it
-    /// pops its own minimum, and pushes keys >= that minimum.
-    fn top(&mut self) -> Option<u64> {
-        if self.len == 0 {
-            return None;
-        }
-        if self.buckets[0].is_empty() {
-            let b = self.buckets.iter().position(|v| !v.is_empty()).unwrap();
-            let moving = std::mem::take(&mut self.buckets[b]);
-            self.last = moving.iter().map(|e| e.key).min().unwrap();
-            for &e in &moving {
-                let to = self.bucket(e.key);
-                self.buckets[to].push(e);
+        for w in 0..NB / 64 {
+            let mut mask = self.occupied[w];
+            while mask != 0 {
+                let bit = mask.trailing_zeros() as usize;
+                self.buckets[w * 64 + bit].clear();
+                mask &= mask - 1;
             }
-            // Hand the emptied vector's capacity back to bucket b for reuse.
-            self.buckets[b] = moving;
-            self.buckets[b].clear();
         }
-        Some(self.last)
+        self.occupied = [0; NB / 64];
+        self.overflow.clear();
+        self.base_bucket = 0;
     }
 
-    fn pop(&mut self) -> Option<(u64, u32)> {
-        self.top()?;
-        let e = self.buckets[0].pop().unwrap();
-        self.len -= 1;
-        Some((e.key, e.node))
+    #[inline(always)]
+    fn push(&mut self, dist: u64, node: u32) {
+        let k = dist / WB;
+        if k < self.base_bucket + NB as u64 {
+            let b = (k as usize) % NB;
+            self.buckets[b].push(Entry { node, dist: dist as u32 });
+            self.occupied[b / 64] |= 1u64 << (b % 64);
+        } else {
+            self.overflow.push(std::cmp::Reverse((dist, node)));
+        }
+    }
+
+    fn refill(&mut self) {
+        let limit = (self.base_bucket + NB as u64) * WB;
+        while let Some(&std::cmp::Reverse((d, node))) = self.overflow.peek() {
+            if d < limit {
+                self.overflow.pop();
+                let b = ((d / WB) as usize) % NB;
+                self.buckets[b].push(Entry { node, dist: d as u32 });
+                self.occupied[b / 64] |= 1u64 << (b % 64);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn next_bucket(&self, curr: usize) -> Option<usize> {
+        let (w, bit) = (curr / 64, curr % 64);
+        let mask = self.occupied[w] & (!0u64 << bit);
+        if mask != 0 {
+            return Some(w * 64 + mask.trailing_zeros() as usize);
+        }
+        for w2 in (w + 1)..NB / 64 {
+            if self.occupied[w2] != 0 {
+                return Some(w2 * 64 + self.occupied[w2].trailing_zeros() as usize);
+            }
+        }
+        for w2 in 0..w {
+            if self.occupied[w2] != 0 {
+                return Some(w2 * 64 + self.occupied[w2].trailing_zeros() as usize);
+            }
+        }
+        if bit > 0 {
+            let mask = self.occupied[w] & ((1u64 << bit) - 1);
+            if mask != 0 {
+                return Some(w * 64 + mask.trailing_zeros() as usize);
+            }
+        }
+        None
+    }
+
+    fn lower(&mut self) -> u64 {
+        let curr = (self.base_bucket as usize) % NB;
+        if (self.occupied[curr / 64] & (1u64 << (curr % 64))) != 0 {
+            return self.base_bucket * WB;
+        }
+        if let Some(next_b) = self.next_bucket(curr) {
+            let delta = if next_b >= curr { next_b - curr } else { NB - curr + next_b };
+            self.base_bucket += delta as u64;
+            self.refill();
+            return self.base_bucket * WB;
+        }
+        if let Some(&std::cmp::Reverse((min_d, _))) = self.overflow.peek() {
+            self.base_bucket = min_d / WB;
+            self.refill();
+            return self.base_bucket * WB;
+        }
+        INF
     }
 }
 
@@ -515,7 +579,7 @@ struct Scratch {
     small: Table,
     large: Table,
     in_large: bool,
-    heaps: [RadixHeap; 2],
+    queues: [BucketQueue; 2],
 }
 
 impl Scratch {
@@ -525,13 +589,13 @@ impl Scratch {
             small: Table::with_slots(SMALL_SLOTS),
             large: Table::with_slots(SMALL_SLOTS * 2),
             in_large: false,
-            heaps: [RadixHeap::new(), RadixHeap::new()],
+            queues: [BucketQueue::new(), BucketQueue::new()],
         }
     }
 
     fn reset(&mut self) {
         (self.direct.clear(), self.small.clear(), self.large.clear(), self.in_large = false);
-        self.heaps.iter_mut().for_each(RadixHeap::clear);
+        self.queues.iter_mut().for_each(BucketQueue::clear);
     }
 
     #[inline(always)]
@@ -590,42 +654,22 @@ impl Scratch {
 /// and prefetching each neighbour's label slot as well bought under 2 %, so neither is here.
 const PREFETCH_AHEAD: usize = 8;
 
-/// Bidirectional Dijkstra: side 0 searches forward from s, side 1 backward from t on the reverse CSR.
-/// mu is the best s-t path seen so far, updated on every relaxation that labels a node the other side
-/// has labelled (zero-weight edges make "the frontiers met" too early a stop). Stop once the two heap
-/// tops sum to mu or more, or either side runs dry. Returns the distance and the number of settles.
-fn bidirectional(g: [&Csr; 2], sc: &mut Scratch, s: u32, t: u32) -> (u64, u64) {
-    sc.reset();
-    for (side, root) in [(0, s), (1, t)] {
-        let i = sc.slot(root);
-        sc.label(i).dist[side] = 0;
-        sc.heaps[side].push(0, root);
-    }
-    let (mut mu, mut settles) = (INF, 0);
-    loop {
-        // Each top is the side's exact minimum key (RadixHeap::top), so the stop test is the floor's.
-        let (Some(top_f), Some(top_b)) = (sc.heaps[0].top(), sc.heaps[1].top()) else {
-            break;
-        };
-        // Both tops are below 2^63, so the sum cannot overflow.
-        if top_f + top_b >= mu {
-            break;
+fn drain_bucket(g: &Csr, sc: &mut Scratch, side: usize, b: usize, bucket_start: u64, best: &mut u64) -> u64 {
+    let mut head = 0;
+    let mut settles = 0;
+    while head < sc.queues[side].buckets[b].len() {
+        if let Some(ahead) = sc.queues[side].buckets[b].get(head + PREFETCH_AHEAD) {
+            g.prefetch(ahead.node as usize);
         }
-        // Expand the side with fewer queued entries. Choosing by the lower top key instead lets a
-        // backward search sweep the whole main body while a forward search from an island waits
-        // behind its near-2^32 spur weights (local A/B: twice the settles, 3x the query time).
-        let side = (sc.heaps[1].len < sc.heaps[0].len) as usize;
-        let (d, u) = sc.heaps[side].pop().unwrap();
-        let iu = sc.slot(u);
-        if d > { sc.label(iu).dist }[side] {
-            continue; // stale: u was relabelled lower after this entry was pushed
+        let e = sc.queues[side].buckets[b][head];
+        head += 1;
+        let iu = sc.slot(e.node);
+        let d = sc.label(iu).dist[side];
+        if d < bucket_start || e.dist != d as u32 {
+            continue;
         }
         settles += 1;
-        // The next pops of this side are the last entries of bucket 0 (it pops from its end).
-        for e in sc.heaps[side].buckets[0].iter().rev().take(PREFETCH_AHEAD) {
-            g[side].prefetch(e.node as usize);
-        }
-        for (v, w) in g[side].row(u as usize) {
+        for (v, w) in g.row(e.node as usize) {
             let nd = d + w;
             let iv = sc.slot(v);
             let l = sc.label(iv);
@@ -635,13 +679,53 @@ fn bidirectional(g: [&Csr; 2], sc: &mut Scratch, s: u32, t: u32) -> (u64, u64) {
                 l.dist = dist;
                 let other = dist[1 - side];
                 if other != INF {
-                    mu = mu.min(nd + other);
+                    *best = (*best).min(nd + other);
                 }
-                sc.heaps[side].push(nd, v);
+                sc.queues[side].push(nd, v);
             }
         }
     }
-    (mu, settles)
+    sc.queues[side].buckets[b].clear();
+    sc.queues[side].occupied[b / 64] &= !(1u64 << (b % 64));
+    settles
+}
+
+/// Bidirectional Dijkstra (d-27 s2): 256-settle forward probe, backward side only when needed.
+fn bidirectional(g: [&Csr; 2], sc: &mut Scratch, s: u32, t: u32) -> (u64, u64) {
+    sc.reset();
+    let is = sc.slot(s);
+    sc.label(is).dist[0] = 0;
+    sc.queues[0].push(0, s);
+    let mut settles = 0;
+    let mut best = INF;
+    while settles < 256 {
+        let lower_f = sc.queues[0].lower();
+        if lower_f == INF {
+            break;
+        }
+        let b = (sc.queues[0].base_bucket as usize) % NB;
+        settles += drain_bucket(g[0], sc, 0, b, sc.queues[0].base_bucket * WB, &mut best);
+    }
+    let lower_f = sc.queues[0].lower();
+    let it = sc.slot(t);
+    let dt = sc.label(it).dist[0];
+    if dt <= lower_f {
+        return (dt, settles);
+    }
+    sc.label(it).dist[1] = 0;
+    sc.queues[1].push(0, t);
+    best = dt;
+    loop {
+        let lower_f = sc.queues[0].lower();
+        let lower_b = sc.queues[1].lower();
+        if lower_f == INF || lower_b == INF || lower_f.saturating_add(lower_b) >= best {
+            break;
+        }
+        let side = if lower_b < lower_f { 1 } else { 0 };
+        let b = (sc.queues[side].base_bucket as usize) % NB;
+        settles += drain_bucket(g[side], sc, side, b, sc.queues[side].base_bucket * WB, &mut best);
+    }
+    (best, settles)
 }
 
 /// The answer to one query (INF means unreachable), the settles it took, and whether its labels
@@ -680,6 +764,7 @@ fn main() {
         let (a, b) = (read_num(queries, &mut i), read_num(queries, &mut i));
         pairs.push((new_id[a as usize], new_id[b as usize]));
     }
+    drop(new_id);
 
     // Queries run in order of their relabelled (s, t), answers still land by input index: after the
     // relabel, neighbouring sources search overlapping regions, so the workers running them at the
