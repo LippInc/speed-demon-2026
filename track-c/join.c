@@ -51,7 +51,9 @@ typedef uint8_t u8;
 enum { NT = 12, CHB = 256, BATCH = 128, RING = 2 * BATCH, PIECE = 1 << 18 };
 enum { MAXREC = 64 * CHB / 8 + 2 };
 
-typedef struct { // one country's running totals, kept per thread
+// One country's running totals, kept per thread: records, id sum, amount
+// sum, min and max in cents, name and note bytes once unescaped, distinct names
+typedef struct {
   long long n, ids, sum, min, max, nb, tb, names;
 } Agg;
 // What pass 2's first loop reads out of a record: the id, where the name
@@ -82,7 +84,7 @@ typedef struct { // one owner's names
 static u8 *rec;                       // records.csv, mapped
 static u64 rsize, regsize, maxreg;    // file sizes, the largest region id
 static const u8 *reg;                 // regions.csv, mapped
-static u8 *rtab;                      // region id -> country, 0 = unmatched
+static u8 *rtab; // region id -> country, 0 = unmatched (the data has 239)
 static _Atomic u8 cidx[26 * 26 * 26]; // country code -> country number
 static int ncountry;
 static pthread_mutex_t cmu = PTHREAD_MUTEX_INITIALIZER;
@@ -198,7 +200,8 @@ static inline u64 name(const u8 *p, u64 *len, const u8 **end) {
 }
 
 // The length of the text field p[0, n) once unescaped: an unquoted field is
-// its bytes; a quoted one loses its two delimiters and one byte per "".
+// its bytes; a quoted one holds q quotes, its two delimiters and two per "",
+// and loses q / 2 + 1 bytes.
 static inline u64 text(const u8 *p, u64 n) {
   u64 q = 0, m = n;
   for (; m > 64; m -= 64, p += 64)
@@ -225,7 +228,8 @@ static inline u64 *find(u64 *slot, u64 mask, u64 msg) {
 }
 
 // Doubles the table and refiles every name; ids and rows stay. lo[id] keeps
-// the message bits 8-19 that the slot lacks.
+// the message bits 8-19 that the slot lacks. add() grows the table at 5/8
+// full, so ids and rows need 5/8 of its slots.
 static void grow(Names *m) {
   u64 *old = m->slot, n = old ? 4 * (m->mask + 1) : 0, size = old ? 2 * n : 1 << 14;
   m->slot = aligned_alloc(32, size * 8);
@@ -261,7 +265,9 @@ static int country(const u8 *p) { // numbers countries in order of first sight
   return c;
 }
 
-static void regions(int t) { // the lines that start in this thread's twelfth
+// The lines that start in this thread's twelfth of regions.csv (thread 0's
+// first line, the header, starts at 0 and is skipped).
+static void regions(int t) {
   u64 p = t ? regsize * t / NT : 1, e = regsize * (t + 1) / NT;
   while (p < e && reg[p - 1] != '\n')
     p++;
@@ -274,7 +280,9 @@ static void regions(int t) { // the lines that start in this thread's twelfth
   }
 }
 
-static u64 record_start(u64 q) { // the first record starting at or after q
+// The first record starting at or after q. Byte 0 starts the BOM and header
+// (spec 2.2), never a record, so the search starts at 1.
+static u64 record_start(u64 q) {
   for (q = q ? q : 1; q < rsize; q++)
     if (rec[q - 1] == '\n' && ((u8)(rec[q] - '0') < 10 || rec[q] == 0xEF))
       return q;
@@ -282,7 +290,8 @@ static u64 record_start(u64 q) { // the first record starting at or after q
 }
 
 // A bit per byte of p[0, 32) that ends a record: an LF that is not followed
-// by a lowercase letter or a quote.
+// by a lowercase letter (the signed compare takes any byte from 'a' to 0x7F)
+// or a quote. A BOM's first byte, 0xEF, compares as negative: a record end.
 static inline u32 ends32(const u8 *p) {
   __m256i next = load32(p + 1);
   return _mm256_movemask_epi8(_mm256_andnot_si256(
@@ -304,7 +313,9 @@ static void ends(Scan *z, u64 to) {
       s = _bzhi_u64(s, end - at);
     u64 k = n;
     n += _mm_popcnt_u64(s);
-    do // two at a time, without a test per bit: a block holds about one
+    // Two at a time, without a test per bit: a block holds about one. An odd
+    // count writes one offset past n, which nothing reads (ix has room).
+    do
       for (int i = 0; i < 2; i++, k++, s = _blsr_u64(s))
         ix[k] = at + _tzcnt_u64(s);
     while (s);
@@ -375,11 +386,13 @@ static void records(Ctx *x, Scan *z) {
     u64 e = ix[r], at = s + (f[s] == 0xEF ? 3 : 0);
     u64 a = _tzcnt_u32(eq32(f + at, comma));
     // The commas before the region and the amount: the last two of the
-    // record, which its last 32 bytes hold
+    // record, which its last 32 bytes hold (spec 2.2: a region id has 7 digits
+    // at most and an amount 8 characters, so that tail is 19 bytes at most)
     u32 m = eq32(f + e - 32, comma);
     u64 d = e - 1 - _lzcnt_u32(m);
     u64 c = e - 1 - _lzcnt_u32(_bzhi_u32(m, d + 32 - e));
-    // The amount ends the record: its digits, the point dropped, end a load
+    // The amount ends the record: v is its last 8 bytes, "DDDDD.CC" with the
+    // point at byte 5, and the shift moves the digits before it up over it
     u64 cr = f[e - 1] == '\r', neg = f[d + 1] == '-', nd = e - cr - d - 2 - neg;
     u64 v = digits(f + e - cr - 8);
     v = (v & 0xFFFF000000000000) | (v << 8 & 0x0000FFFFFFFFFF00);
@@ -394,8 +407,8 @@ static void records(Ctx *x, Scan *z) {
   }
   Agg *ag = x->agg;
   for (u64 r = 0; r < n; r++) {
-    u64 cr = rt[rs[r].reg];
-    Agg *g = ag + cr;
+    u64 co = rt[rs[r].reg];
+    Agg *g = ag + co;
     int64_t cents = rs[r].cents;
     g->n++;
     g->ids += rs[r].id;
@@ -408,12 +421,12 @@ static void records(Ctx *x, Scan *z) {
     u64 nl, h = name(f + rs[r].name, &nl, &b);
     g->nb += nl;
     g->tb += text(b + 1, f + rs[r].comma - b - 1);
-    u64 o = (h >> 32) * NT >> 32; // the name's owner
-    x->batch[o][x->fill[o]] = (h & ~255ull) | cr;
+    u64 o = (h >> 32) * NT >> 32; // the name's owner: h's top half scaled to NT
+    x->batch[o][x->fill[o]] = (h & ~255ull) | co;
     if (++x->fill[o] == BATCH)
       post(x, o);
   }
-  if (n)
+  if (n) // else no record ended in these blocks
     z->start = ix[n - 1] + 1;
   z->n = 0;
 }
@@ -501,7 +514,8 @@ int main(void) {
   reg = mmap(0, regsize, PROT_READ, MAP_PRIVATE, gfd, 0);
   if (reg == MAP_FAILED)
     die("mmap regions.csv");
-  // Ids ascend (spec 2.3): the last line has the largest
+  // Ids ascend (spec 2.3): the last line has the largest. regsize - 1 skips
+  // the file's final LF.
   maxreg = strtoull((char *)memrchr(reg, '\n', regsize - 1) + 1, 0, 10);
   rtab = big(maxreg + 2); // the last entry: every id above the range
   pthread_t th[NT];
