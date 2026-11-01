@@ -36,6 +36,7 @@
 #include <immintrin.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,26 +48,28 @@ typedef uint64_t u64;
 typedef uint32_t u32;
 typedef uint8_t u8;
 // CHB: 64-byte blocks per pass 1; BATCH: messages staged per owner.
-// MAXREC: records per pass 1, each 11 bytes or more.
+// MAXREC: records per pass 1, each 11 bytes or more; HOTREC: the most the
+// data puts in one pass 1 (under 300), with room to spare.
 enum { NT = 12, CHB = 256, BATCH = 128, RING = 2 * BATCH, PIECE = 1 << 18 };
-enum { MAXREC = 64 * CHB / 8 + 2 };
+enum { MAXREC = 64 * CHB / 8 + 2, HOTREC = 512, STACK = 1 << 16 };
 
 typedef struct { // one country's running totals, kept per thread
   long long n, ids, sum, min, max, nb, tb, names;
 } Agg;
 // What pass 2's first loop reads out of a record: the id, where the name
-// starts, the comma before the region, the amount in cents.
+// starts, the comma before the region, the region's table index, the amount
+// in cents.
 typedef struct {
-  u32 id, name, comma;
+  u32 id, name, comma, reg;
   int32_t cents;
 } Rec;
 typedef struct { // a thread's outgoing messages, totals and pass 2 records
   _Alignas(64) u64 batch[NT][BATCH]; // each owner's next messages, fill[o] used
-  Rec rec[MAXREC];
-  u32 rr[MAXREC]; // each record's region table index
   u32 fill[NT];
   int t;
   Agg *agg;
+  u32 ix[MAXREC + 2]; // the record ends pass 1 found
+  Rec rec[MAXREC];
 } Ctx;
 typedef struct { // a thread's part of records.csv, parsed in two passes
   const u8 *f;        // its first byte; offsets count from here
@@ -86,7 +89,8 @@ static u8 *rtab;                      // region id -> country, 0 = unmatched
 static _Atomic u8 cidx[26 * 26 * 26]; // country code -> country number
 static int ncountry;
 static pthread_mutex_t cmu = PTHREAD_MUTEX_INITIALIZER;
-static atomic_int arrived, gen, finished;
+static atomic_int finished;
+static pthread_barrier_t meet; // all NT threads
 static _Atomic u64 piece; // the next piece of records.csv to parse
 typedef struct { // the messages from one thread to one owner, RING at most
   _Alignas(64) _Atomic u64 tail; // advanced by the sender
@@ -96,6 +100,8 @@ typedef struct { // the messages from one thread to one owner, RING at most
 static Ring ring[NT][NT]; // [sender][owner]
 static Agg agg[NT][256];
 static Names names[NT];
+static Ctx *ctx; // [NT]
+extern char __bss_start[], _end[]; // the zeroed statics
 static const u8 KEEP[64] = {[0 ... 31] = 0xFF}; // KEEP + 32 - n: n bytes kept
 
 static void die(const char *what) {
@@ -111,6 +117,13 @@ static void *big(u64 n) { // zeroed; only the pages touched count as memory
   madvise(p, n, MADV_NOHUGEPAGE);
   return p;
 }
+// Faults in p[0, n) now. Main does this for all the memory the threads
+// write: the kernel charges a CPU's first page fault to the cgroup as 64
+// pages, so faults on all 12 CPUs would count up to 3 MB (in M) unused.
+static void hot(void *p, u64 n) {
+  u64 a = (uintptr_t)p & ~4095ull;
+  madvise((void *)a, (uintptr_t)p + n - a, MADV_POPULATE_WRITE);
+}
 static inline u64 digits(const u8 *p) { // p[0, 8) as digit values
   u64 v;
   memcpy(&v, p, 8);
@@ -121,16 +134,6 @@ static inline __m256i load32(const u8 *p) {
 }
 static inline u32 eq32(const u8 *p, __m256i c) { // a bit per byte of p == c
   return _mm256_movemask_epi8(_mm256_cmpeq_epi8(load32(p), c));
-}
-
-static void barrier(void) { // all NT threads meet here
-  int g = gen;
-  if (atomic_fetch_add(&arrived, 1) == NT - 1) {
-    arrived = 0;
-    gen = g + 1;
-  } else
-    while (gen == g)
-      _mm_pause();
 }
 
 // Three numbers at once, each up to 8 digit values in the top bytes of a
@@ -233,26 +236,28 @@ static inline u64 *find(u64 *slot, u64 mask, u64 msg) {
   }
 }
 
-// Doubles the table and refiles every name; ids and rows stay. lo[id] keeps
-// the message bits 8-19 that the slot lacks.
+// Doubles the table (at 9/16 full: the first, 9,216 names, holds the ~8,400
+// an owner gets) and refiles every name; ids and rows stay. lo[id] keeps the
+// message bits 8-19 that the slot lacks.
 static void grow(Names *m) {
   u64 *old = m->slot, n = old ? 4 * (m->mask + 1) : 0, size = old ? 2 * n : 1 << 14;
-  m->slot = aligned_alloc(32, size * 8);
-  m->lo = realloc(m->lo, size * 5 / 8 * sizeof *m->lo);
-  m->row = realloc(m->row, size * 5 / 8 * sizeof *m->row);
-  if (!m->slot || !m->lo || !m->row)
+  m->slot = big(size * 8);
+  m->lo = realloc(m->lo, size * 9 / 16 * sizeof *m->lo);
+  m->row = realloc(m->row, size * 9 / 16 * sizeof *m->row);
+  if (!m->lo || !m->row)
     die("malloc");
-  memset(m->slot, 0, size * 8);
+  hot(m->slot, size * 8), hot(m->lo, size * 9 / 16 * sizeof *m->lo);
+  hot(m->row, size * 9 / 16 * sizeof *m->row);
   m->mask = size / 4 - 1;
   for (u64 i = 0; i < n; i++)
     if (old[i])
       *find(m->slot, m->mask, old[i] >> 20 << 20 | (u64)(m->lo[(old[i] & 0xFFFFF) - 1] & 0xFFF) << 8) = old[i];
-  free(old);
+  munmap(old, n * 8);
 }
 
 // Files the name of message msg, seen for the first time; returns its slot.
 __attribute__((cold)) static u64 add(Names *m, u64 msg) {
-  if (8 * m->n >= 5 * 4 * (m->mask + 1))
+  if (16 * m->n >= 9 * 4 * (m->mask + 1))
     grow(m);
   memset(m->row[m->n], 0, 32); // rows are touched only once used
   m->lo[m->n] = msg >> 8;
@@ -329,7 +334,7 @@ static u64 drain(int t, Agg *a) {
   u64 done = 0;
   for (int from = 0; from < NT; from++) {
     Ring *r = &ring[from][t];
-    u64 *m = r->m, h = r->head, k = atomic_load_explicit(&r->tail, memory_order_acquire);
+    u64 *m = r->m, h = r->head, k = r->tail;
     done += k - h;
     for (u64 e; h < k; h = e) {
       e = k - h < 64 ? k : h + 64;
@@ -360,7 +365,7 @@ static u64 drain(int t, Agg *a) {
 static void post(Ctx *x, int o) {
   Ring *r = &ring[x->t][o];
   u64 n = x->fill[o], t = r->tail;
-  while (t + n - atomic_load_explicit(&r->head, memory_order_acquire) > RING)
+  while (t + n - r->head > RING)
     if (!drain(x->t, x->agg))
       _mm_pause();
   memcpy(r->m + t % RING, x->batch[o], 8 * n);
@@ -378,7 +383,6 @@ static void records(Ctx *x, Scan *z) {
   const u32 *ix = z->ix;
   u64 n = z->n, top = maxreg + 1; // top: unmatched
   Rec *rs = x->rec;
-  u32 *rr = x->rr;
   __m256i comma = _mm256_set1_epi8(',');
   for (u64 r = 0, s = z->start; r < n; s = ix[r++] + 1) {
     // A BOM at a record start is not data. The id: 8 digits at most.
@@ -398,20 +402,22 @@ static void records(Ctx *x, Scan *z) {
                         v & ~0ull << (64 - 8 * nd));
     u64 rid = _mm256_extract_epi64(num, 1);
     int32_t cents = _mm256_extract_epi64(num, 2);
-    rr[r] = rid < top ? rid : top;
-    _mm_prefetch((const char *)rt + rr[r], _MM_HINT_T0);
-    rs[r] = (Rec){_mm256_cvtsi256_si32(num), at + a + 1, c, neg ? -cents : cents};
+    rid = rid < top ? rid : top;
+    _mm_prefetch((const char *)rt + rid, _MM_HINT_T0);
+    rs[r] = (Rec){_mm256_cvtsi256_si32(num), at + a + 1, c, rid, neg ? -cents : cents};
   }
   Agg *ag = x->agg;
   for (u64 r = 0; r < n; r++) {
-    u64 cr = rt[rr[r]];
+    u64 cr = rt[rs[r].reg];
     Agg *g = ag + cr;
     int64_t cents = rs[r].cents;
     g->n++;
     g->ids += rs[r].id;
     g->sum += cents;
-    g->min = cents < g->min ? cents : g->min;
-    g->max = cents > g->max ? cents : g->max;
+    if (cents < g->min) // rarely: a thread sees ~900 amounts per country
+      g->min = cents;
+    if (cents > g->max)
+      g->max = cents;
     const u8 *b;
     u64 nl, h = name(f + rs[r].name, &nl, &b);
     g->nb += nl;
@@ -428,15 +434,12 @@ static void records(Ctx *x, Scan *z) {
 
 static void *worker(void *arg) {
   int t = (int)(intptr_t)arg;
-  static Ctx ctx[NT];
   Ctx *x = &ctx[t];
   x->agg = agg[t], x->t = t;
   for (int c = 0; c < 256; c++)
     agg[t][c] = (Agg){.min = INT64_MAX, .max = INT64_MIN};
   regions(t);
-  barrier(); // the region table is complete
-  grow(&names[t]);
-  u32 *ix = big(4 * (MAXREC + 2));
+  pthread_barrier_wait(&meet); // the region table is complete
   // Piece i is the (i / n)th of the 2 MB stretch i % n: threads working at
   // once never share a stretch's page-table lock when they fault pages in.
   u64 n = (rsize >> 21) + 1;
@@ -445,7 +448,7 @@ static void *worker(void *arg) {
     if (c >= rsize)
       continue;
     u64 lo = record_start(c), hi = record_start(c + PIECE);
-    Scan z = {.f = rec + lo, .end = hi - lo, .ix = ix};
+    Scan z = {.f = rec + lo, .end = hi - lo, .ix = x->ix};
     for (; z.at < z.end; k++) {
       ends(&z, z.at + 64 * CHB < z.end ? z.at + 64 * CHB : z.end);
       records(x, &z);
@@ -461,7 +464,8 @@ static void *worker(void *arg) {
     if (!drain(t, x->agg))
       _mm_pause();
   drain(t, x->agg);
-  barrier(); // every total is final: main writes them out meanwhile
+  // Every total is final: main writes them out meanwhile
+  pthread_barrier_wait(&meet);
   // Every record is parsed: the other threads drop an eleventh of the
   // mapping each, or exit tears down all 49,000 page-table entries on one CPU.
   if (t) {
@@ -505,16 +509,33 @@ int main(void) {
   rec = big(rsize + 4096);
   if (mmap(rec, rsize, PROT_READ, MAP_PRIVATE | MAP_FIXED, rfd, 0) != rec)
     die("mmap records.csv");
-  reg = mmap(0, regsize, PROT_READ, MAP_PRIVATE, gfd, 0);
+  reg = mmap(0, regsize, PROT_READ, MAP_PRIVATE | MAP_POPULATE, gfd, 0);
   if (reg == MAP_FAILED)
     die("mmap regions.csv");
   // Ids ascend (spec 2.3): the last line has the largest
   maxreg = strtoull((char *)memrchr(reg, '\n', regsize - 1) + 1, 0, 10);
   rtab = big(maxreg + 2); // the last entry: every id above the range
+  hot(rtab, maxreg + 2), hot(__bss_start, _end - __bss_start);
+  // Each 2 MB of the mapping gets its page-table page here
+  for (u64 i = 0; i < rsize; i += 1 << 21)
+    (void)*(volatile u8 *)(rec + i);
+  (void)*(volatile u8 *)(rec + rsize); // the zeros after the file
+  ctx = big(NT * sizeof *ctx);
+  u8 *stack = big(NT * STACK);
   pthread_t th[NT];
-  for (long t = 1; t < NT; t++)
-    if (pthread_create(&th[t], 0, worker, (void *)t))
+  pthread_attr_t at;
+  pthread_attr_init(&at);
+  pthread_barrier_init(&meet, 0, NT);
+  for (long t = 0; t < NT; t++) {
+    grow(&names[t]);
+    hot(&ctx[t], offsetof(Ctx, ix) + 4 * HOTREC), hot(ctx[t].rec, sizeof(Rec) * HOTREC);
+    if (!t)
+      continue;
+    hot(stack + t * STACK + STACK * 3 / 4, STACK / 4); // the top, the part used
+    pthread_attr_setstack(&at, stack + t * STACK, STACK);
+    if (pthread_create(&th[t], &at, worker, (void *)t))
       die("pthread_create");
+  }
   worker(0);
   FILE *o = fopen("/out/aggregates.txt", "w");
   if (!o)
