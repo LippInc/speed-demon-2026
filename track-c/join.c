@@ -36,7 +36,6 @@
 #include <immintrin.h>
 #include <pthread.h>
 #include <stdatomic.h>
-#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,15 +47,13 @@ typedef uint64_t u64;
 typedef uint32_t u32;
 typedef uint8_t u8;
 // CHB: 64-byte blocks per pass 1; BATCH: messages staged per owner.
-// MAXREC: records per pass 1, each 11 bytes or more; HOTREC: the most the
-// data puts in one pass 1 (under 300), with room to spare. SLOTS: an owner's
-// first name table, which holds NAMES names (an owner gets ~8,400).
+// MAXREC: records per pass 1, each 11 bytes or more.
 enum { NT = 12, CHB = 256, BATCH = 128, RING = 2 * BATCH, PIECE = 1 << 18 };
-enum { MAXREC = 64 * CHB / 8 + 2, HOTREC = 512, STACK = 1 << 16 };
-enum { SLOTS = 1 << 14, NAMES = SLOTS * 9 / 16, HUGE = 1 << 21 };
-enum { CHARGE = 64 << 12 }; // a CPU's memcg charge batch, 64 pages
+enum { MAXREC = 64 * CHB / 8 + 2 };
 
-typedef struct { // one country's running totals, kept per thread
+// One country's running totals, kept per thread: records, id sum, amount
+// sum, min and max in cents, name and note bytes once unescaped, distinct names
+typedef struct {
   long long n, ids, sum, min, max, nb, tb, names;
 } Agg;
 // What pass 2's first loop reads out of a record: the id, where the name
@@ -68,11 +65,10 @@ typedef struct {
 } Rec;
 typedef struct { // a thread's outgoing messages, totals and pass 2 records
   _Alignas(64) u64 batch[NT][BATCH]; // each owner's next messages, fill[o] used
+  Rec rec[MAXREC];
   u32 fill[NT];
   int t;
   Agg *agg;
-  u32 ix[MAXREC + 2]; // the record ends pass 1 found
-  Rec rec[MAXREC];
 } Ctx;
 typedef struct { // a thread's part of records.csv, parsed in two passes
   const u8 *f;        // its first byte; offsets count from here
@@ -88,13 +84,7 @@ typedef struct { // one owner's names
 static u8 *rec;                       // records.csv, mapped
 static u64 rsize, regsize, maxreg;    // file sizes, the largest region id
 static const u8 *reg;                 // regions.csv, mapped
-// Region id -> country (0: unmatched), for 200,000 ids among 1,000,000. Ids
-// ascend, one per line: has[w] has a bit per id 64w..64w+63, first[w] is the
-// line of word w's first id and ctry[line] the country.
-static u64 *has;
-static u32 *first;
-static u8 *ctry;
-static _Atomic u64 nline[NT]; // the lines of each share of regions.csv, + 1
+static u8 *rtab; // region id -> country, 0 = unmatched (the data has 239)
 static _Atomic u8 cidx[26 * 26 * 26]; // country code -> country number
 static int ncountry;
 static pthread_mutex_t cmu = PTHREAD_MUTEX_INITIALIZER;
@@ -106,18 +96,9 @@ typedef struct { // the messages from one thread to one owner, RING at most
   _Alignas(64) _Atomic u64 head; // advanced by the owner
   _Alignas(64) u64 m[RING];      // message i is m[i % RING]
 } Ring;
-static Ring (*ring)[NT]; // [sender][owner]
-static Agg (*agg)[256];
+static Ring ring[NT][NT]; // [sender][owner]
+static Agg agg[NT][256];
 static Names names[NT];
-static Ctx *ctx;    // [NT]
-static u8 *shared;  // the tables above
-static u64 carved;  // how much of them
-// shared is faulted in CHARGE bytes at a time: the stretch to do next, the
-// ones done of the region table's rstretch, all nstretch
-static _Atomic u64 next;
-static atomic_int ready;
-static u64 rstretch, nstretch;
-extern char __bss_start[], _end[]; // the zeroed statics
 static const u8 KEEP[64] = {[0 ... 31] = 0xFF}; // KEEP + 32 - n: n bytes kept
 
 static void die(const char *what) {
@@ -131,34 +112,6 @@ static void *big(u64 n) { // zeroed; only the pages touched count as memory
     die("mmap");
   // A 2 MB page would be zeroed and counted whole
   madvise(p, n, MADV_NOHUGEPAGE);
-  return p;
-}
-// Faults in p[0, n) now. The kernel charges 4 KB page faults to the cgroup 64
-// pages ahead per CPU, so faults on all 12 CPUs would count up to 3 MB (in M)
-// never used. Main faults in what the threads write alone; the tables they
-// share are faulted in whole charge batches, see spare().
-static void hot(void *p, u64 n) {
-  u64 a = (uintptr_t)p & ~4095ull;
-  madvise((void *)a, (uintptr_t)p + n - a, MADV_POPULATE_WRITE);
-}
-// Faults in a byte per 2 MB of p[0, n) and the last, so each 2 MB of a file
-// mapping gets its page-table page (a 4 KB charge) here
-static void tables(const u8 *p, u64 n) {
-  for (u64 i = 0; i < n; i += HUGE)
-    (void)*(volatile const u8 *)(p + i);
-  (void)*(volatile const u8 *)(p + n - 1);
-}
-// Faults in stretches of shared until stretch `to` is taken
-static void spare(u64 to) {
-  for (u64 s; next < to && (s = next++) < nstretch;) {
-    hot(shared + s * CHARGE, CHARGE);
-    if (s < rstretch)
-      ready++;
-  }
-}
-static void *carve(u64 n) { // the next n bytes of shared
-  void *p = shared + carved;
-  carved += (n + 63) & ~63ull;
   return p;
 }
 static inline u64 digits(const u8 *p) { // p[0, 8) as digit values
@@ -247,7 +200,8 @@ static inline u64 name(const u8 *p, u64 *len, const u8 **end) {
 }
 
 // The length of the text field p[0, n) once unescaped: an unquoted field is
-// its bytes; a quoted one loses its two delimiters and one byte per "".
+// its bytes; a quoted one holds q quotes, its two delimiters and two per "",
+// and loses q / 2 + 1 bytes.
 static inline u64 text(const u8 *p, u64 n) {
   u64 q = 0, m = n;
   for (; m > 64; m -= 64, p += 64)
@@ -273,24 +227,27 @@ static inline u64 *find(u64 *slot, u64 mask, u64 msg) {
   }
 }
 
-// Doubles the table at 9/16 full and refiles every name; ids and rows stay.
-// lo[id] keeps the message bits 8-19 that the slot lacks.
+// Doubles the table and refiles every name; ids and rows stay. lo[id] keeps
+// the message bits 8-19 that the slot lacks. add() grows the table at 5/8
+// full, so ids and rows need 5/8 of its slots.
 static void grow(Names *m) {
-  u64 *old = m->slot, n = 4 * (m->mask + 1), size = 2 * n, cap = size * 9 / 16;
-  uint16_t *lo = malloc(cap * sizeof *lo);
-  u64(*row)[4] = malloc(cap * sizeof *row);
-  if (!lo || !row)
+  u64 *old = m->slot, n = old ? 4 * (m->mask + 1) : 0, size = old ? 2 * n : 1 << 14;
+  m->slot = aligned_alloc(32, size * 8);
+  m->lo = realloc(m->lo, size * 5 / 8 * sizeof *m->lo);
+  m->row = realloc(m->row, size * 5 / 8 * sizeof *m->row);
+  if (!m->slot || !m->lo || !m->row)
     die("malloc");
-  memcpy(lo, m->lo, m->n * sizeof *lo), memcpy(row, m->row, m->n * sizeof *row);
-  m->slot = big(size * 8), m->lo = lo, m->row = row, m->mask = size / 4 - 1;
+  memset(m->slot, 0, size * 8);
+  m->mask = size / 4 - 1;
   for (u64 i = 0; i < n; i++)
     if (old[i])
       *find(m->slot, m->mask, old[i] >> 20 << 20 | (u64)(m->lo[(old[i] & 0xFFFFF) - 1] & 0xFFF) << 8) = old[i];
+  free(old);
 }
 
 // Files the name of message msg, seen for the first time; returns its slot.
 __attribute__((cold)) static u64 add(Names *m, u64 msg) {
-  if (16 * m->n >= 9 * 4 * (m->mask + 1))
+  if (8 * m->n >= 5 * 4 * (m->mask + 1))
     grow(m);
   memset(m->row[m->n], 0, 32); // rows are touched only once used
   m->lo[m->n] = msg >> 8;
@@ -308,45 +265,24 @@ static int country(const u8 *p) { // numbers countries in order of first sight
   return c;
 }
 
-// The lines that start in share i of NT - 2 of regions.csv. Their numbers
-// count on from the lines of the shares before, which a thread counts first.
-static void regions(int i) {
-  u64 p = i ? regsize * i / (NT - 2) : 1, e = regsize * (i + 1) / (NT - 2);
+// The lines that start in this thread's twelfth of regions.csv (thread 0's
+// first line, the header, starts at 0 and is skipped).
+static void regions(int t) {
+  u64 p = t ? regsize * t / NT : 1, e = regsize * (t + 1) / NT;
   while (p < e && reg[p - 1] != '\n')
     p++;
-  u64 n = 0, j = p - 1, line = 0; // the LFs before each line start in [p, e)
-  for (; j + 32 < e; j += 32)
-    n += _mm_popcnt_u32(eq32(reg + j, _mm256_set1_epi8('\n')));
-  for (; j + 1 < e; j++)
-    n += reg[j] == '\n';
-  nline[i] = n + 1;
-  for (int k = 0; k < i; k++) {
-    while (!nline[k])
-      _mm_pause();
-    line += nline[k] - 1;
-  }
-  // The word of the line before: if our first id shares it, so does its first
-  u64 q = p - 1;
-  while (q && reg[q - 1] != '\n')
-    q--;
-  u64 w = strtoull((const char *)reg + q, 0, 10) >> 6, bits = 0; // header: 0
-  while (ready < rstretch) // the table is in
-    _mm_pause();
-  for (; p < e; p += 5, line++) { // "id,CCC\n": plain ASCII, spec 2.3
+  while (p < e) { // "id,CCC\n": plain ASCII, spec 2.3
     u64 id = 0;
     while (reg[p] != ',')
       id = id * 10 + reg[p++] - '0';
-    if (id >> 6 != w) { // words at the shares' ends are shared
-      __atomic_fetch_or(&has[w], bits, __ATOMIC_RELAXED);
-      w = id >> 6, bits = 0, first[w] = line;
-    }
-    bits |= 1ull << (id & 63);
-    ctry[line] = country(reg + p + 1);
+    rtab[id] = country(reg + p + 1);
+    p += 5;
   }
-  __atomic_fetch_or(&has[w], bits, __ATOMIC_RELAXED);
 }
 
-static u64 record_start(u64 q) { // the first record starting at or after q
+// The first record starting at or after q. Byte 0 starts the BOM and header
+// (spec 2.2), never a record, so the search starts at 1.
+static u64 record_start(u64 q) {
   for (q = q ? q : 1; q < rsize; q++)
     if (rec[q - 1] == '\n' && ((u8)(rec[q] - '0') < 10 || rec[q] == 0xEF))
       return q;
@@ -354,7 +290,8 @@ static u64 record_start(u64 q) { // the first record starting at or after q
 }
 
 // A bit per byte of p[0, 32) that ends a record: an LF that is not followed
-// by a lowercase letter or a quote.
+// by a lowercase letter (the signed compare takes any byte from 'a' to 0x7F)
+// or a quote. A BOM's first byte, 0xEF, compares as negative: a record end.
 static inline u32 ends32(const u8 *p) {
   __m256i next = load32(p + 1);
   return _mm256_movemask_epi8(_mm256_andnot_si256(
@@ -376,7 +313,9 @@ static void ends(Scan *z, u64 to) {
       s = _bzhi_u64(s, end - at);
     u64 k = n;
     n += _mm_popcnt_u64(s);
-    do // two at a time, without a test per bit: a block holds about one
+    // Two at a time, without a test per bit: a block holds about one. An odd
+    // count writes one offset past n, which nothing reads (ix has room).
+    do
       for (int i = 0; i < 2; i++, k++, s = _blsr_u64(s))
         ix[k] = at + _tzcnt_u64(s);
     while (s);
@@ -437,9 +376,7 @@ static void post(Ctx *x, int o) {
 // overlap. The second does the totals, the name and the note.
 static void records(Ctx *x, Scan *z) {
   // Locals, not globals or z's fields: the stores below could alias those.
-  const u8 *f = z->f, *cs = ctry;
-  const u64 *hs = has;
-  const u32 *fs = first;
+  const u8 *f = z->f, *rt = rtab;
   const u32 *ix = z->ix;
   u64 n = z->n, top = maxreg + 1; // top: unmatched
   Rec *rs = x->rec;
@@ -449,11 +386,13 @@ static void records(Ctx *x, Scan *z) {
     u64 e = ix[r], at = s + (f[s] == 0xEF ? 3 : 0);
     u64 a = _tzcnt_u32(eq32(f + at, comma));
     // The commas before the region and the amount: the last two of the
-    // record, which its last 32 bytes hold
+    // record, which its last 32 bytes hold (spec 2.2: a region id has 7 digits
+    // at most and an amount 8 characters, so that tail is 19 bytes at most)
     u32 m = eq32(f + e - 32, comma);
     u64 d = e - 1 - _lzcnt_u32(m);
     u64 c = e - 1 - _lzcnt_u32(_bzhi_u32(m, d + 32 - e));
-    // The amount ends the record: its digits, the point dropped, end a load
+    // The amount ends the record: v is its last 8 bytes, "DDDDD.CC" with the
+    // point at byte 5, and the shift moves the digits before it up over it
     u64 cr = f[e - 1] == '\r', neg = f[d + 1] == '-', nd = e - cr - d - 2 - neg;
     u64 v = digits(f + e - cr - 8);
     v = (v & 0xFFFF000000000000) | (v << 8 & 0x0000FFFFFFFFFF00);
@@ -463,15 +402,13 @@ static void records(Ctx *x, Scan *z) {
     u64 rid = _mm256_extract_epi64(num, 1);
     int32_t cents = _mm256_extract_epi64(num, 2);
     rid = rid < top ? rid : top;
-    _mm_prefetch((const char *)(hs + (rid >> 6)), _MM_HINT_T0);
-    _mm_prefetch((const char *)(fs + (rid >> 6)), _MM_HINT_T0);
+    _mm_prefetch((const char *)rt + rid, _MM_HINT_T0);
     rs[r] = (Rec){_mm256_cvtsi256_si32(num), at + a + 1, c, rid, neg ? -cents : cents};
   }
   Agg *ag = x->agg;
   for (u64 r = 0; r < n; r++) {
-    u64 id = rs[r].reg, w = hs[id >> 6], in = w >> (id & 63) & 1;
-    u64 cr = cs[fs[id >> 6] + _mm_popcnt_u64(_bzhi_u64(w, id & 63))] & -in;
-    Agg *g = ag + cr;
+    u64 co = rt[rs[r].reg];
+    Agg *g = ag + co;
     int64_t cents = rs[r].cents;
     g->n++;
     g->ids += rs[r].id;
@@ -484,30 +421,27 @@ static void records(Ctx *x, Scan *z) {
     u64 nl, h = name(f + rs[r].name, &nl, &b);
     g->nb += nl;
     g->tb += text(b + 1, f + rs[r].comma - b - 1);
-    u64 o = (h >> 32) * NT >> 32; // the name's owner
-    x->batch[o][x->fill[o]] = (h & ~255ull) | cr;
+    u64 o = (h >> 32) * NT >> 32; // the name's owner: h's top half scaled to NT
+    x->batch[o][x->fill[o]] = (h & ~255ull) | co;
     if (++x->fill[o] == BATCH)
       post(x, o);
   }
-  if (n)
+  if (n) // else no record ended in these blocks
     z->start = ix[n - 1] + 1;
   z->n = 0;
 }
 
 static void *worker(void *arg) {
   int t = (int)(intptr_t)arg;
+  static Ctx ctx[NT];
   Ctx *x = &ctx[t];
-  // The page-table pages of records.csv: thread NT - 1 charges the first 64,
-  // one CPU's charge batch, main the rest
-  if (t == NT - 1)
-    tables(rec, rsize < 64 * HUGE ? rsize + 1 : 64 * HUGE);
-  else if (t)
-    spare(rstretch), regions(t - 1);
-  spare(nstretch);
-  pthread_barrier_wait(&meet); // the region table is complete
+  x->agg = agg[t], x->t = t;
   for (int c = 0; c < 256; c++)
     agg[t][c] = (Agg){.min = INT64_MAX, .max = INT64_MIN};
-  x->agg = agg[t], x->t = t;
+  regions(t);
+  pthread_barrier_wait(&meet); // the region table is complete
+  grow(&names[t]);
+  u32 *ix = big(4 * (MAXREC + 2));
   // Piece i is the (i / n)th of the 2 MB stretch i % n: threads working at
   // once never share a stretch's page-table lock when they fault pages in.
   u64 n = (rsize >> 21) + 1;
@@ -516,7 +450,7 @@ static void *worker(void *arg) {
     if (c >= rsize)
       continue;
     u64 lo = record_start(c), hi = record_start(c + PIECE);
-    Scan z = {.f = rec + lo, .end = hi - lo, .ix = x->ix};
+    Scan z = {.f = rec + lo, .end = hi - lo, .ix = ix};
     for (; z.at < z.end; k++) {
       ends(&z, z.at + 64 * CHB < z.end ? z.at + 64 * CHB : z.end);
       records(x, &z);
@@ -580,41 +514,15 @@ int main(void) {
   reg = mmap(0, regsize, PROT_READ, MAP_PRIVATE, gfd, 0);
   if (reg == MAP_FAILED)
     die("mmap regions.csv");
-  // Ids ascend (spec 2.3): the last line has the largest
-  tables(reg, regsize);
+  // Ids ascend (spec 2.3): the last line has the largest. regsize - 1 skips
+  // the file's final LF.
   maxreg = strtoull((char *)memrchr(reg, '\n', regsize - 1) + 1, 0, 10);
-  // The shared tables, the region table first. A line of regions.csv is 6
-  // bytes or more. The last word of has: every id above the range. The last
-  // stretch runs past the end.
-  u64 words = (maxreg + 1) / 64 + 1;
-  u64 size = NT * (SLOTS * 8 + NAMES * 34) + sizeof(Ring[NT][NT]) +
-             sizeof(Agg[NT][256]) + words * 12 + regsize / 6 + 4096;
-  shared = big(size + CHARGE);
-  has = carve(words * 8), first = carve(words * 4), ctry = carve(regsize / 6);
-  rstretch = (carved + CHARGE - 1) / CHARGE;
-  for (int t = 0; t < NT; t++)
-    names[t] = (Names){.slot = carve(SLOTS * 8), .mask = SLOTS / 4 - 1,
-                       .lo = carve(NAMES * 2), .row = carve(NAMES * 32)};
-  ring = carve(sizeof(Ring[NT][NT])), agg = carve(sizeof(Agg[NT][256]));
-  nstretch = (carved + CHARGE - 1) / CHARGE;
-  tables(shared, carved); // their page-table pages
-  hot(__bss_start, _end - __bss_start);
-  ctx = big(NT * sizeof *ctx);
-  u8 *stack = big(NT * STACK);
+  rtab = big(maxreg + 2); // the last entry: every id above the range
   pthread_t th[NT];
-  pthread_attr_t at;
-  pthread_attr_init(&at);
   pthread_barrier_init(&meet, 0, NT);
-  for (long t = 1; t < NT; t++) {
-    hot(stack + t * STACK + STACK * 3 / 4, STACK / 4); // the top, the part used
-    pthread_attr_setstack(&at, stack + t * STACK, STACK);
-    if (pthread_create(&th[t], &at, worker, (void *)t))
+  for (long t = 1; t < NT; t++)
+    if (pthread_create(&th[t], 0, worker, (void *)t))
       die("pthread_create");
-  }
-  for (int t = 0; t < NT; t++)
-    hot(&ctx[t], offsetof(Ctx, ix) + 4 * HOTREC), hot(ctx[t].rec, sizeof(Rec) * HOTREC);
-  if (rsize >= 64 * HUGE) // and the zeros after the file
-    tables(rec + 64 * HUGE, rsize + 1 - 64 * HUGE);
   worker(0);
   FILE *o = fopen("/out/aggregates.txt", "w");
   if (!o)
