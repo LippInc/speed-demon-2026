@@ -16,8 +16,10 @@ The reference takes 14.44 s (K 1).
 | join.c v39 on the board, run-cc3a05552f65 (commit c04e8b3) | 21.74 ms | 10.39 MB | 425 | 42.83 |
 | join.c v43, organisers' harness on box 2 (run-b4d9fd8e3054, run-6d81c0998c5b, run-86f619fede63, run-7fa4f90964b6, run-fc7e98fbc4ad) | 20.78 ms | 10.69 MB | 417 | 43.6 |
 | join.c v43 on the board, run-a355185f438a (commit 09f081f) | 22.48 ms | 10.24 MB | 417 | 42.35 |
+| join.c v49 (v43's code, comments fixed) on the board, run-14a8fd87f9be (commit 6b75bfd) | 21.74 ms | 10.3 MB | 417 | 43.04 |
+| join.c v49 on the board, run-be7fc43b744a (commit 4e793b1) | 21.31 ms | 10.51 MB | 417 | 43.27 |
 
-Box 2 is a rented i5-13500 like the scoring box, turbo off, running the organisers' harness. The board ran v21 and v27 3.3 to 3.8 ms slower than box 2, v39 0.8 ms slower and v43 1.7 ms slower (each a single board run against the harness's middle three of five); "Other processes on the scoring box" below has what we know about why.
+Box 2 is a rented i5-13500 like the scoring box, turbo off, running the organisers' harness. The board ran v21 and v27 3.3 to 3.8 ms slower than box 2, v39 0.8 ms slower, v43 1.7 ms and v49 0.5 to 1.0 ms slower (each a single board run against the harness's middle three of five); "Other processes on the scoring box" below has what we know about why.
 
 ## Measuring
 
@@ -44,27 +46,27 @@ The comment at the top of join.c describes the program. The measurements behind 
 
 ## Steps
 
-Box 2, fast loop, median T; none of these were board runs (the board runs of v21, v27, v39 and v43 are in the table at the top).
+Box 2, fast loop, median T, then the live board's T for the same code. On 2026-11-01 we pushed the main steps to the board again, in order, one run each, so each has a board measurement. Until the freeze the board shares its machine with other teams' runs, so a single run can be slow: v32's 84.6 ms is one such run, and v39, with the same sending scheme, measured 21.6 ms 6 minutes later.
 
-- v10, 31.6 ms (harness): an early C version of the owner design.
-- v18, 29.4 ms: hot-loop state in locals (aliasing stores to struct fields had cost ~10 % of instructions), 8-slot SIMD buckets.
-- v19, 27.2 ms: pass 1 without quote counts; pass 2 split into a region loop and the rest; quotes counted from field bytes; branch-free name hash.
-- v20, 26.1 ms: 4-slot SIMD buckets, 56-bit name identity, the owner stores 16 bits per name instead of the key.
+- v10, 31.6 ms (harness), board 33.6 ms (run-34ea5e6b408e): an early C version of the owner design.
+- v18, 29.4 ms, board 30.1 ms (run-66e847fccb66): hot-loop state in locals (aliasing stores to struct fields had cost ~10 % of instructions), 8-slot SIMD buckets.
+- v19, 27.2 ms, board 27.8 ms (run-f963f4408506): pass 1 without quote counts; pass 2 split into a region loop and the rest; quotes counted from field bytes; branch-free name hash.
+- v20, 26.1 ms, board 26.4 ms (run-b49c7f2b2d8c): 4-slot SIMD buckets, 56-bit name identity, the owner stores 16 bits per name instead of the key.
 - v20b, 25.55 ms: name hash fast path without a loop: stack spills in the record loop 47 to 2.
-- v21, 24.1 ms: AES-NI name hash.
-- v24, 22.55 ms: messages staged 128 per owner (was 8), rings of 256, owners drain every 8 passes.
-- v27, 22.63 ms: 256 KB pieces from a shared counter, and sends that never wait. No faster on a quiet box; kept because it holds up when another process takes a CPU (below).
+- v21, 24.1 ms, board 24.9 ms (run-9767cb14f1a6): AES-NI name hash.
+- v24, 22.55 ms, board 23.3 ms (run-b39ff361cb97): messages staged 128 per owner (was 8), rings of 256, owners drain every 8 passes.
+- v27, 22.63 ms, board 24.6 ms (run-709c5622f461): 256 KB pieces from a shared counter, and sends that never wait. No faster on a quiet box; kept because it holds up when another process takes a CPU (below).
 - v28, 22.7 ms: pass 1 lists record ends only, pass 2 reads fields from both ends. The same 1.14 G instructions as v27: pass 1 lost 36 per record, pass 2 gained 25. Kept because pass 2's new shape is what v30 and v31 cut down.
 - v29, 23.2 ms: the three numbers in one AVX2 chain. 1.10 G instructions but slower: GCC spilled the bases of the per-record arrays and rebuilt 64-bit constants inside the loop.
 - v30, 22.30 ms: the per-record array inside the thread's context (one base register), the id's comma by a vector compare: 1.04 G instructions, 581 M cycles (v27: 614 M).
-- v31, 21.67 ms: region table prefetch.
-- v32, 21.16 ms: senders drain while their ring is full, no overflow queue (below).
+- v31, 21.67 ms, board 22.9 ms (run-5d3de098bf35): region table prefetch.
+- v32, 21.16 ms, board 84.6 ms (run-fc8350371cd8, the slow run above): senders drain while their ring is full, no overflow queue (below).
 - v33, same speed, 409 code lines.
 - v37, -0.3 ms: main writes the output while the other threads unmap.
 - v38, -0.13 ms: pieces 2 MB apart.
-- v39, 20.64 ms: one malloc arena.
+- v39, 20.64 ms, board 21.6 ms (run-33798317abda): one malloc arena.
 - v42, 20.45 ms: a new minimum or maximum amount is a branch, not a compare and store per record (a thread sees ~900 amounts per country, so the branch is almost never taken): -0.17 ms. `pthread_barrier_wait` instead of a spinning barrier: same speed, 7 fewer lines.
-- v43, 20.31 ms: each record's region table index lives in its record entry, not in an array of its own: one base register fewer in the first loop, which had kept 5 values on the stack (now 2). 1.02 G instructions.
+- v43, 20.31 ms, board 21.3 ms as v49, the same code with its comments fixed (run-be7fc43b744a): each record's region table index lives in its record entry, not in an array of its own: one base register fewer in the first loop, which had kept 5 values on the stack (now 2). 1.02 G instructions.
 
 Wall time with parts switched off (v39): pass 1 alone 6.4 ms; then the numbers and region index +3.5, per-country totals +1.6, name hash +1.55, note lengths +1.55, sending names +1.5 (owners that take messages off the ring without filing them: 16.15 ms), owners filing them +4.5. Filing costs 59 instructions and 37 cycles per message. The same at v21: pass 1 alone 7.25 ms, the same as reading and scanning the file with nothing else (7.6 ms); then parsing and per-country sums +7.7, note lengths +0.8, name hash +0.85, sending names +3.0, owners filing them +4.5.
 
@@ -88,13 +90,13 @@ v27 did not close the board gap: 3.8 ms slower on the board than on box 2, again
 ## What did not work (box 2)
 
 - `-march=alderlake` or `native` instead of x86-64-v3: 0.4 ms slower. Profile-guided optimisation (`-fprofile-use`, at v27): 22.68 against 22.69 ms.
-- Reading with pread instead of mapping: 34.8 against 33.3 ms in the full program, although pread wins the bare scan; again at v21 (v22): 25.0 against 24.1 ms. The kernel's copy took 80 M cycles against 53 M for mapping and unmapping.
+- Reading with pread instead of mapping: 34.8 against 33.3 ms in the full program, although pread wins the bare scan; again at v21 (v22): 25.0 against 24.1 ms, and on the board 25.8 ms (run-a4105d07d7e5) against v21's 24.9. The kernel's copy took 80 M cycles against 53 M for mapping and unmapping.
 - Each thread populating its part of the mapping up front (`MADV_POPULATE_READ`): 28 ms, the threads queue on the mapping's lock.
 - Main touching all memory before starting the threads, which avoids the cgroup's per-CPU batches (~2 MB of M): 1.6 to 2.8 ms slower, all of it serial. Main allocating the owners' tables (+0.55 ms) or touching the rings and totals (+0.15 ms) before the threads start: slower too.
 - Winning back the per-CPU batches after v43 (v44 to v48). The kernel charges a CPU's first 4 KB page fault to the cgroup 64 pages ahead, so twelve threads that each fault a little count up to 3 MB they never use; a 2 MB page is charged exactly. M below is measured the board's way (Docker, the parent cgroup's peak), where v43 has 10.3 to 10.7 MB.
-  - v44, main faults in every page the threads write before starting them: M 9.17 MB, T 1.3 ms slower (6.8 MB faulted in on one CPU).
+  - v44, main faults in every page the threads write before starting them: M 9.17 MB, T 1.3 ms slower (6.8 MB faulted in on one CPU). Board: 22.8 ms, M 9.74 MB, K 42.11 (run-1cee055fcf78).
   - v45, the tables the threads share (name tables, rings, totals, and the region table compressed to a bit per id plus a country per line) in three 2 MB pages, one faulted in by each of three threads: M about 9.1 MB, T 20.79 against 20.31 ms. The threads cannot fill the region table until its 2 MB page is in, which takes 0.2 to 0.35 ms. v47 got main to the barrier 0.27 ms sooner and changed nothing (20.73 ms): the region table was still the last thing done. On the organisers' harness v47 measured T 20.99 ms, M 9.29 MB, S 495: the 78 extra lines and the slower start cost more than the 1.4 MB saved, K about 0.3 % below v43.
-  - v48, the shared tables in 4 KB pages, faulted in 256 KB (one CPU's batch) at a time by whichever thread is free: the lowest M of all (7.9 to 8.2 MB in a bare cgroup, against 9.6 to 9.9 for v43) but T 22.15 ms. Twelve threads faulting in fresh pages at once went no faster than one, about 0.12 ms per MB.
+  - v48, the shared tables in 4 KB pages, faulted in 256 KB (one CPU's batch) at a time by whichever thread is free: the lowest M of all (7.9 to 8.2 MB in a bare cgroup, against 9.6 to 9.9 for v43) but T 22.15 ms. Twelve threads faulting in fresh pages at once went no faster than one, about 0.12 ms per MB. Board: 22.8 ms, M 8.83 MB, K 42.15 (run-9937f1928cb0), below v49's 43.27.
   - v46, records.csv read with pread in 32 KB pieces instead of mapped (no page tables to charge): M about 9.0 MB, T 22.2 ms.
 - The owners' tables mapped with `mmap` instead of `aligned_alloc`: 0.7 ms slower, 13 % more user cycles. Letting GCC inline the cold path for long names: 29 M more instructions, 0.8 ms slower.
 - `_Alignas(64)` on the first field of the per-country totals: it aligns every field of the declaration, making the struct 512 bytes: 1.2 ms slower.
@@ -107,4 +109,7 @@ v27 did not close the board gap: 3.8 ms slower on the board than on box 2, again
 - Rings of 128 messages: 0.2 ms slower than 256. Pass 1 over 4 KB instead of 16 KB: 0.2 ms slower.
 - Without 64-byte message lines (one 8-byte store per message): 7 ms slower. Non-temporal stores for the lines: no change.
 - Two interleaved input streams per thread: slower. Deferring the per-country updates through a record array: slower.
+- Two redesigns on the last day, both slower than v43 (box 2, 3 alternating rounds, all 10 data sets correct), each pushed once to the board for this log:
+  - v50, shared name ids: one 1 MB intern table shared by all threads (insert by compare-and-swap; the inserting thread owns the name), 4-byte messages, owners only set a country bit. 23.00 against 20.35 ms. User instructions went up (1,081 M against 1,048 M) and kernel cycles nearly doubled (91 M against 49 M, page faults on the shared table and the bit rows), although L2 misses fell from 0.86 M to 0.15 M. Board: 108.9 ms (run-a727cc41ae99), a slow run of the kind described above.
+  - v51, one pass: no record-end pass; each record is read from its start, and the note's end found with the same quote-parity multiply as the name's. 22.95 ms with 14 % fewer instructions (905 M) but more cycles (608 M against 557 M): each record's start waits on the previous record's end, and top-down counts show fetch latency at 429 M slots against 251 M. Moving the name hash back into the second loop (v51b) gave 24.8 ms; two to eight interleaved streams per thread (v52), 23.8 to 25.7 ms. Board: 24.0 ms (run-5c0282f45652).
 - Branch misses: about 4 % of cycles at v18, so branch-free rewrites were not the lever; the program is bound by instruction count (about 60 % of slots retiring, about 2 instructions per cycle per thread).
