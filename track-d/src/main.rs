@@ -301,9 +301,9 @@ fn relabel(old: Csr, threads: usize) -> (Csr, Csr, Vec<u32>) {
 /// CSRs. Row order inside a reverse row is whatever the fetch_add order was; a distance is a
 /// property of the graph, not of row order, and checks B and C prove it.
 /// Why atomics anyway: the slab build they replace kept one slab's records (~30 MB) next to both
-/// CSRs and set a 90-91 MB rev peak; the atomic passes cost time instead, which is the trade this
-/// experiment spends (measured d-28 s3: locally rev 24-45 -> 12-16 ms at 12 workers - faster than
-/// the slabs, not slower: no record allocation traffic, two streaming passes over fwd).
+/// CSRs and set a 90-91 MB rev peak. The atomic passes were expected to cost time for that memory,
+/// but measured faster (d-28 s3: locally rev 24-45 -> 12-16 ms at 12 workers): no record
+/// allocation traffic, two streaming passes over fwd.
 /// Partitions are the smallest power-of-two node range that splits this input's n nodes into at
 /// most 4 * threads ranges (a design constant: enough that threads taking partitions from a counter
 /// finish together, few enough that each thread's per-partition buckets stay large).
@@ -655,11 +655,11 @@ impl Scratch {
     }
 }
 
-/// Pops ahead whose CSR rows are prefetched (a design constant). Each CSR is about 37 MB at full size
-/// (5,000,000 x 6 B edges + 1,740,512 x 4 B ends), both about 74 MB, three times the box's 24 MB L3,
-/// so a settle's edge row is a DRAM miss; the next pops of this side sit at the end of radix bucket 0,
-/// so their rows can load while u is relaxed. Measured locally (full seed 1, interleaved with d-8,
-/// query phase medians): 875 -> 564 ms at 12 workers, 795 -> 490 ms at 4.
+/// Pops ahead whose CSR rows are prefetched (a design constant). Each CSR is about 27 MB at full size
+/// (5,000,000 x 4 B packed edges + 1,740,512 x 4 B ends), both about 54 MB, over twice the box's 24 MB
+/// L3, so a settle's edge row is a DRAM miss; the next pops of this side are the next entries of the
+/// bucket being drained, so their rows can load while u is relaxed. Measured locally when it went in
+/// (full seed 1, interleaved with d-8, query phase medians, 6 B edges): 875 -> 564 ms at 12, 795 -> 490 ms at 4.
 /// Distances 4 / 8 / 16 gave 569 / 564 / 565 ms at 12; prefetching only end[next] gave 725-739 ms,
 /// and prefetching each neighbour's label slot as well bought under 2 %, so neither is here.
 const PREFETCH_AHEAD: usize = 8;
