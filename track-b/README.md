@@ -2,9 +2,9 @@
 
 Reads `queries.txt` (BOOL and PHRASE queries) and `docs.txt` (one document per line) from `/data` and writes `results.txt` to `/out`: for each query, the number of matching documents, the sum of their ids and the ten smallest ids.
 
-56.35 s → 0.21 s (about 267×), 2.2 GB → 39 MB. No index is built: one parallel pass decides every BOOL query 1,024 documents at a time from bit-rows and a sorted log of the rarer terms' hits, and every phrase by checks at its rarest term.
+56.35 s → 0.21 s (about 270×), 2.2 GB → 39 MB. No index is built: one parallel pass decides every BOOL query 1,024 documents at a time from bit-rows and a sorted log of the rarer terms' hits, and every phrase by checks at its rarest term.
 
-Rust, standard library only. K 25.58 (box `sd-bench/B`, commit 08cf34c, b-98; the lower of two seeds, the same in both readings): T 0.211 s, M 38.7 MB, S 847, D 1 (no dependencies). Board: run-188484269540 (commit 1be93e4, the code of acaa379, before b-84), K 24.86, T 0.230 s, our best board run; b-84's run-bb7e38634965 read K 24.78, T 0.226 s.
+Rust, standard library only. K 25.67 (box `sd-bench/B`, commit 7f4ac1c, b-99a; the lower of two seeds and two readings): T 0.209 s, M 38.6 MB, S 851, D 1 (no dependencies). Board: run-21676903d119 (commit 60b5493, the code of a2b0dfd, b-84), K 25.19, T 0.218 s, our best board run; b-98's run-79c769d1182b (commit e550f50) read K 24.87, T 0.223 s.
 
 Terms: K is the organisers' score combining T (run time), M (peak memory), S (lines of code) and D (dependencies) against the reference, higher is better; the box is our bench machine with the scoring machine's CPU; b-NN is one experiment in PERF.md; KNOWN = a textbook technique, OURS = our own design.
 
@@ -13,16 +13,16 @@ Reproduce with seed 1's full data in `<data>`, then compare the hash with the fu
 
 | Trick | Where | PERF |
 |---|---|---|
-| One pass over the mapped corpus, one document range per thread | [`map_file`](src/main.rs#L91), [`scan`](src/main.rs#L784) | b-1 |
+| One pass over the mapped corpus, one document range per thread | [`map_file`](src/main.rs#L91), [`scan`](src/main.rs#L785) | b-1 |
 | Only the query terms are looked up, in one compact table | [`TermTable`](src/main.rs#L127) | b-6, b-13, b-36a |
-| The queries parsed by every worker at once into that one table, each new term published by a compare-and-swap | [`Interner`](src/main.rs#L264), [`parse`](src/main.rs#L842) | b-52, b-84 |
+| The queries parsed by every worker at once into that one table, each new term published by a compare-and-swap | [`Interner`](src/main.rs#L264), [`parse`](src/main.rs#L843) | b-52, b-84 |
 | Each token's slot line prefetched one token ahead, the token reported one step late | [`hold`](src/main.rs#L195) | b-64 |
-| Phrases checked at the rarest term's byte offsets at the doc's end, a pattern skipped first when the token before the anchor is not its term | [`PhrasePlan`](src/main.rs#L342) | b-8, b-56, b-98 |
-| BOOL queries folded per 1,024-document chunk: rows for common terms, a radix-sorted log for the rest, no posting store | [`ChunkLog`](src/main.rs#L604), [`fold_chunk`](src/main.rs#L562) | b-3, b-32b, b-68 |
-| A query is folded only in chunks where a term of its cover occurs | [`cover`](src/main.rs#L514) | b-3 |
-| Counts by popcount, id sums by bit-sliced popcounts | [`record`](src/main.rs#L588) | b-4 |
+| Phrases checked at the rarest term's byte offsets at the doc's end (a first term counted 8x commoner, so more anchors have a term before them), a pattern skipped first when the token before the anchor is not its term | [`PhrasePlan`](src/main.rs#L342) | b-8, b-56, b-98, b-99a |
+| BOOL queries folded per 1,024-document chunk: rows for common terms, a radix-sorted log for the rest, no posting store | [`ChunkLog`](src/main.rs#L605), [`fold_chunk`](src/main.rs#L563) | b-3, b-32b, b-68 |
+| A query is folded only in chunks where a term of its cover occurs | [`cover`](src/main.rs#L515) | b-3 |
+| Counts by popcount, id sums by bit-sliced popcounts | [`record`](src/main.rs#L589) | b-4 |
 | Tokens cut 32 bytes at a time, starts and ends as two masks | [`tokenize`](src/main.rs#L180), [`walk`](src/main.rs#L214) | b-31a, b-31b, b-31c, b-55, b-59 |
-| Trigger order and the dense/sparse cut from document frequencies sampled on 1/128 of the corpus | [`estimate_df`](src/main.rs#L432) | b-9, b-11, b-68 |
+| Trigger order and the dense/sparse cut from document frequencies sampled on 1/128 of the corpus | [`estimate_df`](src/main.rs#L433) | b-9, b-11, b-68 |
 
 Every measurement, failed experiments included, with its board run ID: [PERF.md](PERF.md). Receipts: [`reports/b/`](../reports/b/) at the repository root, one `harness-<commit>.txt` per measured submission commit, from the board's runs of that commit; each names the commit it measured, and the commit after a measured push only adds its receipt.
 

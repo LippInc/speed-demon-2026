@@ -56,17 +56,6 @@ impl Chunk {
         unsafe { _mm256_movemask_epi8(_mm256_cmpeq_epi8(self.0, _mm256_set1_epi8(b as i8))) as u32 }
     }
 
-    /// Bit k: byte k ends the doc, an LF or the end of `data` (a last line without LF ends there).
-    #[inline(always)]
-    fn lf(&self, data: &[u8], i: usize) -> u32 {
-        let lf = self.eq_mask(b'\n');
-        let past_end = data.len().saturating_sub(i);
-        if past_end < 32 {
-            return lf | 1 << past_end;
-        }
-        lf
-    }
-
     /// The first n bytes lower-cased (bit 5 set), the rest zero.
     #[inline(always)]
     fn folded(&self, n: usize) -> [u8; 32] {
@@ -91,10 +80,9 @@ extern "C" {
 fn map_file(path: &str) -> &'static [u8] {
     let file = File::open(path).unwrap_or_else(|e| panic!("{path}: {e}"));
     let len = file.metadata().expect("stat").len() as usize;
-    // PROT_READ, MAP_PRIVATE. An empty file maps one page (mmap refuses length 0) that the empty slice never reads.
     // 1 = PROT_READ, 2 = MAP_PRIVATE (the Linux values), declared here so the standard library stays
     // the only dependency.
-    let ptr = unsafe { mmap(std::ptr::null_mut(), len.max(1), 1, 2, file.as_raw_fd(), 0) };
+    let ptr = unsafe { mmap(std::ptr::null_mut(), len, 1, 2, file.as_raw_fd(), 0) };
     assert!(ptr as isize != -1, "mmap {path} failed");
     // The mapping outlives the descriptor and is never unmapped, so the slice is valid for the whole run.
     unsafe { std::slice::from_raw_parts(ptr, len) }
@@ -125,7 +113,7 @@ fn hash32(t: &[u8; MAX_TERM]) -> u32 {
 /// against the term's bytes, stored inline and zero-padded to 32 B (one more line). b-4 probed slots sized from
 /// every term occurrence (4 MB), a separate hash array, and a slice into queries.txt per term.
 struct TermTable {
-    // 4 B slots: the hash's top 2 bits | (term id + 1) in the low 30 (TERM: ids stay below 2^30, BoolPlan::new),
+    // 4 B slots: the hash's top 2 bits | (term id + 1) in the low 30 (TERM: ids stay below 2^30, spec 2.4),
     // 0 = empty. The tag only filters and the bytes decide, so any query file is exact. Half the bytes of 8 B slots
     // for the probe's slot misses (b-36; b-34a measured -5 ms on the box).
     slots: Vec<u32>,
@@ -175,12 +163,6 @@ impl TermTable {
         }
     }
 
-    /// `walk` without the start offsets, for the df sample. (b-59)
-    #[inline(always)]
-    fn tokenize(&self, data: &[u8], i: usize, mut on_token: impl FnMut(Option<u32>)) -> usize {
-        self.walk(data, i, |_, t| on_token(t))
-    }
-
     /// Looks up the token held back by `hold`, if any, and reports it. (b-64)
     #[rustfmt::skip]
     #[inline(always)]
@@ -216,7 +198,7 @@ impl TermTable {
         let mut pend = None;
         loop {
             let chunk = Chunk::load(data, i);
-            let (lf, tok) = (chunk.lf(data, i), chunk.token_mask());
+            let (lf, tok) = (chunk.eq_mask(b'\n'), chunk.token_mask());
             let tok = tok & lf.wrapping_sub(1) & !lf; // only the bytes before the doc's LF
             let prev = tok << 1 | (start != NIL as usize) as u32; // bit k: byte i + k - 1 is a token byte
             let mut starts = tok & !prev; // bit k: a token starts at byte i + k
@@ -353,7 +335,8 @@ impl PhrasePlan {
         let (mut anchors, mut lo) = (Vec::new(), 0);
         for (pi, &hi) in ends.iter().enumerate() {
             let p = &terms[lo as usize..hi as usize];
-            let j = (0..p.len()).min_by_key(|&j| df[p[j] as usize]).unwrap();
+            // b-99a: an anchor with a term before it is filtered by that term (b-98), so it may be 8x commoner (T -2 ms).
+            let j = (0..p.len()).min_by_key(|&j| df[p[j] as usize] as u64 * if j == 0 && p.len() > 1 { 8 } else { 1 }).unwrap();
             anchor_bits[p[j] as usize / 64] |= 1 << (p[j] % 64);
             anchors.push((p[j], (pi as u32, j as u32, lo, hi)));
             lo = hi;
@@ -377,7 +360,7 @@ impl PhrasePlan {
         let is_term = |token: Option<&[u8]>, t: u32| {
             token.is_some_and(|tk| {
                 let term = &dt.bytes[t as usize].0;
-                tk.len() <= MAX_TERM && term[..tk.len()].eq_ignore_ascii_case(tk) && term.get(tk.len()).unwrap_or(&0) == &0
+                term[..tk.len()].eq_ignore_ascii_case(tk) && term.get(tk.len()).unwrap_or(&0) == &0
             })
         };
         for &(t, at, left) in hits {
@@ -414,7 +397,7 @@ fn line_start(data: &[u8], from: usize) -> usize {
 #[inline]
 fn parse_id(data: &[u8], mut i: usize) -> (u32, usize) {
     let mut id = 0u32;
-    while i < data.len() && data[i] != b'\t' {
+    while data[i] != b'\t' {
         id = id * 10 + (data[i] - b'0') as u32;
         i += 1;
     }
@@ -441,7 +424,7 @@ fn estimate_df(docs: &[u8], dict: &TermTable, workers: usize) -> (Vec<u32>, u32)
             let stop = (i + window).min(docs.len());
             while i < stop {
                 stamp += 1;
-                i = dict.tokenize(docs, parse_id(docs, i).1, |t| {
+                i = dict.walk(docs, parse_id(docs, i).1, |_, t| {
                     if let Some(t) = t.filter(|&t| seen[t as usize] != stamp) {
                         seen[t as usize] = stamp;
                         df[t as usize] += 1;
@@ -468,7 +451,7 @@ fn estimate_df(docs: &[u8], dict: &TermTable, workers: usize) -> (Vec<u32>, u32)
 const MAX_BOOL_TERMS: usize = 6; // spec 2.3: a BOOL query has 1 to 6 terms
 /// A query's code: its first term, then op << OP_SHIFT | term per operator, NIL-padded.
 type Code = [u32; MAX_BOOL_TERMS];
-const OP_SHIFT: u32 = 30; // term ids stay below 2^30 (asserted in BoolPlan::new)
+const OP_SHIFT: u32 = 30; // term ids stay below 2^30 (spec 2.4: 600,000 words)
 const TERM: u32 = (1 << OP_SHIFT) - 1;
 const OP_AND: u32 = 0;
 const OP_OR: u32 = 1;
@@ -476,7 +459,7 @@ const OP_NOT: u32 = 2;
 
 /// Docs per chunk: a doc's place in its chunk takes the low LOCAL_BITS of a log entry, and a chunk's row is
 /// CHUNK / 64 words. (b-68)
-const LOCAL_BITS: u32 = 10;
+const LOCAL_BITS: u32 = 11;
 const CHUNK: u32 = 1 << LOCAL_BITS;
 const ROW: usize = CHUNK as usize / 64;
 
@@ -503,22 +486,18 @@ struct BoolPlan {
     ids: FirstIds, // by slot
 }
 
-/// The estimated number of docs holding the terms, summed.
-fn df_sum(terms: &[u32], df: &[u32]) -> u64 {
-    terms.iter().map(|&t| df[t as usize] as u64).sum()
-}
-
 /// Trigger terms of a query, written to `cover` (reused, so a query allocates nothing): every doc in R contains one
 /// of them. {first} holds for R = S(first); OR adds its operand; AND narrows R to S(t), so it may replace the cover by
 /// {t} when t is estimated rarer; NOT keeps it.
 fn cover(q: &Code, df: &[u32], cover: &mut Vec<u32>) {
     cover.clear();
     cover.push(q[0]);
+    let df_of = |c: u32| df[c as usize] as u64;
     for &w in q[1..].iter().take_while(|&&w| w != NIL) {
         let t = w & TERM;
         match w >> OP_SHIFT {
             OP_OR => cover.push(t),
-            OP_AND if df_sum(&[t], df) < df_sum(cover, df) => *cover = vec![t],
+            OP_AND if df_of(t) < cover.iter().map(|&c| df_of(c)).sum() => *cover = vec![t],
             _ => {}
         }
     }
@@ -528,7 +507,6 @@ fn cover(q: &Code, df: &[u32], cover: &mut Vec<u32>) {
 
 impl BoolPlan {
     fn new(queries: &[Code], n_dense: usize, n_bool: usize, df: &[u32]) -> Self {
-        assert!(n_bool < 1 << OP_SHIFT && n_bool - n_dense < 1 << (32 - LOCAL_BITS));
         let (mut every_chunk, mut triggers, mut terms) = (Vec::new(), Vec::new(), Vec::new());
         for (qi, q) in queries.iter().enumerate() {
             cover(q, df, &mut terms);
@@ -807,9 +785,8 @@ fn scan(data: &[u8], dict: &TermTable, phrases: &PhrasePlan, plan: &BoolPlan) ->
                 chunk.hit(plan.n_dense, t as usize, id);
             }
         });
-        // `i - 1` is the doc's LF, so the check reads this doc's text only; clamped for out-of-spec TAB-less lines.
-        let end = (i - 1).min(data.len());
-        phrases.check(dict, &data[text.min(end)..end], &hits, |p| {
+        // `i - 1` is the doc's LF, so the check reads this doc's text only.
+        phrases.check(dict, &data[text..i - 1], &hits, |p| {
             if pattern_last[p as usize] != id + 1 {
                 pattern_last[p as usize] = id + 1;
                 matches.push((p, id));
@@ -847,10 +824,9 @@ fn parse(text: &[u8], terms: &Interner) -> Parsed {
     // a split per line and per word, byte by byte, and a Vec per line: the parse fell from 76 M to 37 M
     // instructions (cachegrind, seed 1) and from 22.4 ms to 16.6 ms on the VM (medians of 15 runs). (b-69)
     let (mut words, mut from) = (Vec::new(), 0);
-    // `<=`: a chunk at the end itself marks the end (`lf`) when the length is a multiple of 32.
-    for i in (0..=text.len()).step_by(32) {
+    for i in (0..text.len()).step_by(32) {
         let chunk = Chunk::load(text, i);
-        let lf = chunk.lf(text, i);
+        let lf = chunk.eq_mask(b'\n');
         let mut cuts = lf | chunk.eq_mask(b' ') | chunk.eq_mask(b'"');
         while cuts != 0 {
             let at = i + cuts.trailing_zeros() as usize;
