@@ -2,59 +2,38 @@
 
 Reads 3,100,000 HTTP request log lines and, for every hour and endpoint that saw traffic, writes the request count, the nearest-rank p50, p95 and p99 latency, and the number and rate of 5xx responses.
 
-Rust, standard library only. K 39.49 (box `sd-bench/A`, commit fa5a5d4, a-40; fresh, the lower reading; official 40.32): T 0.027-0.028 s, M 23.6 MB, S 392, D 1. This code's board runs: run-67d08e654e03, K 39.62, T 28.1 ms (the best of three; run-cf19ad557a30 read T 41.0 ms, a single-run outlier). The track's best board run is run-136eb6e8fd39, K 39.97, T 28.6 ms (a-35's code).
+Rust, standard library only. K 42.54 / 43.04 (box `sd-bench/A`, commit a6b3205, a-55 trim; lower: fresh; official 42.82 / 43.05): T 0.024 s, M 20.2-20.4 MB, S 463, D 1, against the banked board tip 5c47d22 (a-47d) at 39.80 / 40.25. The board's best run of ours is run-136eb6e8fd39, K 39.97, T 28.6 ms (a-35's code); the banked board tip 5c47d22 ran at 178ceb2 (run-b79ba3882933, T 0.03 s, M 23 MB, points 79.4, with re-runs up to 80.5 points). Threads claim 256 KB blocks of the file and parse them into per-hour records; an hour is finished as soon as the registered prefix of the file holds a line two hours later; a line that arrives after its hour was finished makes the run repeat with no early finishing, so the output is exact for any order.
 
 Reproduce with seed 1's full data in `<data>`, then compare the hash with the full seed-1 output hash in the [spec](https://github.com/hackathon-raptors/speed-demon-2026/blob/main/specs/a-ingest.md):
 `docker build -t a track-a && docker run --rm --network=none -v <data>:/data:ro -v <out>:/out a && sha256sum <out>/summary.txt`
 
 | Trick | Where | PERF |
 |---|---|---|
-| One read-only mapping, one line-aligned byte range per thread, private tables | [`line_ranges`](src/main.rs#L39), [`scan`](src/main.rs#L292) | a-1 |
-| The endpoint's `/` and the line end from one 64-byte AVX2 window at byte 32 | [`line_fields`](src/main.rs#L67) | a-5, a-40a |
-| Latency digits from one 16-byte load and SIMD multiply-adds | [`parse_latency`](src/main.rs#L104) | a-6, a-13 |
-| Endpoints interned to small ids per thread by their first two 32-byte chunks (CRC32 hash, no byte compare call), copied to a pool, one global rank | [`Table`](src/main.rs#L178), [`global_ranks`](src/main.rs#L384) | a-10, a-17, a-40b |
-| One 4-byte record per line in its hour's buffer, merged per hour by a counting sort | [`Hour`](src/main.rs#L164) | a-29 |
-| Percentiles: up to 32 latencies sorted, larger groups selected | [`percentiles`](src/main.rs#L353) | a-20 |
-| Each range's page-table entries dropped after its scan; glibc's mmap threshold pinned | [`release_range`](src/main.rs#L25), [`main`](src/main.rs#L402) | a-11, a-12 |
+| The pipeline: threads claim 256 KiB blocks and parse into per-hour records; an hour finished early once prefix is 2 hours ahead | [`Job::work`](src/main.rs#L433), [`parse`](src/main.rs#L289), [`State::register`](src/main.rs#L386) | a-55 |
+| The endpoint's `/` and the line end from one 64-byte AVX2 window at byte 32 | [`line_fields`](src/main.rs#L59) | a-5, a-40a |
+| Latency digits from one 16-byte load and SIMD multiply-adds | [`parse_latency`](src/main.rs#L96) | a-6, a-13 |
+| Endpoints interned to small ids: first two 32-byte chunks compared as vectors, 128-byte images, new ids sorted in by finishing threads | [`Table::find`](src/main.rs#L226), [`Dict::order`](src/main.rs#L181) | a-10, a-40b, a-55 |
+| Counting-sort tail: records placed into scratch by endpoint byte order, percentiles selected, in-order output stream | [`Job::finish`](src/main.rs#L468), [`percentiles`](src/main.rs#L357) | a-20, a-29, a-55 |
+| Exactness on late lines: repeat with no early finishing if a line arrives after its hour was claimed | [`run`](src/main.rs#L544), [`main`](src/main.rs#L596-L602) | a-55 |
+| Memory: mapping released in 4 MiB steps; one malloc arena; glibc mmap threshold pinned | [`Job::release`](src/main.rs#L534), [`main`](src/main.rs#L567-L572) | a-11, a-12, a-55 |
 
 Every measurement, failed experiments included, with its board run ID: [PERF.md](PERF.md). Receipts: `reports/a/` at the repository root, one `harness-<commit>.txt` per measured submission commit, from the board's runs of that commit; each names the commit it measured, and the commit after a measured push only adds its receipt.
 
-Limit: the scan and the join take about 20 ms of the 30 ms and the tail about 7.5 ms (a-33). Six rewrites of the scan's lookup and line walk read level or slower on the box (a-7, a-8, a-16, a-22, a-31, a-34); a-40 cut the scan's instructions per line instead (231 -> 189 on seed 1), and the scan fell about 3 ms per thread (16.1 -> 13.1 ms, probe 1b9b7de).
+Limit: the line loop is throughput-bound (IPC 2.67 on one worker; hyperthreads fill the core at 12 workers), so overlapping chains by interleaving line streams gave no gain (a-55 r3). Further speed must come from fewer instructions per line (HighVelocity parses latency forward with SWAR without searching '/' or loading backwards) or from finish (~1.1 ms per hour).
 
 ## Approach
 
-Rust, standard library only. The binary links the C runtime statically (probe a-26), so no dynamic loader runs before main. The program maps `/data/requests.log` read-only (`src/main.rs` `main`) and
-cuts it into one byte range per worker, each starting at a line start (`line_ranges`). Every thread walks its
-range once with private tables, so threads share nothing (`scan`, `Table`), then drops that range's page-table
-entries (`release_range`) so the process exit has fewer to tear down. The key has two levels: a small
-open-addressing table interns each endpoint to a local id (its key is its first two 32-byte chunks, zero past its
-end, with its length in the slot, hashed by CRC32 and compared as vectors with no byte compare call, a-40b; the keys
-are freed after the scan, a-40d), and each line bumps its hour's request and 5xx
-counters at that id and appends one 4-byte record (id and latency) to its hour's buffer, so a line costs one
-probe in a cache-resident table, two increments and an append (per-hour records, a-29). The hour is parsed only when the 13-byte hour prefix (two u64 loads) differs from the previous line's;
-one 64-byte AVX2 window at byte 32 of the line finds the endpoint's `/` and, for lines of up to 96 bytes, the LF
-(`line_fields`, a-40a); one 16-byte load before the LF finds the space before the latency and converts its 1 to 10
-digits with SIMD multiply-adds, with no per-digit loop (`parse_latency`); the 5xx flag is the status's first
-digit.
+Rust, standard library only. The binary links the C runtime statically (probe a-26), so no dynamic loader runs before main. The program maps `/data/requests.log` read-only (`src/main.rs` `main`) and claims it in 256 KiB blocks in file order (`Job::align`, `Job::work`). Each thread walks its claimed blocks with private open-addressing tables (`parse`, `Table`), parsing lines into per-hour 64-bit records (global endpoint id, 5xx flag, and latency).
 
-Memory is kept small: a line takes one 4-byte record, the endpoint id in its low 11 bits and the latency above;
-the rare line whose latency is 2^21 or more (or whose id is 2,047 or more, which spec 2's 1,842 endpoints never
-reach) takes three words, so every u32 stays exact. Each (thread, hour) keeps its records in one buffer, with no
-per-group allocation. glibc's mmap threshold is pinned so the
-tail's freed output buffers go back to the kernel instead of staying charged. Each thread copies its few distinct endpoints into a small pool when
-first seen, so nothing after the scan touches the released mapping. After the scan each thread sorts them, and
-one merge, one step per distinct endpoint, gives every endpoint a global rank (`global_ranks`), so the output
-order needs only integer sorts.
+The pipeline finishes hours as soon as the registered prefix of the file holds a line two hours later (LAG 2), so threads do not wait for the whole scan to complete (`Job::work`). If a line arrives for an hour that was already claimed for finishing, the run is marked late, and `main` repeats the entire run with no early finishing (LAG = HOURS), ensuring the output is exact for any line order (`run`, `main`).
 
-The tail runs in parallel, split by hour (the `format_hour` closure in `main`): hours are disjoint and contiguous in the output, so
-each hour is merged across threads by a counting sort on global endpoint rank (counts summed per rank, prefix
-sums, one pass placing each latency), its percentiles found (`percentiles`: groups of up to 32 latencies are
-sorted, larger ones are selected in ascending rank order, each rank inside the part right of the previous one)
-and its lines formatted by one thread. That hour's records are dropped as soon as they are placed, and a buffer above glibc's pinned 128 KiB mmap threshold goes back to the kernel at once.
-The main thread writes the hours' buffers in output order as they finish.
+The key has two levels: a small open-addressing table interns each endpoint to a local id (its key is its first two 32-byte chunks, zero past its end, with its length in the slot, hashed by CRC32 and compared as vectors with no byte compare call, a-40b; the keys are 128-byte aligned name images published by an atomic counter, a-55 r2d). The lock on adding new names covers only the id; finishing threads sort newly published ids in byte order via `Dict::order` (a-55 r2b). The hour prefix is compared as two u64 words; one 64-byte AVX2 window at byte 32 of the line finds the endpoint's `/` and the LF (`line_fields`, a-40a); one 16-byte load before the LF finds the space before the latency and converts its digits with SIMD multiply-adds (`parse_latency`, a-13).
 
-The worker count is `available_parallelism`; `SD_WORKERS` overrides it for the hash tests only. Each
-output number is written from its low end one digit per step.
+Memory is kept small: one malloc arena (`mallopt(M_ARENA_MAX, 1)`, a-55 r2a) allows freed record buffers to be reused across threads without per-thread heap slack; glibc's mmap threshold is pinned at 128 KiB (`main`, a-11) so output buffers go back to the kernel at once. Once all hours are claimed, threads release the input mapping's page-table entries in shared 4 MiB steps (`Job::release`, a-12, a-55) so process exit has fewer to tear down.
+
+The tail runs in parallel as hours become ready (`Job::finish`): each hour's records are counted per endpoint and 5xx flag, placed into scratch by counting sort in endpoint byte order, their percentiles found (`percentiles`: groups of up to 32 latencies sorted, larger ones selected in ascending rank order), and lines formatted. That hour's records are freed before formatting, and hours are written to `/out/summary.txt` in hour order as they finish (`Job::emit`).
+
+The worker count is `available_parallelism`; `SD_WORKERS` overrides it for the hash tests only. Each output number is written from its low end one digit per step (`push_u64`).
 
 ## Dependencies
 
@@ -62,4 +41,4 @@ None.
 
 ## With another 24 hours
 
-Cut the line count further: S is 392 lines here (a-35 cut 11 lines of cold code, then a-40's faster scan added 36), and K moves about as S^-0.15, so 300 lines would be about 4 % more K. Two rewrites of the endpoint lookup (a-22, a-31) and a line walk from 64-byte LF bitmasks (a-34) read level or lower on the box, so neither the lookup nor the LF search is where the scan waits.
+Cut the line count further: S is 463 lines here (the pipeline's State, Out, Job and synchronization added lines, trimmed to 463 in a-55 trim). A leaner line parse (HighVelocity's forward SWAR latency parse without searching '/' or loading backwards) targets -20-30 % parse instructions per line.

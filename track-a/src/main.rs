@@ -1,32 +1,34 @@
 //! Track A: per (hour, endpoint) request count, nearest-rank p50/p95/p99 latency and 5xx rate.
-//! One pass over an mmap of /data/requests.log, split into byte ranges, one private table per thread;
-//! the merge, percentile selection and formatting then run in parallel, one hour per task.
-//! Main tricks: line_fields (a-5), parse_latency (a-13), Table (a-10, a-17), Hour (a-29), percentiles (a-20), release_range (a-12).
+//! The threads claim an mmap of /data/requests.log in 256 KiB blocks, in file order, and turn each block's lines into
+//! per-hour records. An hour is finished (counted, selected, formatted) as soon as the registered prefix of the file holds
+//! a line two hours later, while other threads keep parsing, and finished hours are written in hour order: no thread
+//! waits for the whole scan, and only a few hours' records are alive at once.
+//! Main tricks: line_fields (a-5), parse_latency (a-13), Table (a-10, a-40), percentiles (a-20), the pipeline (a-55).
 
-use std::sync::{Mutex, atomic::AtomicUsize, atomic::Ordering::Relaxed, mpsc};
-use std::{fs::File, io::Write, os::fd::AsRawFd, thread};
+use std::arch::x86_64::*;
+use std::sync::atomic::{AtomicUsize, Ordering::Acquire, Ordering::Relaxed, Ordering::Release};
+use std::sync::{Condvar, Mutex};
+use std::{cell::UnsafeCell, collections::BTreeMap, fs::File, io::prelude::*, os::fd::AsRawFd};
 
 // Spec 2 grammar: ts (27 bytes), SP, method (3 to 7 bytes), SP: the endpoint starts at byte 32 to 36 of a line.
 const ENDPOINT_MIN: usize = 32;
 // Spec 2 grammar: ts = "YYYY-MM-DDTHH..."; bytes 0..13 name the UTC hour.
 const HOUR_PREFIX: usize = 13;
+// Spec 2: every timestamp lies in the same 72 hours for every seed and scale, 2026-10-30T18:00Z to 2026-11-02T17:59Z.
+const HOURS: usize = 72;
+const DAYS: [&str; 4] = ["2026-10-30", "2026-10-31", "2026-11-01", "2026-11-02"];
+// Spec 2: exactly 1,842 distinct endpoints per seed, so global ids stay below 2,048 (11 bits).
+const IDS: usize = 2048;
+const BLOCK: usize = 256 << 10;
+// An hour is finished once the registered prefix of the file holds a line LAG hours later. Spec 2 promises no bound on
+// how far a line is out of order (generated files: at most one hour behind the latest hour before it), so a line that
+// comes after its hour was finished is detected, and main repeats the run with no early finishing: exact for any order.
+const LAG: usize = 2;
 
 unsafe extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn madvise(addr: *const u8, len: usize, advice: i32) -> i32;
     fn mallopt(param: i32, value: i32) -> i32;
-}
-
-/// Drops the page-table entries of data[start..end] once its scan is done, so the exit has fewer to tear down.
-/// The mapping is private and never written: a later read of these bytes (an endpoint the tail prints)
-/// faults the same bytes back in from the page cache. Only whole pages inside the range are released.
-/// Measured on this VM (seed 1 full, 20 runs; a-12): output closed -> process reaped 1.9-2.0 -> 0.8-1.3 ms at 1, 4
-/// and 12 workers; the work before it unchanged within noise.
-fn release_range(data: &[u8], start: usize, end: usize) {
-    let (lo, hi) = (start.div_ceil(4096) * 4096, end / 4096 * 4096);
-    // Safety: [lo, hi) lies inside the mapping, which nothing writes. 4 is MADV_DONTNEED. A range
-    // shorter than one page gives length 0, a no-op; wrapping_add covers lo past the input's end.
-    unsafe { madvise(data.as_ptr().wrapping_add(lo), hi.saturating_sub(lo), 4) };
 }
 
 /// The first `byte` at or after `from`, or the input's end.
@@ -35,21 +37,11 @@ fn find(data: &[u8], from: usize, byte: u8) -> usize {
     pos.map_or(data.len(), |off| from + off)
 }
 
-/// Splits data into `parts` ranges whose starts are line starts; a line belongs to the range holding its first byte.
-fn line_ranges(data: &[u8], parts: usize) -> Vec<(usize, usize)> {
-    // Range i starts at the first line start at or after len / parts * i: 0 (i = 0 or a very short
-    // input) or a position right after an LF; i = parts is the input's end.
-    let start = |i: usize| match data.len() / parts * i {
-        _ if i == parts => data.len(),
-        n => (find(data, n.saturating_sub(1), b'\n') + 1).min(data.len()) * (n != 0) as usize,
-    };
-    (0..parts).map(|i| (start(i), start(i + 1))).collect()
-}
-
-/// "YYYY-MM-DDTHH" as the decimal number YYYYMMDDHH: fits u32 and sorts like the text.
-fn parse_hour(p: &[u8]) -> u32 {
-    let n = |r: std::ops::Range<usize>| r.fold(0, |acc, i| acc * 10 + (p[i] - b'0') as u32);
-    n(0..4) * 1_000_000 + n(5..7) * 10_000 + n(8..10) * 100 + n(11..13)
+/// Hours since 2026-10-30T18 of the line at p, from "YYYY-MM-DDTHH" (spec 2: the window crosses two midnights and the
+/// October to November boundary): days 10-30 and 10-31 are 0 and 1, 11-01 and 11-02 are 2 and 3.
+fn hour_index(p: &[u8]) -> usize {
+    let d = |i: usize| (p[i] - b'0') as usize;
+    (d(9) + d(6)) * 24 + d(11) * 10 + d(12) - 18
 }
 
 /// Byte mask of `byte` in data[i..i + 32], one bit per byte.
@@ -121,8 +113,6 @@ fn parse_latency(data: &[u8], lf: usize) -> (usize, u32) {
     }
 }
 
-use std::arch::x86_64::*;
-
 /// 32 bytes at p, zeroed from byte n on (n <= 32): one 32-byte chunk of an endpoint. Spec 2 endpoints hold no zero
 /// byte, so a chunk zeroed past the endpoint's end also tells the end, and equal chunks mean equal endpoints.
 /// Safety: p..p + 32 must be readable.
@@ -149,152 +139,155 @@ fn key_hash(v: __m256i) -> u64 {
     }
 }
 
-/// A record is one u32 per input line: the thread-local endpoint id in the low ID_BITS bits, the latency above
-/// them. Spec 2 fixes 1,842 endpoints per seed, so ids stay below ID_ESC; a line whose id is ID_ESC or more, or whose
-/// latency is LAT_ESC (2^21 us) or more, takes three words instead: ID_ESC, the id, the latency, so every input
-/// stays exact. These records (a-29) replace a 16-byte group per (thread, hour, endpoint) whose latencies sat in
-/// 3-byte slots in chunk chains (a-4, a-11): the scan keeps no per-group state.
-const ID_BITS: u32 = 11;
-const ID_ESC: u32 = (1 << ID_BITS) - 1;
-const LAT_ESC: u32 = 1 << (32 - ID_BITS);
+/// One endpoint, zero-padded to 128 bytes (spec 2: 1 to 125 bytes, never a zero byte), so a lookup compares it in
+/// whole 32-byte chunks; byte 127 holds its length. Exactly two cache lines, so the confirm of an endpoint up to 64
+/// bytes reads one line. On the box (perf, 12 workers) the confirm took ~18 pct of all cycles when each name was an
+/// OnceLock<Name> (a 144-byte stride, its Once state on another line). Effect: PERF.md a-55.
+#[repr(C, align(64))]
+struct Name([u8; 128]);
 
-/// One thread's lines of one hour: request and 5xx counts per thread-local endpoint id, and the records in input
-/// order. Kept apart per hour, so the tail takes each hour whole, as that hour's job, and drops it once placed.
-#[derive(Default, Clone)]
-struct Hour {
-    hour: u32,
-    counts: Vec<u32>,
-    errors: Vec<u32>,
-    recs: Vec<u32>,
+impl Name {
+    fn bytes(&self) -> &[u8] {
+        &self.0[..self.0[127] as usize]
+    }
 }
 
-/// Two-level key. An open-addressing (linear probing) table interns each endpoint to a local id; it holds
-/// only the distinct endpoints, so it stays small and cache-resident. Each line then bumps its hour's two counters
-/// at that id and appends one record, with no second probe.
-/// Measured against one (hour, endpoint) table (a-6), this VM, seed 1 full: scan 90 -> 70 ns per line at
-/// 1 worker, 94 -> 72 at 4; peak RssAnon -1.4 MB (1 worker) to -3 MB (12 workers).
-/// After the scan the same table is what the thread hands to the tail.
+/// The endpoints any thread has met, one global id each. Only the holder of `adding` writes a name, names[published],
+/// and then moves `published` past it (Release); every reader takes ids below `published` (Acquire), so a name is
+/// written before any read of it and never again. `sorted` holds ids 0..sorted.len() in byte order (spec 4); finishing
+/// threads sort the newly published ids in, so a parsing thread's lock covers only the id itself. The box split (a-55
+/// probe) showed 1.4-2.1 ms per thread inside misses when the sorted insert ran under that lock: 1,842 inserts, most in
+/// the first milliseconds, while all 12 threads meet the same endpoints. Effect: PERF.md a-55.
 #[derive(Default)]
+struct Dict {
+    names: Vec<UnsafeCell<Name>>,
+    published: AtomicUsize,
+    adding: Mutex<()>,
+    sorted: Mutex<Vec<u16>>,
+}
+
+// Safety: names are written only as described above (one writer, before the Release that publishes them).
+unsafe impl Sync for Dict {}
+
+impl Dict {
+    /// Name `id`; the caller took id below `published` (Acquire).
+    fn name(&self, id: usize) -> &Name {
+        // Safety: a published name is written before its Release and never written again.
+        unsafe { &*self.names[id].get() }
+    }
+
+    /// Every published id, in byte order: the ids published since the last call are appended and sorted in (the sort
+    /// finds the sorted prefix as one run, so it costs about one merge).
+    fn order(&self) -> Vec<u16> {
+        let n = self.published.load(Acquire);
+        let mut sorted = self.sorted.lock().unwrap();
+        if sorted.len() < n {
+            let len = sorted.len() as u16;
+            sorted.extend(len..n as u16);
+            sorted.sort_by_key(|&id| self.name(id as usize).bytes());
+        }
+        sorted.clone()
+    }
+}
+
+/// One thread's open-addressing (linear probing) view of the dictionary: a slot is length << 24 | global id + 1, 0 when
+/// empty, and 4,096 slots stay at most half full (spec 2: 1,842 endpoints), so the table never grows. A hit needs the
+/// slot's length and the line's first two chunks equal to the stored name's, and an endpoint over 64 bytes also compares
+/// its other chunks, so there is no byte compare call and no length branch up to 64 bytes (a-40b: scan 218.2 -> 189.1
+/// instructions per line on seed 1 against a four-multiply hash and bcmp confirm, cachegrind, 1 worker).
 struct Table {
-    slots: Vec<u32>, // length << 24 | endpoint id + 1; 0 marks an empty slot
-    keys: Vec<[__m256i; 2]>, // endpoint id -> its first two chunks (the second zero up to 32 bytes)
-    eps: Vec<(u32, u8)>,    // endpoint id -> (offset in `pool`, length); spec 2: at most 125 bytes
-    // Each distinct endpoint's bytes, copied here when first seen. Everything after the scan reads endpoints from
-    // this pool, never from the mapping, whose page-table entries are released once its range is scanned: read
-    // from the mapping, the global merge and the output refault those pages. Measured on this VM with the
-    // per-endpoint merge below: merge 0.69 -> 0.27 ms at 4 workers, 2.27 -> 1.62 ms at 12 (a-17).
-    // Each endpoint is zero-padded to a multiple of 32 bytes here, so a hit is confirmed chunk by chunk (a-40b).
-    pool: Vec<u8>,
-    hours: Vec<Hour>,
+    slots: Vec<u32>,
+    synced: usize,
 }
 
 impl Table {
-    fn hour(&mut self, hour: u32) -> usize {
-        if let Some(i) = self.hours.iter().position(|h| h.hour == hour) {
-            return i;
+    fn put(&mut self, dict: &Dict, id: usize) {
+        let name = dict.name(id);
+        // Safety: the name is 128 readable bytes; zero past its end, its first chunk equals the masked first chunk
+        // of any line holding this endpoint, so both hash alike.
+        let mut i = key_hash(unsafe { chunk(name.0.as_ptr(), 32) }) as usize & (self.slots.len() - 1);
+        while self.slots[i] != 0 {
+            i = (i + 1) & (self.slots.len() - 1);
         }
-        // a-47: reserved up front. recs at 1 << 16 entries (256 KB) is above glibc's mmap threshold (128 KiB, pinned
-        // in main), so it is mapped on its own and only the pages written are charged, instead of doubling inside the
-        // thread's heap and leaving each old block charged there; counts and errors start at the 2,048 ids that
-        // ID_BITS allows, so add's resize is only a fallback. Measured effect: PERF.md a-47.
-        self.hours.push(Hour { hour, counts: vec![0; 1 << ID_BITS], errors: vec![0; 1 << ID_BITS], recs: Vec::with_capacity(1 << 16) });
-        self.hours.len() - 1
+        self.slots[i] = id as u32 + 1 | (name.bytes().len() as u32) << 24;
     }
 
-    fn ep(&self, id: u32) -> &[u8] {
-        &self.pool[self.eps[id as usize].0 as usize..][..self.eps[id as usize].1 as usize]
+    /// Adds the names other threads published since this one last looked.
+    fn sync(&mut self, dict: &Dict) {
+        let end = dict.published.load(Acquire);
+        for id in self.synced..end {
+            self.put(dict, id);
+        }
+        self.synced = end;
     }
 
-    /// The local id of the endpoint b[s..s + len], interning it on first sight; the table doubles once it is half
-    /// full. Its first chunk is the hash's input; a hit needs the slot's length and the stored first two chunks to
-    /// match, and an endpoint over 64 bytes also compares its other chunks with its zero-padded pool copy, so there is
-    /// no byte compare call and no length branch up to 64 bytes (94.5 % of seed 1's lines). The caller keeps
-    /// s + 128 within b. a-40b, cachegrind, 1 worker, against a-40a's four-multiply hash and bcmp confirm: scan
-    /// 218.2 -> 189.1 instructions per line (seed 1), 220.5 -> 190.7 (seed 4242); conditional mispredicts -0.71 per
-    /// line (seed 1), -0.68 (seed 4242).
+    /// The global id of the endpoint at p of length len, whose first two chunks are v; p + 128 must be readable.
     #[inline(always)]
-    fn endpoint(&mut self, b: &[u8], s: usize, len: usize) -> u32 {
-        let v = Self::key(b, s, len);
+    fn find(&self, dict: &Dict, v: [__m256i; 2], p: *const u8, len: usize) -> Option<u32> {
         let mask = self.slots.len() - 1;
         let mut i = key_hash(v[0]) as usize & mask;
-        // The probe loop calls nothing, so the key vectors stay in registers; a miss inserts after it.
+        // The probe loop calls nothing, so the key vectors stay in registers.
         while self.slots[i] != 0 {
             let id = (self.slots[i] & 0xFF_FFFF) as usize - 1;
-            // Safety: a nonzero slot holds an interned id + 1; keys and eps have one entry per interned id, and the
-            // pool holds each endpoint's chunks whole. s + 128 <= b.len() (endpoint's caller), and endpoints have
-            // at most 125 bytes (spec 2), so every chunk read is readable.
-            // The length is compared first: equal lengths keep every chunk read inside the candidate's pool copy.
+            // Safety: a slot holds only published ids, whose names are set; a name is 128 bytes, p + 128 is readable, and
+            // equal lengths keep every chunk compare inside both endpoints' padded bytes (the last chunk is masked on
+            // both sides, so the stored length in byte 127 is not compared).
             let hit = self.slots[i] >> 24 == len as u32 && unsafe {
-                let key = self.keys.get_unchecked(id);
-                let p = b.as_ptr().add(s);
-                let off = self.eps.get_unchecked(id).0 as usize;
-                let q = self.pool.as_ptr().add(off);
-                same(v[0], key[0])
-                    & same(v[1], key[1])
-                    & (len <= 64 || same(chunk(p.add(64), (len - 64).min(32)), chunk(q.add(64), 32)))
-                    & (len <= 96 || same(chunk(p.add(96), (len - 96).min(32)), chunk(q.add(96), 32)))
+                let q = dict.names.get_unchecked(id).get() as *const u8;
+                let load = |k: usize| _mm256_loadu_si256(q.add(k) as _);
+                same(v[0], load(0))
+                    & same(v[1], load(32))
+                    & (len <= 64 || same(chunk(p.add(64), (len - 64).min(32)), load(64)))
+                    & (len <= 96 || same(chunk(p.add(96), len - 96), chunk(q.add(96), len - 96)))
             };
             if hit {
-                return id as u32;
+                return Some(id as u32);
             }
             i = (i + 1) & mask;
         }
-        self.insert(i, b, s, len)
+        None
     }
 
-    /// An endpoint's first two chunks (the second zero up to 32 bytes). The caller keeps s + 128 within b.
-    fn key(b: &[u8], s: usize, len: usize) -> [__m256i; 2] {
+    /// The global id of the endpoint b[s..s + len]; the caller keeps s + 128 within b.
+    #[inline(always)]
+    fn endpoint(&mut self, dict: &Dict, b: &[u8], s: usize, len: usize) -> u32 {
         // Safety: s + 128 <= b.len(), and an endpoint has at most 125 bytes (spec 2), so both chunks are readable.
-        let (p, hi) = (b.as_ptr().wrapping_add(s), len.clamp(32, 64) - 32);
-        unsafe { [chunk(p, len.min(32)), chunk(p.add(32), hi)] }
+        let p = b.as_ptr().wrapping_add(s);
+        let v = unsafe { [chunk(p, len.min(32)), chunk(p.add(32), len.clamp(32, 64) - 32)] };
+        match self.find(dict, v, p, len) {
+            Some(id) => id,
+            None => self.miss(dict, v, p, &b[s..s + len]),
+        }
     }
 
+    /// An endpoint this thread has not met: first the names other threads published, then, under the lock, a new id.
     #[cold]
-    fn insert(&mut self, i: usize, b: &[u8], s: usize, len: usize) -> u32 {
-        self.eps.push((self.pool.len() as u32, len as u8));
-        self.pool.extend_from_slice(&b[s..s + len]);
-        self.pool.resize(self.pool.len().next_multiple_of(32), 0);
-        self.keys.push(Self::key(b, s, len));
-        self.slots[i] = self.eps.len() as u32 | (len as u32) << 24;
-        if self.eps.len() * 2 > self.slots.len() {
-            self.grow();
+    fn miss(&mut self, dict: &Dict, v: [__m256i; 2], p: *const u8, ep: &[u8]) -> u32 {
+        self.sync(dict);
+        if let Some(id) = self.find(dict, v, p, ep.len()) {
+            return id;
         }
-        self.eps.len() as u32 - 1
-    }
-
-    fn grow(&mut self) {
-        let n = self.slots.len() * 2;
-        let old = std::mem::replace(&mut self.slots, vec![0; n]);
-        for id in old.into_iter().filter(|&id| id != 0) {
-            let mut i = key_hash(self.keys[(id & 0xFF_FFFF) as usize - 1][0]) as usize & (self.slots.len() - 1);
-            while self.slots[i] != 0 {
-                i = (i + 1) & (self.slots.len() - 1);
-            }
-            self.slots[i] = id;
+        let adding = dict.adding.lock().unwrap();
+        self.sync(dict);
+        if let Some(id) = self.find(dict, v, p, ep.len()) {
+            return id;
         }
-    }
-
-    fn add(&mut self, at: usize, e: u32, error: bool, latency: u32) {
-        let h = &mut self.hours[at];
-        if e as usize >= h.counts.len() {
-            let n = (e as usize + 1).next_power_of_two();
-            h.counts.resize(n, 0);
-            h.errors.resize(n, 0);
-        }
-        h.counts[e as usize] += 1;
-        h.errors[e as usize] += error as u32;
-        if e < ID_ESC && latency < LAT_ESC {
-            h.recs.push(e | latency << ID_BITS);
-        } else {
-            h.recs.extend_from_slice(&[ID_ESC, e, latency]);
-        }
+        let id = self.synced; // == published, which only the lock holder moves
+        // Safety: only the holder of `adding` writes, and no thread reads names[id] before the Release below.
+        let name = unsafe { &mut (*dict.names[id].get()).0 };
+        name[..ep.len()].copy_from_slice(ep);
+        name[127] = ep.len() as u8;
+        dict.published.store(id + 1, Release);
+        drop(adding);
+        self.sync(dict);
+        id as u32
     }
 }
 
-/// Aggregates every line starting in data[start..end].
-fn scan(data: &'static [u8], start: usize, end: usize) -> Table {
-    let mut table = Table::default();
-    table.slots = vec![0; 1024];
+/// The lines starting in data[start..end], as one record vector per hour met. A record is the latency in the low
+/// 32 bits and, above them, the endpoint's global id | 5xx << 11, so the hour's counts come from its records.
+fn parse(data: &[u8], start: usize, end: usize, table: &mut Table, dict: &Dict) -> Vec<(usize, Vec<u64>)> {
+    let mut runs: Vec<(usize, Vec<u64>)> = Vec::new();
     let (mut prev_prefix, mut at, mut p) = ((u64::MAX, u64::MAX), 0, start);
     while p < end {
         // Lines usually share the previous line's hour, so compare its 13-byte prefix first, as two overlapping
@@ -302,28 +295,36 @@ fn scan(data: &'static [u8], start: usize, end: usize) -> Table {
         let word = |i: usize| u64::from_le_bytes(data[i..i + 8].try_into().unwrap());
         let prefix = (word(p), word(p + HOUR_PREFIX - 8));
         if prefix != prev_prefix {
-            at = table.hour(parse_hour(&data[p..p + HOUR_PREFIX]));
+            let h = hour_index(&data[p..]);
+            at = match runs.iter().position(|r| r.0 == h) {
+                Some(i) => i,
+                None => {
+                    // Spec 2: every line is at least 40 bytes, so the block holds at most this many.
+                    runs.push((h, Vec::with_capacity((end - start) / 40 + 1)));
+                    runs.len() - 1
+                }
+            };
             prev_prefix = prefix;
         }
         let (ep_start, lf) = line_fields(data, p);
         let (sp, latency) = parse_latency(data, lf);
         // Spec 2 grammar: status is three digits, 100 to 599, followed by SP; it is a 5xx error exactly when its
         // first digit is '5', so only that byte is read.
-        let error = data[sp - 3] == b'5';
+        let error = (data[sp - 3] == b'5') as u64;
         let len = sp - 4 - ep_start;
         let e = match data.get(..ep_start + 128) {
-            Some(b) => table.endpoint(b, ep_start, len),
+            Some(b) => table.endpoint(dict, b, ep_start, len),
             None => {
                 // The input's last 128 bytes: the endpoint is copied into a zeroed buffer, so no load passes the end.
                 let mut buf = [0u8; 128];
                 buf[..len].copy_from_slice(&data[ep_start..sp - 4]);
-                table.endpoint(&buf, 0, len)
+                table.endpoint(dict, &buf, 0, len)
             }
         };
-        table.add(at, e, error, latency);
+        runs[at].1.push(latency as u64 | (e as u64 | error << 11) << 32);
         p = lf + 1;
     }
-    table
+    runs
 }
 
 /// Appends v in decimal, one digit per step from the low end. Against a-19's two-digit table (a 200-byte table
@@ -368,46 +369,207 @@ fn percentiles(lat: &mut [u32]) -> [u32; 3] {
     [v50, v95, v99]
 }
 
-/// An endpoint's first 16 bytes as a big-endian integer, zero-padded: integer order equals byte order on
-/// those bytes, and a shorter endpoint (spec 2: no zero bytes) sorts first, as spec 4 requires.
-fn prefix_key(ep: &[u8]) -> u128 {
-    u128::from_be_bytes(std::array::from_fn(|i| *ep.get(i).unwrap_or(&0)))
+/// The run's shared progress, under one lock.
+#[derive(Default)]
+struct State {
+    next_block: usize,
+    top: BTreeMap<usize, usize>, // per registered block past the watermark: its last hour
+    watermark: usize,            // every block below it is registered
+    prefix_max: usize,           // the last hour in the blocks below the watermark
+    runs: BTreeMap<usize, Vec<Vec<u64>>>, // per hour: the registered blocks' records
+    next_hour: usize,            // every hour below it is claimed for finishing
+    late: bool,                  // a block brought lines of an hour already claimed
 }
 
-/// One global endpoint order: every thread's distinct endpoints merged by bytes (spec 4), giving the
-/// sorted list of all endpoints and, per thread, local id -> global rank. Each thread's list is sorted in
-/// parallel first. Each merge step takes the smallest 16-byte integer prefix among the threads' heads, the
-/// smallest endpoint among the heads with that prefix (bytes compared only there), and advances every head
-/// holding that endpoint at once: one step per distinct endpoint, not per (thread, endpoint).
-/// It replaces the per-thread sort of every group by (hour, endpoint bytes) and the tail's byte sort.
-/// Measured on this VM (seed 1 full, with the endpoint pool; a-17), the merge against one that picked one head per step
-/// by comparing (prefix, bytes) across all heads: 1.38 -> 0.27 ms at 4 workers, 8.19 -> 1.62 ms at 12; the serial
-/// window from the last scan end to the first tail job 2.56 -> 1.32 ms and 9.06 -> 2.31 ms.
-/// It takes the sorted lists and drops them on return, so they are not held through the tail.
-fn global_ranks(tables: &[Table], sorted: Vec<Vec<(u128, u32)>>) -> (Vec<&[u8]>, Vec<Vec<u32>>) {
-    let mut ranks: Vec<Vec<u32>> = tables.iter().map(|t| vec![0; t.eps.len()]).collect();
-    let (mut all, mut pos) = (Vec::new(), vec![0; tables.len()]);
-    loop {
-        // A thread's head as (prefix, bytes): tuple order compares the bytes only where the prefixes tie.
-        let head = |t: usize| sorted[t].get(pos[t]).map(|&(k, e)| (k, tables[t].ep(e)));
-        let Some(least) = (0..tables.len()).filter_map(head).min() else {
-            return (all, ranks);
-        };
-        all.push(least.1);
-        let at: Vec<usize> = (0..tables.len()).filter(|&t| head(t) == Some(least)).collect();
-        for t in at {
-            ranks[t][sorted[t][pos[t]].1 as usize] = all.len() as u32 - 1;
-            pos[t] += 1;
+impl State {
+    /// Hands block b's records to their hours; a record for an hour already claimed marks the run late.
+    fn register(&mut self, b: usize, runs: Vec<(usize, Vec<u64>)>) {
+        self.top.insert(b, runs.iter().map(|r| r.0).max().unwrap_or(0));
+        for (h, recs) in runs {
+            // A late record is kept like the others: the run is repeated anyway.
+            self.late |= h < self.next_hour;
+            self.runs.entry(h).or_default().push(recs);
+        }
+        while let Some(t) = self.top.remove(&self.watermark) {
+            self.prefix_max = self.prefix_max.max(t);
+            self.watermark += 1;
         }
     }
 }
 
+/// Finished hours waiting for the ones before them, and how many are written.
+#[derive(Default)]
+struct Out {
+    parts: BTreeMap<usize, Vec<u8>>,
+    written: usize,
+    writing: bool,
+}
+
+/// One run over the input (a-55). Each thread takes, in this order: an hour that is safe to finish, else the next
+/// block, at most two per thread past the oldest unregistered one, so few records wait; else it sleeps until a block
+/// is registered or an hour claimed; once all hours are claimed it releases the mapping and ends. Unlike a-37 (static
+/// ranges, finishing on the scan threads, then a barrier and a serial merge), no thread idles while work is left, and
+/// the finishing fills the gaps. Measured effect: PERF.md a-55.
+struct Job<'a> {
+    data: &'static [u8],
+    dict: &'a Dict,
+    file: &'a File,
+    state: Mutex<State>,
+    ready: Condvar,
+    out: Mutex<Out>,
+    released: AtomicUsize,
+}
+
+impl Job<'_> {
+    /// Block b's first line start: the first at or after b * BLOCK (spec 2: the last line ends with an LF).
+    fn align(&self, b: usize) -> usize {
+        match (b * BLOCK).min(self.data.len()) {
+            0 => 0,
+            n => find(self.data, n - 1, b'\n') + 1,
+        }
+    }
+
+    /// One of the run's `workers` threads; an hour is finished once the registered prefix holds a line `lag` hours later.
+    fn work(&self, workers: usize, lag: usize) {
+        let nblocks = self.data.len().div_ceil(BLOCK);
+        let slots = vec![0; 2 * IDS];
+        let mut table = Table { slots, synced: 0 };
+        let mut scratch = Vec::new();
+        let mut s = self.state.lock().unwrap();
+        while !s.late {
+            if s.next_hour == HOURS {
+                drop(s);
+                return self.release();
+            } else if s.watermark == nblocks || s.next_hour + lag <= s.prefix_max {
+                let h = s.next_hour;
+                s.next_hour += 1;
+                let runs = s.runs.remove(&h).unwrap_or_default();
+                drop(s);
+                self.ready.notify_all();
+                self.emit(h, self.finish(h, runs, &mut scratch));
+            } else if s.next_block < nblocks && s.next_block < s.watermark + 2 * workers {
+                let b = s.next_block;
+                s.next_block += 1;
+                drop(s);
+                let start = self.align(b);
+                let runs = parse(self.data, start, self.align(b + 1), &mut table, self.dict);
+                self.state.lock().unwrap().register(b, runs);
+                self.ready.notify_all();
+            } else {
+                s = self.ready.wait(s).unwrap();
+                continue;
+            }
+            s = self.state.lock().unwrap();
+        }
+    }
+
+    /// Hour h's output lines in endpoint byte order (spec 4): the records counted per (id, 5xx), then a counting sort
+    /// in byte order puts each endpoint's latencies side by side in scratch, with no comparison sort.
+    fn finish(&self, h: usize, runs: Vec<Vec<u64>>, scratch: &mut Vec<u32>) -> Vec<u8> {
+        let order = self.dict.order();
+        let mut count = [0u32; 2 * IDS]; // by id | 5xx << 11
+        for &x in runs.iter().flatten() {
+            count[(x >> 32) as usize] += 1;
+        }
+        let (mut start, mut total) = ([0u32; IDS], 0);
+        for &id in &order {
+            start[id as usize] = total;
+            total += count[id as usize] + count[id as usize | IDS];
+        }
+        // resize keeps the scratch capacity across hours; every slot below total is written by the placement.
+        scratch.resize(total as usize, 0);
+        let mut next = start;
+        for &x in runs.iter().flatten() {
+            let id = (x >> 32) as usize & (IDS - 1);
+            scratch[next[id] as usize] = x as u32;
+            next[id] += 1;
+        }
+        drop(runs); // every latency is placed: the records go back before the formatting
+        let t = h + 18;
+        let label = format!("{}T{:02}:00:00Z ", DAYS[t / 24], t % 24);
+        // Reserved once at the most a line can take (spec 2: endpoints of at most 125 bytes; six numbers under 2^64), so
+        // it never doubles; above the mmap threshold (main), only the pages written are charged.
+        let mut buf = Vec::with_capacity(order.len() * (label.len() + 125 + 6 * 21 + 1));
+        for &id in &order {
+            let (n, errors) = (count[id as usize] + count[id as usize | IDS], count[id as usize | IDS] as u64);
+            if n == 0 {
+                continue;
+            }
+            let lat = &mut scratch[start[id as usize] as usize..][..n as usize];
+            let [p50, p95, p99] = percentiles(lat).map(u64::from);
+            buf.extend_from_slice(label.as_bytes());
+            buf.extend_from_slice(self.dict.name(id as usize).bytes());
+            // Spec 3.6: error_ppm = floor(errors * 1000000 / count), in 64 bits.
+            for v in [n as u64, p50, p95, p99, errors, errors * 1_000_000 / n as u64] {
+                buf.push(b' ');
+                push_u64(&mut buf, v);
+            }
+            buf.push(b'\n');
+        }
+        buf
+    }
+
+    /// Hands over hour h's text; a thread that finds no write in progress writes every hour that is ready, in order.
+    fn emit(&self, h: usize, text: Vec<u8>) {
+        let mut o = self.out.lock().unwrap();
+        o.parts.insert(h, text);
+        if std::mem::replace(&mut o.writing, true) {
+            return;
+        }
+        loop {
+            let w = o.written;
+            let Some(buf) = o.parts.remove(&w) else { break };
+            drop(o);
+            let mut file = self.file;
+            file.write_all(&buf).expect("write output");
+            drop(buf);
+            o = self.out.lock().unwrap();
+            o.written += 1;
+        }
+        o.writing = false;
+    }
+
+    /// Every block is parsed: the mapping's page-table entries are dropped in shared 4 MiB steps, so the exit has fewer
+    /// to tear down (a-12: output closed -> process reaped 1.9-2.0 -> 0.8-1.3 ms). Nothing reads the mapping any more.
+    fn release(&self) {
+        let steps = self.data.chunks(4 << 20);
+        while let Some(step) = steps.clone().nth(self.released.fetch_add(1, Relaxed)) {
+            // Safety: step lies inside the mapping, which nothing writes or reads now; 4 is MADV_DONTNEED.
+            unsafe { madvise(step.as_ptr(), step.len(), 4) };
+        }
+    }
+}
+
+/// One run over the input with `workers` threads; false when a line came after its hour was finished.
+fn run(data: &'static [u8], dict: &Dict, file: &File, workers: usize, lag: usize) -> bool {
+    let job = Job {
+        data,
+        dict,
+        file,
+        state: Mutex::default(),
+        ready: Condvar::default(),
+        out: Mutex::default(),
+        released: AtomicUsize::default(),
+    };
+    std::thread::scope(|s| {
+        for _ in 1..workers {
+            s.spawn(|| job.work(workers, lag));
+        }
+        job.work(workers, lag);
+    });
+    !job.state.into_inner().unwrap().late
+}
+
 fn main() {
     // Pin glibc's mmap threshold (M_MMAP_THRESHOLD, -3) at its 128 KiB default. Left dynamic, freeing the first
-    // large record buffer raises it to 1 MiB, so the tail's output buffers come from the heap and their freed pages
-    // stay charged while the output file grows. Measured (this VM, 12 workers, peak of RssAnon + output size; a-11):
-    // 22.4 -> 19.8 MB median.
+    // large buffer raises it to 1 MiB, so the output buffers come from the heap and their freed pages stay charged
+    // while the output file grows. Measured (this VM, 12 workers, peak of RssAnon + output size; a-11): 22.4 -> 19.8 MB median.
     unsafe { mallopt(-3, 128 * 1024) };
+    // One malloc arena (M_ARENA_MAX, -8) for every thread: a block's record vectors are freed by the thread that
+    // finishes their hour, so with an arena per thread each arena keeps its own high-water mark of freed chunks.
+    // With one, freed chunks are reused by whichever thread allocates next (a few allocations per block and per hour,
+    // so the shared arena's lock is rarely contended). Measured effect: PERF.md a-55.
+    unsafe { mallopt(-8, 1) };
     let file = File::open("/data/requests.log").expect("open input");
     let len = file.metadata().expect("stat input").len() as usize;
     let mut out = File::create("/out/summary.txt").expect("create output");
@@ -424,123 +586,20 @@ fn main() {
 
     // Worker count. SD_WORKERS is a test-only override (rule 30: the hash runs force 1, 4, 12 and 24);
     // the board never sets it, so the scored run sizes itself from the CPUs it may use.
-    let cpus = thread::available_parallelism().map_or(1, |n| n.get());
+    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
     let var = std::env::var("SD_WORKERS").unwrap_or_default();
     let workers = var.trim().parse().unwrap_or(cpus).max(1);
-    let (mut tables, sorted): (Vec<Table>, Vec<_>) = thread::scope(|s| {
-        let spawn = |&(a, b): &(usize, usize)| {
-            s.spawn(move || {
-                let mut t = scan(data, a, b);
-                release_range(data, a, b);
-                // The probe table and the endpoint keys are not needed after the scan; freed here, they are not held
-                // through the tail. Freeing the keys (64 bytes per endpoint, a-40d), this VM, seed 1 full, 12 workers,
-                // peak RssAnon + output, median of 11: 20.6 -> 19.4 MB (ce481c8: 19.1).
-                (t.slots, t.keys) = (Vec::new(), Vec::new());
-                // This thread's endpoint ids in byte order, sorted here in parallel for the global merge.
-                let ids = 0..t.eps.len() as u32;
-                let mut sorted: Vec<_> = ids.map(|e| (prefix_key(t.ep(e)), e)).collect();
-                sorted.sort_unstable_by_key(|&(k, e)| (k, t.ep(e)));
-                (t, sorted)
-            })
-        };
-        let handles: Vec<_> = line_ranges(data, workers).iter().map(spawn).collect();
-        handles.into_iter().map(|h| h.join().unwrap()).unzip()
-    });
-
-    // The tail is split by hour: hours are disjoint parts of the key space that are also contiguous in the
-    // output, so each part is merged, selected and formatted by one thread with no shared writes, and the
-    // parts are written in order. The hours come from the input itself.
-    let mut hours: Vec<u32> = tables.iter().flat_map(|t| &t.hours).map(|h| h.hour).collect();
-    hours.sort_unstable();
-    hours.dedup();
-    // Each hour's job owns every thread's records and counters for that hour, so they are dropped
-    // as soon as the hour is formatted. Each mutex is taken exactly once, by the thread that claims the hour:
-    // never contended.
-    let mut jobs = vec![vec![Hour::default(); workers]; hours.len()];
-    for (t, table) in tables.iter_mut().enumerate() {
-        for x in &mut table.hours {
-            let h = hours.binary_search(&x.hour).unwrap(); // before the take, which zeroes x.hour
-            jobs[h][t] = std::mem::take(x);
-        }
-    }
-    let jobs: Vec<Mutex<Vec<Hour>>> = jobs.into_iter().map(Mutex::new).collect();
-    let (all, ranks) = global_ranks(&tables, sorted);
-
-    // Merges every thread's records of one hour and formats its output lines in endpoint order (spec 4): a
-    // counting sort by global endpoint rank (counts summed per rank, prefix sums, one pass placing each latency)
-    // puts each group's latencies side by side in `scratch`, with no comparison sort and no byte compares.
-    let format_hour = |i: usize, scratch: &mut Vec<u32>| {
-        let (parts, n) = (std::mem::take(&mut *jobs[i].lock().unwrap()), all.len());
-        let (mut start, mut errors) = (vec![0u32; n + 1], vec![0u64; n]);
-        for (t, x) in parts.iter().enumerate() {
-            for (e, &c) in x.counts.iter().enumerate().filter(|&(_, &c)| c > 0) {
-                let r = ranks[t][e] as usize;
-                start[r + 1] += c;
-                errors[r] += x.errors[e] as u64;
-            }
-        }
-        for r in 1..=n {
-            start[r] += start[r - 1]; // start[r] is now where rank r's latencies begin
-        }
-        // resize keeps the scratch capacity across hours; every slot below start[n] is written by the placement.
-        scratch.resize(start[n] as usize, 0);
-        let mut next = start.clone();
-        for (t, x) in parts.iter().enumerate() {
-            let mut k = 0;
-            while k < x.recs.len() {
-                let (e, lat, w) = match x.recs[k] {
-                    v if v & ID_ESC == ID_ESC => (x.recs[k + 1], x.recs[k + 2], 3),
-                    v => (v & ID_ESC, v >> ID_BITS, 1),
-                };
-                let r = ranks[t][e as usize] as usize;
-                scratch[next[r] as usize] = lat;
-                next[r] += 1;
-                k += w;
-            }
-        }
-        drop(parts); // every latency is placed: the records' pages go back before the formatting
-        let (h, mut buf) = (hours[i].to_string(), Vec::new()); // h: YYYYMMDDHH
-        let text = format!("{}-{}-{}T{}:00:00Z ", &h[..4], &h[4..6], &h[6..8], &h[8..]);
-        for r in (0..n).filter(|&r| start[r] < start[r + 1]) {
-            let lat = &mut scratch[start[r] as usize..start[r + 1] as usize];
-            let count = lat.len() as u64;
-            let [p50, p95, p99] = percentiles(lat).map(u64::from);
-            buf.extend_from_slice(text.as_bytes());
-            buf.extend_from_slice(all[r]);
-            // Spec 3.6: error_ppm = floor(errors * 1000000 / count), in 64 bits.
-            for v in [count, p50, p95, p99, errors[r], errors[r] * 1_000_000 / count] {
-                buf.push(b' ');
-                push_u64(&mut buf, v);
-            }
-            buf.push(b'\n');
-        }
-        buf
+    let dict = Dict {
+        names: (0..IDS).map(|_| UnsafeCell::new(Name([0; 128]))).collect(),
+        ..Default::default()
     };
-
-    // Threads take the next hour from a shared counter, so uneven hours still balance.
-    let (next, (tx, rx)) = (AtomicUsize::new(0), mpsc::channel::<(usize, Vec<u8>)>());
-    thread::scope(|s| {
-        for _ in 0..workers {
-            let (tx, next, hours, format_hour) = (tx.clone(), &next, &hours, &format_hour);
-            s.spawn(move || {
-                let mut scratch = Vec::new();
-                loop {
-                    let i = next.fetch_add(1, Relaxed);
-                    let Some(_) = hours.get(i) else { break };
-                    tx.send((i, format_hour(i, &mut scratch))).unwrap();
-                }
-            });
-        }
-        drop(tx);
-        // Write each hour's buffer as soon as every earlier hour is written, overlapping the write with the
-        // remaining work and freeing buffers early.
-        let (mut pending, mut written) = (vec![None; hours.len()], 0);
-        for (i, buf) in rx {
-            pending[i] = Some(buf);
-            while let Some(buf) = pending.get_mut(written).and_then(Option::take) {
-                out.write_all(&buf).expect("write output");
-                written += 1;
-            }
-        }
-    });
+    if !run(data, &dict, &out, workers, LAG) {
+        // A line came after its hour was finished: again from an empty file, with no hour finished before every block
+        // is registered, so the output is exact for any line order.
+        out.set_len(0).expect("truncate output");
+        out.rewind().expect("rewind output");
+        run(data, &dict, &out, workers, HOURS);
+    }
+    // Everything is written; exit without freeing what the kernel reclaims anyway.
+    std::process::exit(0);
 }
