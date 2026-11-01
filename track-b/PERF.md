@@ -82,6 +82,8 @@ What each push carried (the board re-runs the same code on every push):
 - **Step 58: experiment b-98**, phrase anchors checked against the token before them first (kit e80309e, code 08cf34c, with its docs).
   - Box: K 25.58 / 25.58 / 25.50, T 0.210-0.212 s, M 38.7-38.9 MB, S 847.
   - Board: T 0.223 s, K 24.87, points 69.8: 5 ms above b-84's step 57, where the box reads b-98 5 ms below b-84; the two board runs of b-84's code alone differ by 8 ms, so one board run cannot order the two.
+- **Step 59: experiment b-101**, the C rewrite (`bindex.c` replaces `Cargo.toml`, `Cargo.lock` and `src/`).
+  - Box, organisers' harness, 5 runs on seed 1 full: T 0.146-0.147 s, M 45.3 MB, S 788, D 1, K about 31 against b-99a's 25.67.
 
 Experiments read on the bench box (sd-bench/B); the lifted ones also have their board rows in the table above. The others were never pushed to the board, so they have no run ID: their numbers are bench-box readings of the commit named with them.
 
@@ -301,6 +303,12 @@ Experiments read on the bench box (sd-bench/B); the lifted ones also have their 
 - **b-99a** (OURS), the phrase anchor chosen with the first term's document frequency counted 8 times, so more anchors have a term before them for b-98's filter (7f4ac1c, on b-98).
   - Box K 25.67 / 25.68 (official T 0.209 / 0.209 s, fresh 0.207 / 0.209 s), M 38.5-38.6 MB, S 851, against b-98's 25.58 / 25.58 / 25.50: T -2 to -3 ms, beyond both spreads, S +4. Kept.
 - **b-100** (OURS), the token hash from one 32-byte load folded in registers, the same hash (ce240cb, on b-99a). Box K 25.63 / 25.70 against b-99a's 25.67 / 25.68, S +6: inside the spread. Not kept.
+- **b-101** (OURS), the C rewrite. The Rust design had run out of steps: after b-84 each kept change moved T by 5 ms or less, and the chunk evaluation stayed about a third of each worker's pass (64 of 185 ms, b-81). The rewrite changes the shape instead of the parts: per part of at most 32,768 documents, rows for the ~180 common terms and sorted 16-bit lists for the rest, then every BOOL query answered over them, left to right.
+  - v1, a first draft from the design (GLM-5.3), then ten fixes: correct on 6 seeds at 1, 3 and 12 workers and on seed 1's sha, box T 0.474 s.
+  - v2: the per-worker size checks moved out of the token loop. They wrote to shared arrays, 8 workers per cache line; T 0.474 → 0.222 s.
+  - v3, the clean version: one 64-byte aligned struct per worker and no shared writes in the scan; the queries parsed by all workers with compare-and-swap interning; buckets of 4 exact keys compared by one AVX2 instruction; all of a document's lookups before its branch-free pass, each bucket prefetched a document earlier; common-term bits in a per-document bitset turned into rows every 64 documents by transposes; the part's memory freed before the merge. Organisers' harness on the box: T 0.1458 s, M 45.4 MB.
+  - Per token on one thread (2.5 GHz): tokenize about 14 cycles, lookup 16, the branch-free pass 12, count and scatter 5, answering 18. No gain from a longer prefetch distance or a branch-free lookup (slower).
+  - Parts per worker and table size (organisers' harness, T / M): 2 parts, 2^16 buckets 0.1436 s / 55.7 MB; 2, 2^15 0.1445 s / 53.6 MB; 3, 2^15 0.1458 s / 45.4 MB; 4, 2^15 0.1482 s / 42.2 MB. Kept 3 and 2^15: M pays only down to 44 MB, and 3 parts gives up 1.4 ms for 8 MB against 2.
 
 ## Decisions
 
@@ -310,6 +318,7 @@ The plan's core choices (KNOWN = the known-best technique's version, OURS = our 
 - 2, look up only the terms the queries use (KNOWN): held, in one table for interning and the probe (b-13), with 4-byte slots (b-36a), filled by all workers at once (b-84).
 - 2b, one 12-thread pass over document ranges with posting lists in arena blocks (OURS): the pass held; the posting lists were traded. With a posting store one pass could not get under the 43,999,232 B memory cap (b-2), so b-3 decides BOOL queries inside the pass with no store, and b-28 folds every BOOL query per 64-document window. That window was traded in turn by b-68, which folds each triggered query once per 1,024-document chunk from rows and a sorted log of the rarer terms' hits (box T 0.250 → 0.238 s).
 - 3, no stored positions, phrases through an inline Aho-Corasick automaton over term ids (OURS): no positions held; the automaton was traded for anchor checks at each phrase's rarest term (b-8), each first filtered by the token before the anchor (b-98), with the anchor choice leaning to terms that have one (b-99a).
+- 4, Rust (KNOWN): traded for C (b-101). The rewrite moved BOOL answering out of the pass into per-part lists and rows, T 0.209 → 0.146 s on the box.
 
 Rejected:
 - b-5 (KNOWN): an AVX2 tokenizer; dropped, no gain and S grew by 50 lines.
@@ -365,4 +374,4 @@ Experiments measured only on the build VM and not kept:
 - **b-17** (KNOWN), tokenizing 64 bytes at a time with AVX2 class masks, lower-casing in the vector and hashing each token a word at a time. A second variant kept the byte loop and changed only the hash. Both were slower on the VM at 1, 4 and 12 workers, and both ran more instructions per docs byte (cachegrind). The byte loop's FNV multiply costs almost nothing, because it overlaps the scan. No code was committed.
 - **b-22** (KNOWN), answering AND queries of rare terms by intersecting doc lists instead of per-document triggers. It was not built, because the VM count showed too little to gain: such queries hold 0.9 % of the 10.7 M per-document evaluations at "rarer than 1 in 1,024 docs", and 3 % at 1 in 256. No code was committed.
 
-Final result (this tip, code 7f4ac1c, b-99a): box K 25.67 and 25.68 (the lower of two seeds, two readings), T 0.207-0.209 s, M 38.5-38.6 MB, S 851. The board's best run of ours, run-21676903d119 (60b5493 · Track B), measured b-84's code (a2b0dfd): T 0.218 s, M 39.6 MB, S 836, D 1, K 25.19, points 70.1, against the reference's T 56.35 s and M 2,200 MB.
+Final result (this tip, b-101, the C rewrite): organisers' harness on the box T 0.146-0.147 s, M 45.3 MB, S 788, D 1, K about 31. The board's best run of the Rust version, run-21676903d119 (60b5493 · Track B), measured b-84's code (a2b0dfd): T 0.218 s, M 39.6 MB, S 836, D 1, K 25.19, points 70.1, against the reference's T 56.35 s and M 2,200 MB.

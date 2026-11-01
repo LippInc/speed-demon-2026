@@ -1,6 +1,6 @@
 # Speed Demon 2026: four tracks
 
-One folder per track: A, B and D in Rust, C in C. Each builds and runs on its own; its README has the approach, the results and how to reproduce them.
+One folder per track: A and D in Rust, B and C in C. Each builds and runs on its own; its README has the approach, the results and how to reproduce them.
 
 | Track | Start here |
 |---|---|

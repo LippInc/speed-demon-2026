@@ -1,49 +1,61 @@
 # Track B: Index
 
-Reads `queries.txt` (BOOL and PHRASE queries) and `docs.txt` (one document per line) from `/data` and writes `results.txt` to `/out`: for each query, the number of matching documents, the sum of their ids and the ten smallest ids.
+Reads `queries.txt` (50,000 BOOL and PHRASE queries) and `docs.txt` (254 MB, one document per line) from `/data` and writes `results.txt` to `/out`: for each query, the number of matching documents, the sum of their ids and the ten smallest ids.
 
-56.35 s → 0.21 s (about 270×), 2.2 GB → 39 MB. No index is built: one parallel pass decides every BOOL query 1,024 documents at a time from bit-rows and a sorted log of the rarer terms' hits, and every phrase by checks at its rarest term.
+## For the judges, in one minute
 
-Rust, standard library only. K 25.67 (box `sd-bench/B`, commit 7f4ac1c, b-99a; the lower of two seeds and two readings): T 0.209 s, M 38.6 MB, S 851, D 1 (no dependencies). Board: run-21676903d119 (commit 60b5493, the code of a2b0dfd, b-84), K 25.19, T 0.218 s, our best board run; b-98's run-79c769d1182b (commit e550f50) read K 24.87, T 0.223 s.
+- **The code:** one file, [bindex.c](bindex.c), C17 with no dependencies. Its top comment gives the design in one paragraph, and each function's comment says why it is shaped the way it is.
+- **The result:** 56.35 s → 0.146 s (about 385×), 2.2 GB → 45 MB. On our copy of the scoring box with the organisers' harness (5 runs, seed 1 full): T 145.8-146.8 ms, M 45.3 MB, S 788, D 1, K about 31. The Rust version it replaced read T 0.218 s, K 25.19 on the board (run-21676903d119).
+- **Where each criterion's evidence is:**
+  - Code quality: bindex.c's header and function comments. Errors on open, map and write stop the program with the path or call that failed.
+  - Technique: the table below, each trick linked to its line.
+  - Optimisation log: [PERF.md](PERF.md), every step with its board run ID, failed experiments included; the C rewrite's own steps are at the end.
 
-Terms: K is the organisers' score combining T (run time), M (peak memory), S (lines of code) and D (dependencies) against the reference, higher is better; the box is our bench machine with the scoring machine's CPU; b-NN is one experiment in PERF.md; KNOWN = a textbook technique, OURS = our own design.
+| Trick | Where |
+|---|---|
+| Only the query terms are indexed. All workers parse the queries at once into one shared table; a new term is claimed with a compare-and-swap, no lock | [`intern`](bindex.c#L130), [`parse`](bindex.c#L184) |
+| A token of up to 8 bytes is its own key (its lowercased bytes as one 64-bit word), so a match needs no byte compare; buckets of 4 keys in one cache line, compared by one AVX2 instruction | [`key_at`](bindex.c#L110), [`lookup`](bindex.c#L121) |
+| Tokens cut 64 bytes at a time from AVX2 class masks; each token's bucket is prefetched a whole document before its lookup | [`tokenize`](bindex.c#L165), [`scan_part`](bindex.c#L294) |
+| Common terms (in over 1/16 of the sampled documents) get a bitmap row, built 64 documents at a time by 64×64 bit transposes; the rest get sorted 16-bit document lists | [`transpose64`](bindex.c#L274), [`scan_part`](bindex.c#L294) |
+| Term ids renumbered by sampled frequency: common terms first, then rare BOOL terms, then phrase-only terms | [`classify`](bindex.c#L234) |
+| Phrases checked during the scan at each occurrence of their rarest term, against the document's own token ids | [`match_phrases`](bindex.c#L254) |
+| BOOL queries answered per part, strictly left to right, on lists while the result is small and on bitmaps once a common term joins by OR; a short list against a long one binary-searches the long one | [`eval_part`](bindex.c#L409), [`isect`](bindex.c#L354) |
+| Counts by popcount, id sums by bit-sliced popcounts, and only as many ids as the query still lacks | [`emit`](bindex.c#L381) |
+| Each worker merges and formats the queries it parsed; one write per worker's slice | [`finish`](bindex.c#L473) |
 
-Reproduce with seed 1's full data in `<data>`, then compare the hash with the full seed-1 output hash in the [spec](https://github.com/hackathon-raptors/speed-demon-2026/blob/main/specs/b-index.md) (seed 1, full size: `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`):
-`docker build -t b track-b && docker run --rm --network=none -v <data>:/data:ro -v <out>:/out b && sha256sum <out>/results.txt`
+## The approach
 
-| Trick | Where | PERF |
-|---|---|---|
-| One pass over the mapped corpus, one document range per thread | [`map_file`](src/main.rs#L91), [`scan`](src/main.rs#L785) | b-1 |
-| Only the query terms are looked up, in one compact table | [`TermTable`](src/main.rs#L127) | b-6, b-13, b-36a |
-| The queries parsed by every worker at once into that one table, each new term published by a compare-and-swap | [`Interner`](src/main.rs#L264), [`parse`](src/main.rs#L843) | b-52, b-84 |
-| Each token's slot line prefetched one token ahead, the token reported one step late | [`hold`](src/main.rs#L195) | b-64 |
-| Phrases checked at the rarest term's byte offsets at the doc's end (a first term counted 8x commoner, so more anchors have a term before them), a pattern skipped first when the token before the anchor is not its term | [`PhrasePlan`](src/main.rs#L342) | b-8, b-56, b-98, b-99a |
-| BOOL queries folded per 1,024-document chunk: rows for common terms, a radix-sorted log for the rest, no posting store | [`ChunkLog`](src/main.rs#L605), [`fold_chunk`](src/main.rs#L563) | b-3, b-32b, b-68 |
-| A query is folded only in chunks where a term of its cover occurs | [`cover`](src/main.rs#L515) | b-3 |
-| Counts by popcount, id sums by bit-sliced popcounts | [`record`](src/main.rs#L589) | b-4 |
-| Tokens cut 32 bytes at a time, starts and ends as two masks | [`tokenize`](src/main.rs#L180), [`walk`](src/main.rs#L214) | b-31a, b-31b, b-31c, b-55, b-59 |
-| Trigger order and the dense/sparse cut from document frequencies sampled on 1/128 of the corpus | [`estimate_df`](src/main.rs#L433) | b-9, b-11, b-68 |
+Twelve workers, one per hardware thread of the scoring box. Each owns a contiguous stretch of `docs.txt` (mapped read-only, never copied), cut into 3 parts of at most 32,768 documents, so a document's number inside its part fits in 16 bits.
 
-Every measurement, failed experiments included, with its board run ID: [PERF.md](PERF.md). Receipts: [`reports/b/`](../reports/b/) at the repository root, one `harness-<commit>.txt` per measured submission commit, from the board's runs of that commit; each names the commit it measured, and the commit after a measured push only adds its receipt.
+1. **Queries.** Each worker parses one slice of `queries.txt` into the shared term table. Every BOOL term is flagged; each phrase is a list of term ids.
+2. **Sample and renumber.** Each worker counts document frequencies on the first 1/64 of its first part. From the summed counts, terms in over 1/16 of the sampled documents are common (about 180 on seed 1), and every term gets a new id: common, then rare BOOL, then phrase-only. Each phrase is anchored at its term with the lowest sampled frequency.
+3. **Scan a part.** Per document: tokenize, look every token up (independent loads, many in flight), then one branch-free pass. A common term sets its bit in the document's small bitset, a rare BOOL term appends its id to a stream, an anchor is noted. Every 64 documents the bitsets become one word of each common term's row by transposes. After the part, the stream is counted and scattered into per-term document lists, repeats dropped. Phrases are checked at the end of each document, at each anchor, against its token ids.
+4. **Answer the part.** Every BOOL query is folded left to right over its terms' lists and rows. A query that matched leaves a record: count, sum of part-local numbers, and as many of the smallest numbers as it still needs.
+5. **Merge.** Each worker adds up the records of the queries it parsed, part by part in document order, adds the phrase hits and formats its lines. The main thread writes the slices in order.
 
-Limit: each worker's pass is about 185 ms of the 216 ms run at 12 workers (box timers, b-81): tokenizing, looking up and recording every token about 95 ms, the chunk evaluation about 64 ms, the phrase checks about 17 ms. Most of the evaluation, about 47 ms, folds queries triggered by rare terms, each over 16 words for about 4 candidate documents (b-83).
+No locks: the phases meet at barriers, and in the scan and answer phases each worker writes only its own memory, 64-byte aligned so no two workers share a cache line.
 
-## Approach
+## Why it is shaped this way
 
-The program reads `queries.txt` first. Every line is its own query (a line dedupe was 70 M of the parse's 110 M instructions; removing it took the VM's parse from 32 ms to 22.7 ms). Every worker parses one range of whole lines at once (b-84). One pass cuts its lines at spaces, double quotes and LFs, 32 bytes per AVX2 compare, with no allocation per line (b-69), and every term is interned straight into the one table the pass later probes, shared by all workers. A new term's bytes go to an entry at an id the worker drew (64 at a time), then a compare-and-swap publishes its slot, so no worker takes a lock; the workers' queries are joined in file order. On the box the parse fell from about 12.5 ms on one thread to about 3.4 ms (b-84). That table uses a fixed-width CRC32-C hash of the zero-padded term (b-74) and open addressing. It is sized from the length of `queries.txt` first, and the parse runs again at twice the slots if the terms would pass a load factor of 1/3. Each 4-byte slot holds the term's id in its low 30 bits and the hash's top 2 bits, so a miss reads one cache line. A hash match is confirmed against the term's bytes, which are stored inline and zero-padded in a 32-byte entry: one more line, and one 32-byte compare with the zero-padded token. Each PHRASE line becomes one pattern with one anchor, its term with the lowest estimated document frequency. The binary links the C runtime statically (probe b-21), so no dynamic loader runs before main.
-
-Under the spec's strict left fold, whether a document is in a BOOL query's result depends only on which of the query's terms the document contains, so the same fold over 64-bit words, one bit per document, decides 64 documents at once. A document can only be in R if it contains a term of the query's cover. The cover starts as the first term; each OR operand is added to it; an AND operand may replace the cover when its estimated document frequency is lower. Every query is listed, with its code inline, under each term of its cover. Its accumulator slot follows that list order, so the queries one term triggers have neighbouring accumulators. Before the pass, document frequencies are estimated on 64 evenly spaced windows covering 1/128 of the corpus, only to make those choices. The sample's 64 windows are spread over the worker threads. The terms are then renumbered in place in the term table: the BOOL terms first, and each group by descending estimated frequency, so the terms most tokens hit have neighbouring ids and their table entries and rows share cache lines. A BOOL term sampled in at least 1/64 of the sampled documents is dense (738 of 53,444 on seed 1), and the dense terms are the first ids. A query whose cover holds a dense term is folded in every chunk; every other query is listed under its cover's terms. The BOOL and phrase plans are built on two threads.
-
-`docs.txt` is mapped read-only and cut into one line-aligned range per worker. Each worker tokenizes its documents as the spec defines (ASCII lower-casing, runs of `a-z0-9`), classifying 32 bytes at a time with AVX2 and cutting tokens where the token-byte mask changes, the starts and ends decoded as two masks (b-55), so no branch is taken per byte. Each token's bytes are then loaded once, lower-cased by setting bit 5, zero-padded to 32 bytes, and hashed as four 64-bit words at once, so no loop depends on the token's length. The next token's slot line is prefetched before the current token is probed (b-64). A token found in the table, if it is a dense term, sets the document's bit in that term's 16-word row for the current 1,024-document chunk; any other BOOL term is appended to the chunk's log as its key and the document's place in the chunk, a store with no read (b-68). Neither takes a branch: a sparse hit sets a bit in a dummy row, and a dense hit's log entry is written but not kept. The pass records only a document's anchor occurrences, each with its byte offset. At the end of the document, each anchor occurrence is a candidate for every phrase anchored on that term, whose anchor is its j-th term, confirmed by reading the doc's bytes around it: the non-empty pieces of the text from the anchor on, split at separators, are the doc's own tokens from the anchor on, and the pieces before it, split from the right, are the tokens before it, so each of the pattern's other terms is checked against the token at its offset from the anchor; a term equals a token when its bytes equal the token's up to ASCII case and end there (the term table's own test). A token is a maximal run of `a-z0-9` and every other byte separates, so this reads the same tokens the old per-token sequence held and decides exactly what it decided, without the 36.3 M pushes per run (b-56). Each anchor occurrence also carries the term id of the token just before it, so a pattern whose term before the anchor is another term is skipped with one compare, before any byte is read (b-98: box T 0.216 → 0.211 s). Each phrase counts a document once. A phrase containing a term that occurs nowhere has an estimated frequency of 0 there, so it is anchored on that term and never checked.
-
-When the chunk ends, the worker sorts its log by key with a two-pass LSD radix sort (stable, so each key's documents stay ascending), drops repeated (key, document) entries, and notes each key's span. It folds every every-chunk query, then walks the keys present and folds each query listed under them once (a per-chunk stamp skips a query already folded through another key), over the chunk's 16 words at once, with AND, OR and AND-NOT; a sparse operand's row is built from its span of the log, and the operator selects masks from a small table, so the fold takes no branch on it. On seed 1 the 12 workers fold 3.64 M (query, chunk) pairs in all, where the 64-document window folded 18.84 M. For each word with a match, found through a mask of them, the match count is the popcount, and the id sum is the word's base times that count plus the sum over k of popcount(word AND mask_k) shifted left by k, where mask_k selects the bit positions whose bit k is set. First ids are taken from the word only while the query can still use them, and offered to a shared set of the ten smallest ids, which a single atomic bound guards. Then the rows and spans are cleared. After the pass, the workers' counts and sums are added up. PHRASE answers are the per-document matches the pass collected. `results.txt` is formatted with a small decimal writer, each worker formatting one contiguous slice of the queries, and written once at the end, and the process exits right after, without freeing its tables.
+- **Answers per part, no global index.** Holding every posting list at once does not fit in the memory the score rewards (it pays down to 44 MB; a posting store could not get under it, b-2 in PERF.md). Parts of 32,768 documents keep every list 16-bit and in cache, and a part's memory is freed before the merge.
+- **Exact keys for short tokens.** Most words are 8 letters or shorter, so the key is the token itself; longer tokens fold their further 8-byte words in with odd multipliers.
+- **Rows only for common terms.** A row costs one bit per document of the part whether the term occurs there or not; for the rare terms, about 53,000 of them, a sorted list is smaller and folds faster.
+- **Phrases at the rarest term, on token ids.** Checking at the anchor turns 36 M token positions into about a million candidate checks, and the ids are already in hand from the lookup.
 
 ## Dependencies
 
-None.
+None. The C standard library and POSIX threads, linked statically. Built by the [Dockerfile](Dockerfile) with gcc 15, `-O3 -march=x86-64-v3`.
 
 ## With another 24 hours
 
-- The chunk evaluation (b-68): most of its folds are of queries whose operands are all rare, with about 4 candidate documents in the chunk, so they spend 16-word work on a few bits. Folding those documents one by one read 2.3 times slower on the box, from a branch per document (b-83), so the next form folds only the words that hold a candidate, with no branch per document.
-- The token lookup: a longer prefetch distance read slower on the box (b-82, eight tokens in flight: T +4 ms), so the next form is a smaller table, an exact minimal perfect hash with a 16-bit pilot per bucket and the keys by id, about 600 KB where the probe chains of b-80 took 1.5 MB.
-- An 8-byte accumulator that keeps the duplicate-fold stamp inside it (narrow fields that spill exactly on wrap), so the halved footprint does not cost an extra line per fold (b-33b moved the stamp out and lost).
+Per token on one thread (box, 2.5 GHz): tokenize about 14 cycles, lookup 16, the branch-free pass 12, count and scatter 5, answering 18.
+
+- **The answer phase.** The list merges are its biggest share (`unite` 9 %, `isect` 8.5 % of cycles). Most folds are over short lists; merging them with SIMD compares instead of one element per step is next.
+- **The lookup.** One bucket line per token, prefetched a document ahead. A smaller table for the hot short tokens would keep it in L1.
+- **The serial setup.** Renumbering runs on one thread (about 4 ms) while the others wait; it can be split by slot range like the sample sum.
+
+## Reproduce
+
+From the repository root: `python3 check.py b --data data/b --expected f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`
+
+Or by hand, with seed 1's full data in `<data>`: `docker build -t b track-b && docker run --rm --network=none -v <data>:/data:ro -v <out>:/out b && sha256sum <out>/results.txt`
