@@ -26,9 +26,9 @@
 //  5. Each name has one owner thread, picked by its hash. The reader sends
 //     the owner an 8-byte message (the hash, with the country in the low
 //     byte) through a lock-free ring, and the owner keeps its names in a
-//     private table with one bit per country. A table shared by all threads
-//     cost 18 ms more: every lookup missed the core's own cache. The owner's
-//     table fits in its L2 and needs no atomic instruction.
+//     private table with one bit per country. One table shared by all
+//     threads took almost twice as long (PERF.md): every lookup missed the
+//     core's own cache. The owner's table needs no atomic instruction.
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <immintrin.h>
@@ -105,10 +105,6 @@ static inline u64 load(const u8 *p) {
   memcpy(&v, p, 8);
   return v;
 }
-static inline u64 mix(u64 a, u64 b) { // wyhash's mum: a 128-bit product, folded
-  unsigned long long hi, lo = _mulx_u64(a, b, &hi);
-  return lo ^ hi;
-}
 
 static void barrier(void) { // all NT threads meet here
   int g = gen;
@@ -140,18 +136,18 @@ static inline u64 quotes(const u8 *p) { // a bit per quote byte of p[0, 64)
               _mm256_cmpeq_epi8(_mm256_loadu_si256((const void *)(p + 32)), q));
 }
 
-// Name hashing, 32 bytes v at a time into h; q counts the quote bytes.
+// Name hashing: 32 bytes v at a time go into the 128-bit state h, the first
+// 16 by XOR and the last 16 as the key of one AES round; q counts the quotes.
 typedef struct {
   const u8 *p;
-  u64 n, h, q;
+  u64 n, q;
+  __m128i h;
 } Name;
 static inline Name step(Name s, __m256i v) {
   s.q += _mm_popcnt_u32(
       _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8('"'))));
-  s.h = mix(_mm256_extract_epi64(v, 0) ^ s.h ^ 0xA0761D6478BD642F,
-            _mm256_extract_epi64(v, 1) ^ 0xE7037ED1A0B428DB) ^
-        mix(_mm256_extract_epi64(v, 2) ^ 0x8EBC6AF09C88C6E3,
-            _mm256_extract_epi64(v, 3) ^ 0x589965CC75374CC3);
+  s.h = _mm_aesenc_si128(_mm_xor_si128(s.h, _mm256_castsi256_si128(v)),
+                         _mm256_extracti128_si256(v, 1));
   return s;
 }
 // All but the last 32 bytes of a long name (spec 2.2 sets no bound; the
@@ -162,16 +158,21 @@ __attribute__((cold, noinline)) static Name head(Name s) {
   return s;
 }
 // The hash of the name bytes p[0, n), and in *len their length once
-// unescaped: every quote inside a name is half of a "".
+// unescaped: every quote inside a name is half of a "". After two more AES
+// rounds every name byte has reached all 128 bits of the state. One round is
+// a bijection, so names of up to 16 bytes cannot collide before the state is
+// cut to 64 bits.
 static inline u64 name(const u8 *p, u64 n, u64 *len) {
-  Name s = {p, n, n, 0};
+  Name s = {p, n, 0, _mm_set_epi64x(0x8EBC6AF09C88C6E3, 0xA0761D6478BD642F)};
   if (n > 32)
     s = head(s);
   s = step(s, _mm256_and_si256(
                   _mm256_loadu_si256((const void *)s.p),
                   _mm256_loadu_si256((const void *)(KEEP + 32 - s.n))));
   *len = n - s.q / 2;
-  return mix(s.h, 0x1D8E4E27C47D124F);
+  s.h = _mm_aesenc_si128(s.h, _mm_set_epi64x(0x589965CC75374CC3, 0xE7037ED1A0B428DB));
+  s.h = _mm_aesenc_si128(s.h, _mm_set_epi64x(0x1D8E4E27C47D124F, 0x9E3779B97F4A7C15));
+  return _mm_cvtsi128_si64(s.h);
 }
 
 // The length of the text field p[0, n) once unescaped: an unquoted field is
