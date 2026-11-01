@@ -3,12 +3,13 @@
 //
 // How it works, and why it is fast:
 //  1. Twelve threads, one per hardware thread of the scoring box's six
-//     P-cores. Thread t owns the records that start in its twelfth of the
-//     file. A record starts right after an LF that is followed by a digit or
-//     a BOM: inside a quoted note an LF is always followed by a lowercase
-//     letter or a quote (spec 2.2), so a thread finds its first record
-//     without reading anything before it.
-//  2. records.csv is mapped, and each thread parses its part in two passes
+//     P-cores. They take 256 KB pieces of the file from a shared counter, so
+//     a thread that another process slows down takes fewer. A thread owns
+//     the records that start in its piece. A record starts right after an LF
+//     that is followed by a digit or a BOM: inside a quoted note an LF is
+//     always followed by a lowercase letter or a quote (spec 2.2), so a
+//     thread finds a piece's first record without reading anything before it.
+//  2. records.csv is mapped, and each thread parses its piece in two passes
 //     per 16 KB. Pass 1 is the only one that reads every byte: per 64 bytes,
 //     AVX2 compares give bitmasks of quotes, commas and LFs, and a carry-less
 //     multiply turns the quote mask into an "inside quotes" mask (every quote
@@ -25,8 +26,9 @@
 //     1e-7 per run.
 //  5. Each name has one owner thread, picked by its hash. The reader sends
 //     the owner an 8-byte message (the hash, with the country in the low
-//     byte) through a lock-free ring, and the owner keeps its names in a
-//     private table with one bit per country. One table shared by all
+//     byte) through a lock-free ring, 128 messages at a time (8 at a time
+//     cost 1.5 ms more), and the owner keeps its names in a private table
+//     with one bit per country. One table shared by all
 //     threads took almost twice as long (PERF.md): every lookup missed the
 //     core's own cache. The owner's table needs no atomic instruction.
 #define _GNU_SOURCE
@@ -45,14 +47,17 @@ typedef uint64_t u64;
 typedef uint32_t u32;
 typedef uint16_t u16;
 typedef uint8_t u8;
-enum { NT = 12, CHB = 256, RING = 512 }; // CHB: 64-byte blocks per pass 1
+// CHB: 64-byte blocks per pass 1; BATCH: messages staged per owner
+enum { NT = 12, CHB = 256, BATCH = 128, RING = 2 * BATCH, PIECE = 1 << 18 };
 
 typedef struct { // one country's running totals, kept per thread
   int64_t n, ids, sum, min, max, nb, tb, names;
 } Agg;
 typedef struct { // a thread's outgoing messages and its totals
-  _Alignas(64) u64 line[NT][8]; // each owner's next 64 bytes, fill[o] used
+  _Alignas(64) u64 batch[NT][BATCH]; // each owner's next messages, fill[o] used
   u64 head[NT]; // each owner's ring head as last read: re-read only when full
+  u64 *over[NT]; // each owner's messages that found its ring full: lo to hi
+  u32 lo[NT], hi[NT], cap[NT];
   int t;
   u32 fill[NT];
   Agg *agg;
@@ -78,10 +83,11 @@ static char codes[256][4];            // country number -> code
 static int ncountry;
 static pthread_mutex_t cmu = PTHREAD_MUTEX_INITIALIZER;
 static atomic_int arrived, gen, finished;
+static _Atomic u64 piece; // the start of the next piece of records.csv to parse
 typedef struct { // the messages from one thread to one owner, RING at most
   _Alignas(64) _Atomic u64 tail; // advanced by the sender
   _Alignas(64) _Atomic u64 head; // advanced by the owner
-  u64 *m;                        // one page; message i is m[i % RING]
+  u64 *m;                        // message i is m[i % RING]
 } Ring;
 static Ring ring[NT][NT]; // [sender][owner]
 static Agg agg[NT][256];
@@ -323,17 +329,35 @@ static u64 drain(int t, Agg *a) {
   return done;
 }
 
-// Sends x's partial line for owner o, waiting (and filing its own messages
-// meanwhile, so two full rings never wait on each other) while o's ring is full.
-static void post(Ctx *x, int o) {
+// Moves up to n messages from p into x's ring to owner o; returns how many.
+static u64 push(Ctx *x, int o, const u64 *p, u64 n) {
   Ring *r = &ring[x->t][o];
   u64 t = r->tail;
-  while (t + x->fill[o] - x->head[o] > RING &&
-         t + x->fill[o] - (x->head[o] = atomic_load_explicit(&r->head, memory_order_acquire)) > RING)
-    if (!drain(x->t, x->agg))
-      _mm_pause();
-  memcpy(r->m + t % RING, x->line[o], 8 * x->fill[o]); // lines never wrap
-  atomic_store_explicit(&r->tail, t + x->fill[o], memory_order_release);
+  if (t + n - x->head[o] > RING)
+    x->head[o] = atomic_load_explicit(&r->head, memory_order_acquire);
+  n = n < RING - (t - x->head[o]) ? n : RING - (t - x->head[o]);
+  u64 i = t % RING, k = n < RING - i ? n : RING - i; // up to the ring's end
+  memcpy(r->m + i, p, 8 * k);
+  memcpy(r->m, p + k, 8 * (n - k));
+  atomic_store_explicit(&r->tail, t + n, memory_order_release);
+  return n;
+}
+
+// Sends x's batch for owner o. It never waits: an owner that another process
+// keeps off its CPU would hold up every sender (PERF.md: a CPU busy 1 ms in
+// every 5 cost 4 ms). What finds the ring full waits in an overflow queue,
+// which is sent first.
+static void post(Ctx *x, int o) {
+  if (x->lo[o] < x->hi[o] && (x->lo[o] += push(x, o, x->over[o] + x->lo[o], x->hi[o] - x->lo[o])) == x->hi[o])
+    x->lo[o] = x->hi[o] = 0;
+  u64 n = x->lo[o] == x->hi[o] ? push(x, o, x->batch[o], x->fill[o]) : 0;
+  if (n < x->fill[o]) { // the rest joins the overflow
+    if (x->hi[o] + BATCH > x->cap[o] &&
+        !(x->over[o] = realloc(x->over[o], 8 * (x->cap[o] = 2 * x->cap[o] + BATCH))))
+      die("realloc");
+    memcpy(x->over[o] + x->hi[o], x->batch[o] + n, 8 * (x->fill[o] - n));
+    x->hi[o] += x->fill[o] - n;
+  }
   x->fill[o] = 0;
 }
 
@@ -371,8 +395,8 @@ static void records(Ctx *x, Scan *z) {
     g->nb += nl;
     g->tb += text(f + b + 1, c - b - 1);
     u64 o = (h >> 32) * NT >> 32; // the name's owner
-    x->line[o][x->fill[o]] = (h & ~255ull) | cc[r];
-    if (++x->fill[o] == 8) // a full line: one 64-byte write
+    x->batch[o][x->fill[o]] = (h & ~255ull) | cc[r];
+    if (++x->fill[o] == BATCH)
       post(x, o);
   }
   z->start = start, z->n -= n;
@@ -387,18 +411,25 @@ static void *worker(void *arg) {
   regions(t);
   barrier(); // the region table is complete
   grow(&names[t]);
-  u64 lo = record_start(rsize * t / NT);
-  u64 hi = t + 1 < NT ? record_start(rsize * (t + 1) / NT) : rsize;
-  Scan z = {.f = rec + lo, .end = hi - lo};
-  z.ix = big(4 * 64 * (CHB + 2));
-  for (int k = 1; z.at < z.end; k++) {
-    separators(&z, z.at + 64 * CHB < z.end ? z.at + 64 * CHB : z.end);
-    records(x, &z);
-    if (k % 4 == 0)
-      drain(t, x->agg);
+  u32 *ix = big(4 * 64 * (CHB + 2));
+  for (u64 c, k = 1; (c = atomic_fetch_add(&piece, PIECE)) < rsize;) {
+    u64 lo = record_start(c), hi = record_start(c + PIECE);
+    Scan z = {.f = rec + lo, .end = hi - lo, .ix = ix};
+    for (; z.at < z.end; k++) {
+      separators(&z, z.at + 64 * CHB < z.end ? z.at + 64 * CHB : z.end);
+      records(x, &z);
+      if (k % 8 == 0)
+        drain(t, x->agg);
+    }
   }
-  for (int o = 0; o < NT; o++) // the partial lines
-    post(x, o);
+  for (int o = 0; o < NT; o++) { // the partial batches and the overflow,
+    post(x, o);                   // filing meanwhile so that two full
+    while (x->lo[o] < x->hi[o]) { // rings never wait on each other
+      if (!drain(t, x->agg))
+        _mm_pause();
+      post(x, o);
+    }
+  }
   atomic_fetch_add(&finished, 1); // after every send, so the last drain sees all
   while (finished < NT)
     if (!drain(t, x->agg))
@@ -442,7 +473,7 @@ int main(void) {
     p--;
   maxreg = strtoull((const char *)reg + p, 0, 10);
   rtab = big(maxreg + 2); // the last entry: every id above the range
-  u64 *m = big(8 * RING * NT * NT); // a page per ring
+  u64 *m = big(8 * RING * NT * NT);
   for (int i = 0; i < NT * NT; i++)
     (&ring[0][0])[i].m = m + RING * i;
   for (int t = 0; t < NT; t++)
