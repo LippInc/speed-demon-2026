@@ -49,9 +49,12 @@ typedef uint32_t u32;
 typedef uint8_t u8;
 // CHB: 64-byte blocks per pass 1; BATCH: messages staged per owner.
 // MAXREC: records per pass 1, each 11 bytes or more; HOTREC: the most the
-// data puts in one pass 1 (under 300), with room to spare.
+// data puts in one pass 1 (under 300), with room to spare. SLOTS: an owner's
+// first name table, which holds NAMES names (an owner gets ~8,400).
 enum { NT = 12, CHB = 256, BATCH = 128, RING = 2 * BATCH, PIECE = 1 << 18 };
 enum { MAXREC = 64 * CHB / 8 + 2, HOTREC = 512, STACK = 1 << 16 };
+enum { SLOTS = 1 << 14, NAMES = SLOTS * 9 / 16, HUGE = 1 << 21 };
+enum { CHARGE = 64 << 12 }; // a CPU's memcg charge batch, 64 pages
 
 typedef struct { // one country's running totals, kept per thread
   long long n, ids, sum, min, max, nb, tb, names;
@@ -85,7 +88,13 @@ typedef struct { // one owner's names
 static u8 *rec;                       // records.csv, mapped
 static u64 rsize, regsize, maxreg;    // file sizes, the largest region id
 static const u8 *reg;                 // regions.csv, mapped
-static u8 *rtab;                      // region id -> country, 0 = unmatched
+// Region id -> country (0: unmatched), for 200,000 ids among 1,000,000. Ids
+// ascend, one per line: has[w] has a bit per id 64w..64w+63, first[w] is the
+// line of word w's first id and ctry[line] the country.
+static u64 *has;
+static u32 *first;
+static u8 *ctry;
+static _Atomic u64 nline[NT]; // the lines of each share of regions.csv, + 1
 static _Atomic u8 cidx[26 * 26 * 26]; // country code -> country number
 static int ncountry;
 static pthread_mutex_t cmu = PTHREAD_MUTEX_INITIALIZER;
@@ -97,10 +106,17 @@ typedef struct { // the messages from one thread to one owner, RING at most
   _Alignas(64) _Atomic u64 head; // advanced by the owner
   _Alignas(64) u64 m[RING];      // message i is m[i % RING]
 } Ring;
-static Ring ring[NT][NT]; // [sender][owner]
-static Agg agg[NT][256];
+static Ring (*ring)[NT]; // [sender][owner]
+static Agg (*agg)[256];
 static Names names[NT];
-static Ctx *ctx; // [NT]
+static Ctx *ctx;    // [NT]
+static u8 *shared;  // the tables above
+static u64 carved;  // how much of them
+// shared is faulted in CHARGE bytes at a time: the stretch to do next, the
+// ones done of the region table's rstretch, all nstretch
+static _Atomic u64 next;
+static atomic_int ready;
+static u64 rstretch, nstretch;
 extern char __bss_start[], _end[]; // the zeroed statics
 static const u8 KEEP[64] = {[0 ... 31] = 0xFF}; // KEEP + 32 - n: n bytes kept
 
@@ -117,12 +133,33 @@ static void *big(u64 n) { // zeroed; only the pages touched count as memory
   madvise(p, n, MADV_NOHUGEPAGE);
   return p;
 }
-// Faults in p[0, n) now. Main does this for all the memory the threads
-// write: the kernel charges a CPU's first page fault to the cgroup as 64
-// pages, so faults on all 12 CPUs would count up to 3 MB (in M) unused.
+// Faults in p[0, n) now. The kernel charges 4 KB page faults to the cgroup 64
+// pages ahead per CPU, so faults on all 12 CPUs would count up to 3 MB (in M)
+// never used. Main faults in what the threads write alone; the tables they
+// share are faulted in whole charge batches, see spare().
 static void hot(void *p, u64 n) {
   u64 a = (uintptr_t)p & ~4095ull;
   madvise((void *)a, (uintptr_t)p + n - a, MADV_POPULATE_WRITE);
+}
+// Faults in a byte per 2 MB of p[0, n) and the last, so each 2 MB of a file
+// mapping gets its page-table page (a 4 KB charge) here
+static void tables(const u8 *p, u64 n) {
+  for (u64 i = 0; i < n; i += HUGE)
+    (void)*(volatile const u8 *)(p + i);
+  (void)*(volatile const u8 *)(p + n - 1);
+}
+// Faults in stretches of shared until stretch `to` is taken
+static void spare(u64 to) {
+  for (u64 s; next < to && (s = next++) < nstretch;) {
+    hot(shared + s * CHARGE, CHARGE);
+    if (s < rstretch)
+      ready++;
+  }
+}
+static void *carve(u64 n) { // the next n bytes of shared
+  void *p = shared + carved;
+  carved += (n + 63) & ~63ull;
+  return p;
 }
 static inline u64 digits(const u8 *p) { // p[0, 8) as digit values
   u64 v;
@@ -236,23 +273,19 @@ static inline u64 *find(u64 *slot, u64 mask, u64 msg) {
   }
 }
 
-// Doubles the table (at 9/16 full: the first, 9,216 names, holds the ~8,400
-// an owner gets) and refiles every name; ids and rows stay. lo[id] keeps the
-// message bits 8-19 that the slot lacks.
+// Doubles the table at 9/16 full and refiles every name; ids and rows stay.
+// lo[id] keeps the message bits 8-19 that the slot lacks.
 static void grow(Names *m) {
-  u64 *old = m->slot, n = old ? 4 * (m->mask + 1) : 0, size = old ? 2 * n : 1 << 14;
-  m->slot = big(size * 8);
-  m->lo = realloc(m->lo, size * 9 / 16 * sizeof *m->lo);
-  m->row = realloc(m->row, size * 9 / 16 * sizeof *m->row);
-  if (!m->lo || !m->row)
+  u64 *old = m->slot, n = 4 * (m->mask + 1), size = 2 * n, cap = size * 9 / 16;
+  uint16_t *lo = malloc(cap * sizeof *lo);
+  u64(*row)[4] = malloc(cap * sizeof *row);
+  if (!lo || !row)
     die("malloc");
-  hot(m->slot, size * 8), hot(m->lo, size * 9 / 16 * sizeof *m->lo);
-  hot(m->row, size * 9 / 16 * sizeof *m->row);
-  m->mask = size / 4 - 1;
+  memcpy(lo, m->lo, m->n * sizeof *lo), memcpy(row, m->row, m->n * sizeof *row);
+  m->slot = big(size * 8), m->lo = lo, m->row = row, m->mask = size / 4 - 1;
   for (u64 i = 0; i < n; i++)
     if (old[i])
       *find(m->slot, m->mask, old[i] >> 20 << 20 | (u64)(m->lo[(old[i] & 0xFFFFF) - 1] & 0xFFF) << 8) = old[i];
-  munmap(old, n * 8);
 }
 
 // Files the name of message msg, seen for the first time; returns its slot.
@@ -275,17 +308,42 @@ static int country(const u8 *p) { // numbers countries in order of first sight
   return c;
 }
 
-static void regions(int t) { // the lines that start in this thread's twelfth
-  u64 p = t ? regsize * t / NT : 1, e = regsize * (t + 1) / NT;
+// The lines that start in share i of NT - 2 of regions.csv. Their numbers
+// count on from the lines of the shares before, which a thread counts first.
+static void regions(int i) {
+  u64 p = i ? regsize * i / (NT - 2) : 1, e = regsize * (i + 1) / (NT - 2);
   while (p < e && reg[p - 1] != '\n')
     p++;
-  while (p < e) { // "id,CCC\n": plain ASCII, spec 2.3
+  u64 n = 0, j = p - 1, line = 0; // the LFs before each line start in [p, e)
+  for (; j + 32 < e; j += 32)
+    n += _mm_popcnt_u32(eq32(reg + j, _mm256_set1_epi8('\n')));
+  for (; j + 1 < e; j++)
+    n += reg[j] == '\n';
+  nline[i] = n + 1;
+  for (int k = 0; k < i; k++) {
+    while (!nline[k])
+      _mm_pause();
+    line += nline[k] - 1;
+  }
+  // The word of the line before: if our first id shares it, so does its first
+  u64 q = p - 1;
+  while (q && reg[q - 1] != '\n')
+    q--;
+  u64 w = strtoull((const char *)reg + q, 0, 10) >> 6, bits = 0; // header: 0
+  while (ready < rstretch) // the table is in
+    _mm_pause();
+  for (; p < e; p += 5, line++) { // "id,CCC\n": plain ASCII, spec 2.3
     u64 id = 0;
     while (reg[p] != ',')
       id = id * 10 + reg[p++] - '0';
-    rtab[id] = country(reg + p + 1);
-    p += 5;
+    if (id >> 6 != w) { // words at the shares' ends are shared
+      __atomic_fetch_or(&has[w], bits, __ATOMIC_RELAXED);
+      w = id >> 6, bits = 0, first[w] = line;
+    }
+    bits |= 1ull << (id & 63);
+    ctry[line] = country(reg + p + 1);
   }
+  __atomic_fetch_or(&has[w], bits, __ATOMIC_RELAXED);
 }
 
 static u64 record_start(u64 q) { // the first record starting at or after q
@@ -379,7 +437,9 @@ static void post(Ctx *x, int o) {
 // overlap. The second does the totals, the name and the note.
 static void records(Ctx *x, Scan *z) {
   // Locals, not globals or z's fields: the stores below could alias those.
-  const u8 *f = z->f, *rt = rtab;
+  const u8 *f = z->f, *cs = ctry;
+  const u64 *hs = has;
+  const u32 *fs = first;
   const u32 *ix = z->ix;
   u64 n = z->n, top = maxreg + 1; // top: unmatched
   Rec *rs = x->rec;
@@ -403,12 +463,14 @@ static void records(Ctx *x, Scan *z) {
     u64 rid = _mm256_extract_epi64(num, 1);
     int32_t cents = _mm256_extract_epi64(num, 2);
     rid = rid < top ? rid : top;
-    _mm_prefetch((const char *)rt + rid, _MM_HINT_T0);
+    _mm_prefetch((const char *)(hs + (rid >> 6)), _MM_HINT_T0);
+    _mm_prefetch((const char *)(fs + (rid >> 6)), _MM_HINT_T0);
     rs[r] = (Rec){_mm256_cvtsi256_si32(num), at + a + 1, c, rid, neg ? -cents : cents};
   }
   Agg *ag = x->agg;
   for (u64 r = 0; r < n; r++) {
-    u64 cr = rt[rs[r].reg];
+    u64 id = rs[r].reg, w = hs[id >> 6], in = w >> (id & 63) & 1;
+    u64 cr = cs[fs[id >> 6] + _mm_popcnt_u64(_bzhi_u64(w, id & 63))] & -in;
     Agg *g = ag + cr;
     int64_t cents = rs[r].cents;
     g->n++;
@@ -435,11 +497,17 @@ static void records(Ctx *x, Scan *z) {
 static void *worker(void *arg) {
   int t = (int)(intptr_t)arg;
   Ctx *x = &ctx[t];
-  x->agg = agg[t], x->t = t;
+  // The page-table pages of records.csv: thread NT - 1 charges the first 64,
+  // one CPU's charge batch, main the rest
+  if (t == NT - 1)
+    tables(rec, rsize < 64 * HUGE ? rsize + 1 : 64 * HUGE);
+  else if (t)
+    spare(rstretch), regions(t - 1);
+  spare(nstretch);
+  pthread_barrier_wait(&meet); // the region table is complete
   for (int c = 0; c < 256; c++)
     agg[t][c] = (Agg){.min = INT64_MAX, .max = INT64_MIN};
-  regions(t);
-  pthread_barrier_wait(&meet); // the region table is complete
+  x->agg = agg[t], x->t = t;
   // Piece i is the (i / n)th of the 2 MB stretch i % n: threads working at
   // once never share a stretch's page-table lock when they fault pages in.
   u64 n = (rsize >> 21) + 1;
@@ -509,33 +577,44 @@ int main(void) {
   rec = big(rsize + 4096);
   if (mmap(rec, rsize, PROT_READ, MAP_PRIVATE | MAP_FIXED, rfd, 0) != rec)
     die("mmap records.csv");
-  reg = mmap(0, regsize, PROT_READ, MAP_PRIVATE | MAP_POPULATE, gfd, 0);
+  reg = mmap(0, regsize, PROT_READ, MAP_PRIVATE, gfd, 0);
   if (reg == MAP_FAILED)
     die("mmap regions.csv");
   // Ids ascend (spec 2.3): the last line has the largest
+  tables(reg, regsize);
   maxreg = strtoull((char *)memrchr(reg, '\n', regsize - 1) + 1, 0, 10);
-  rtab = big(maxreg + 2); // the last entry: every id above the range
-  hot(rtab, maxreg + 2), hot(__bss_start, _end - __bss_start);
-  // Each 2 MB of the mapping gets its page-table page here
-  for (u64 i = 0; i < rsize; i += 1 << 21)
-    (void)*(volatile u8 *)(rec + i);
-  (void)*(volatile u8 *)(rec + rsize); // the zeros after the file
+  // The shared tables, the region table first. A line of regions.csv is 6
+  // bytes or more. The last word of has: every id above the range. The last
+  // stretch runs past the end.
+  u64 words = (maxreg + 1) / 64 + 1;
+  u64 size = NT * (SLOTS * 8 + NAMES * 34) + sizeof(Ring[NT][NT]) +
+             sizeof(Agg[NT][256]) + words * 12 + regsize / 6 + 4096;
+  shared = big(size + CHARGE);
+  has = carve(words * 8), first = carve(words * 4), ctry = carve(regsize / 6);
+  rstretch = (carved + CHARGE - 1) / CHARGE;
+  for (int t = 0; t < NT; t++)
+    names[t] = (Names){.slot = carve(SLOTS * 8), .mask = SLOTS / 4 - 1,
+                       .lo = carve(NAMES * 2), .row = carve(NAMES * 32)};
+  ring = carve(sizeof(Ring[NT][NT])), agg = carve(sizeof(Agg[NT][256]));
+  nstretch = (carved + CHARGE - 1) / CHARGE;
+  tables(shared, carved); // their page-table pages
+  hot(__bss_start, _end - __bss_start);
   ctx = big(NT * sizeof *ctx);
   u8 *stack = big(NT * STACK);
   pthread_t th[NT];
   pthread_attr_t at;
   pthread_attr_init(&at);
   pthread_barrier_init(&meet, 0, NT);
-  for (long t = 0; t < NT; t++) {
-    grow(&names[t]);
-    hot(&ctx[t], offsetof(Ctx, ix) + 4 * HOTREC), hot(ctx[t].rec, sizeof(Rec) * HOTREC);
-    if (!t)
-      continue;
+  for (long t = 1; t < NT; t++) {
     hot(stack + t * STACK + STACK * 3 / 4, STACK / 4); // the top, the part used
     pthread_attr_setstack(&at, stack + t * STACK, STACK);
     if (pthread_create(&th[t], &at, worker, (void *)t))
       die("pthread_create");
   }
+  for (int t = 0; t < NT; t++)
+    hot(&ctx[t], offsetof(Ctx, ix) + 4 * HOTREC), hot(ctx[t].rec, sizeof(Rec) * HOTREC);
+  if (rsize >= 64 * HUGE) // and the zeros after the file
+    tables(rec + 64 * HUGE, rsize + 1 - 64 * HUGE);
   worker(0);
   FILE *o = fopen("/out/aggregates.txt", "w");
   if (!o)
