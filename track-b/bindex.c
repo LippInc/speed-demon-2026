@@ -547,6 +547,7 @@ static void *worker(void *arg) {
     me->ids = (u32 *)(me->keys + 2 * MAXTOK); me->aps = me->ids + MAXTOK;
     // 1. queries: count this worker's lines, then parse them into the shared table
     u32 n = 0, base = 0;
+    for (size_t o = (size_t)w << 21; o < sdfsize; o += (size_t)nw << 21) ((volatile u8 *)sdfs)[o] = 0;   // one thread per huge page
     for (size_t i = qs[w]; i < qs[w + 1]; i++) n += qtxt[i] == '\n';
     qcount[w] = n;
     pthread_barrier_wait(&bar);
@@ -616,14 +617,18 @@ static void *worker(void *arg) {
     if (!w) munmap(sdfs, sdfsize);
     for (int p = w * ppw; p < (w + 1) * ppw; p++) {
         scan_part(me, p);
+        uintptr_t a = ((uintptr_t)doc + pstart[p] + 4095) & ~(uintptr_t)4095, b = ((uintptr_t)doc + pstart[p + 1]) & ~(uintptr_t)4095;
+        if (a < b) madvise((void *)a, b - a, MADV_DONTNEED);   // the text's page-table entries, dropped in parallel, not at exit
         if (!w || w == nw - 1) MARK("w%d part %d scanned\n", w, p);
         eval_part(me, p);
         if (!w || w == nw - 1) MARK("w%d part %d answered\n", w, p);
     }
-    munmap(me->heap, me->hsize + 64);
+    madvise(me->heap, me->hsize, MADV_DONTNEED);   // in parallel; munmap would take the lock for writing
     pthread_barrier_wait(&bar);
     // 4. merge and format the queries this worker parsed
     finish(me, w);
+    pthread_barrier_wait(&bar);
+    madvise(me->rec, (size_t)ppw * nq * (3 + MAXQ / 2) * 4, MADV_DONTNEED);
     return NULL;
 }
 
