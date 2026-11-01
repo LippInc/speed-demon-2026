@@ -46,26 +46,26 @@ typedef uint64_t u64;
 typedef uint32_t u32;
 typedef uint16_t u16;
 typedef uint8_t u8;
-// CHB: 64-byte blocks per pass 1; BATCH: messages staged per owner
+// CHB: 64-byte blocks per pass 1; BATCH: messages staged per owner.
+// MAXREC: records per pass 1, each 11 bytes or more.
 enum { NT = 12, CHB = 256, BATCH = 128, RING = 2 * BATCH, PIECE = 1 << 18 };
-enum { MAXREC = 64 * CHB / 8 + 2 }; // records per pass: each is 11 bytes or more
+enum { MAXREC = 64 * CHB / 8 + 2 };
 
 typedef struct { // one country's running totals, kept per thread
-  int64_t n, ids, sum, min, max, nb, tb, names;
+  long long n, ids, sum, min, max, nb, tb, names;
 } Agg;
-typedef struct { // what pass 2's first loop reads out of a record
-  u32 id, name, comma; // the id, where the name starts, the comma before the region
-  int32_t cents;       // the amount
+// What pass 2's first loop reads out of a record: the id, where the name
+// starts, the comma before the region, the amount in cents.
+typedef struct {
+  u32 id, name, comma;
+  int32_t cents;
 } Rec;
 typedef struct { // a thread's outgoing messages, totals and pass 2 records
   _Alignas(64) u64 batch[NT][BATCH]; // each owner's next messages, fill[o] used
   Rec rec[MAXREC];
   u32 rr[MAXREC]; // each record's region table index
-  u64 head[NT]; // each owner's ring head as last read: re-read only when full
-  u64 *over[NT]; // each owner's messages that found its ring full: lo to hi
-  u32 lo[NT], hi[NT], cap[NT];
-  int t;
   u32 fill[NT];
+  int t;
   Agg *agg;
 } Ctx;
 typedef struct { // a thread's part of records.csv, parsed in two passes
@@ -84,7 +84,6 @@ static u64 rsize, regsize, maxreg;    // file sizes, the largest region id
 static const u8 *reg;                 // regions.csv, mapped
 static u8 *rtab;                      // region id -> country, 0 = unmatched
 static _Atomic u8 cidx[26 * 26 * 26]; // country code -> country number
-static char codes[256][4];            // country number -> code
 static int ncountry;
 static pthread_mutex_t cmu = PTHREAD_MUTEX_INITIALIZER;
 static atomic_int arrived, gen, finished;
@@ -92,7 +91,7 @@ static _Atomic u64 piece; // the start of the next piece of records.csv to parse
 typedef struct { // the messages from one thread to one owner, RING at most
   _Alignas(64) _Atomic u64 tail; // advanced by the sender
   _Alignas(64) _Atomic u64 head; // advanced by the owner
-  u64 *m;                        // message i is m[i % RING]
+  _Alignas(64) u64 m[RING];      // message i is m[i % RING]
 } Ring;
 static Ring ring[NT][NT]; // [sender][owner]
 static Agg agg[NT][256];
@@ -108,16 +107,20 @@ static void *big(u64 n) { // zeroed; only the pages touched count as memory
                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
   if (p == MAP_FAILED)
     die("mmap");
-  madvise(p, n, MADV_NOHUGEPAGE); // a 2 MB page would be zeroed and counted whole
+  // A 2 MB page would be zeroed and counted whole
+  madvise(p, n, MADV_NOHUGEPAGE);
   return p;
 }
-static inline u64 load(const u8 *p) {
+static inline u64 digits(const u8 *p) { // p[0, 8) as digit values
   u64 v;
   memcpy(&v, p, 8);
-  return v;
+  return v ^ 0x3030303030303030;
 }
 static inline __m256i load32(const u8 *p) {
   return _mm256_loadu_si256((const void *)p);
+}
+static inline u32 eq32(const u8 *p, __m256i c) { // a bit per byte of p == c
+  return _mm256_movemask_epi8(_mm256_cmpeq_epi8(load32(p), c));
 }
 
 static void barrier(void) { // all NT threads meet here
@@ -147,8 +150,7 @@ static inline u64 bits(__m256i lo, __m256i hi) { // byte masks -> 64 bits
 }
 static inline u64 quotes(const u8 *p) { // a bit per quote byte of p[0, 64)
   __m256i q = _mm256_set1_epi8('"');
-  return bits(_mm256_cmpeq_epi8(load32(p), q),
-              _mm256_cmpeq_epi8(load32(p + 32), q));
+  return eq32(p, q) | (u64)eq32(p + 32, q) << 32;
 }
 
 // Name hashing: 32 bytes v at a time go into the 128-bit state h, the first
@@ -160,13 +162,14 @@ static inline __m128i step(__m128i h, __m256i v) {
   return _mm_aesenc_si128(_mm_xor_si128(h, _mm256_castsi256_si128(v)),
                           _mm256_extracti128_si256(v, 1));
 }
-static inline u64 last(__m128i h, __m256i v, u64 n) { // v's first n bytes end the name
-  h = step(h, _mm256_and_si256(v, load32(KEEP + 32 - n)));
-  h = _mm_aesenc_si128(h, _mm_set_epi64x(0x589965CC75374CC3, 0xE7037ED1A0B428DB));
-  h = _mm_aesenc_si128(h, _mm_set_epi64x(0x1D8E4E27C47D124F, 0x9E3779B97F4A7C15));
-  return _mm_cvtsi128_si64(h);
-}
 #define SEED _mm_set_epi64x(0x8EBC6AF09C88C6E3, 0xA0761D6478BD642F)
+#define K1 _mm_set_epi64x(0x589965CC75374CC3, 0xE7037ED1A0B428DB)
+#define K2 _mm_set_epi64x(0x1D8E4E27C47D124F, 0x9E3779B97F4A7C15)
+// v's first n bytes end the name
+static inline u64 last(__m128i h, __m256i v, u64 n) {
+  h = step(h, _mm256_and_si256(v, load32(KEEP + 32 - n)));
+  return _mm_cvtsi128_si64(_mm_aesenc_si128(_mm_aesenc_si128(h, K1), K2));
+}
 
 // A name of 31 bytes or more (spec 2.2 sets no bound; the published data
 // has none over 29). p is its first byte after the opening quote; returns
@@ -196,7 +199,7 @@ static inline u64 name(const u8 *p, u64 *len, const u8 **end) {
     return last(SEED, _mm256_setzero_si256(), 0);
   }
   __m256i v = load32(p + 1);
-  u64 q = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8('"')));
+  u64 q = eq32(p + 1, _mm256_set1_epi8('"'));
   // The name ends at the first byte that is not a quote and follows an odd
   // number of them: a "" flips the count twice (12% of names have one).
   u64 odd = _mm_cvtsi128_si64(_mm_clmulepi64_si128(_mm_cvtsi64_si128(q), _mm_set1_epi8(-1), 0));
@@ -265,7 +268,7 @@ static int country(const u8 *p) { // numbers countries in order of first sight
   if (!c) {
     pthread_mutex_lock(&cmu);
     if (!(c = cidx[k]))
-      memcpy(codes[c = cidx[k] = ++ncountry], p, 3);
+      c = cidx[k] = ++ncountry;
     pthread_mutex_unlock(&cmu);
   }
   return c;
@@ -355,35 +358,17 @@ static u64 drain(int t, Agg *a) {
   return done;
 }
 
-// Moves up to n messages from p into x's ring to owner o; returns how many.
-static u64 push(Ctx *x, int o, const u64 *p, u64 n) {
-  Ring *r = &ring[x->t][o];
-  u64 t = r->tail;
-  if (t + n - x->head[o] > RING)
-    x->head[o] = atomic_load_explicit(&r->head, memory_order_acquire);
-  n = n < RING - (t - x->head[o]) ? n : RING - (t - x->head[o]);
-  u64 i = t % RING, k = n < RING - i ? n : RING - i; // up to the ring's end
-  memcpy(r->m + i, p, 8 * k);
-  memcpy(r->m, p + k, 8 * (n - k));
-  atomic_store_explicit(&r->tail, t + n, memory_order_release);
-  return n;
-}
-
-// Sends x's batch for owner o. It never waits: an owner that another process
-// keeps off its CPU would hold up every sender (PERF.md: a CPU busy 1 ms in
-// every 5 cost 4 ms). What finds the ring full waits in an overflow queue,
-// which is sent first.
+// Sends x's batch for owner o. While the ring is full the sender files the
+// messages sent to it, so two threads that wait on each other both advance.
+// Every batch but a thread's last is whole, so none wraps the ring.
 static void post(Ctx *x, int o) {
-  if (x->lo[o] < x->hi[o] && (x->lo[o] += push(x, o, x->over[o] + x->lo[o], x->hi[o] - x->lo[o])) == x->hi[o])
-    x->lo[o] = x->hi[o] = 0;
-  u64 n = x->lo[o] == x->hi[o] ? push(x, o, x->batch[o], x->fill[o]) : 0;
-  if (n < x->fill[o]) { // the rest joins the overflow
-    if (x->hi[o] + BATCH > x->cap[o] &&
-        !(x->over[o] = realloc(x->over[o], 8 * (x->cap[o] = 2 * x->cap[o] + BATCH))))
-      die("realloc");
-    memcpy(x->over[o] + x->hi[o], x->batch[o] + n, 8 * (x->fill[o] - n));
-    x->hi[o] += x->fill[o] - n;
-  }
+  Ring *r = &ring[x->t][o];
+  u64 n = x->fill[o], t = r->tail;
+  while (t + n - atomic_load_explicit(&r->head, memory_order_acquire) > RING)
+    if (!drain(x->t, x->agg))
+      _mm_pause();
+  memcpy(r->m + t % RING, x->batch[o], 8 * n);
+  atomic_store_explicit(&r->tail, t + n, memory_order_release);
   x->fill[o] = 0;
 }
 
@@ -400,25 +385,26 @@ static void records(Ctx *x, Scan *z) {
   u32 *rr = x->rr;
   __m256i comma = _mm256_set1_epi8(',');
   for (u64 r = 0, s = z->start; r < n; s = ix[r++] + 1) {
-    u64 e = ix[r], at = s + (f[s] == 0xEF ? 3 : 0); // a BOM at a record start is not data
-    u64 w = load(f + at) ^ 0x3030303030303030; // the id: 8 digits at most
-    u64 a = _tzcnt_u32(_mm256_movemask_epi8(_mm256_cmpeq_epi8(load32(f + at), comma)));
+    // A BOM at a record start is not data. The id: 8 digits at most.
+    u64 e = ix[r], at = s + (f[s] == 0xEF ? 3 : 0);
+    u64 a = _tzcnt_u32(eq32(f + at, comma));
     // The commas before the region and the amount: the last two of the
     // record, which its last 32 bytes hold
-    u32 m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(load32(f + e - 32), comma));
+    u32 m = eq32(f + e - 32, comma);
     u64 d = e - 1 - _lzcnt_u32(m);
     u64 c = e - 1 - _lzcnt_u32(_bzhi_u32(m, d + 32 - e));
     // The amount ends the record: its digits, the point dropped, end a load
     u64 cr = f[e - 1] == '\r', neg = f[d + 1] == '-', nd = e - cr - d - 2 - neg;
-    u64 v = load(f + e - cr - 8) ^ 0x3030303030303030;
+    u64 v = digits(f + e - cr - 8);
     v = (v & 0xFFFF000000000000) | (v << 8 & 0x0000FFFFFFFFFF00);
-    __m256i num = fold3(w << (64 - 8 * a),
-                        (load(f + c + 1) ^ 0x3030303030303030) << (72 - 8 * (d - c)),
+    __m256i num = fold3(digits(f + at) << (64 - 8 * a),
+                        digits(f + c + 1) << (72 - 8 * (d - c)),
                         v & ~0ull << (64 - 8 * nd));
-    u64 rid = _mm256_extract_epi64(num, 1), cents = _mm256_extract_epi64(num, 2);
+    u64 rid = _mm256_extract_epi64(num, 1);
+    int32_t cents = _mm256_extract_epi64(num, 2);
     rr[r] = rid < top ? rid : top;
     _mm_prefetch((const char *)rt + rr[r], _MM_HINT_T0);
-    rs[r] = (Rec){_mm256_extract_epi64(num, 0), at + a + 1, c, (cents ^ -neg) + neg};
+    rs[r] = (Rec){_mm256_cvtsi256_si32(num), at + a + 1, c, neg ? -cents : cents};
   }
   Agg *ag = x->agg;
   for (u64 r = 0; r < n; r++) {
@@ -449,6 +435,8 @@ static void *worker(void *arg) {
   static Ctx ctx[NT];
   Ctx *x = &ctx[t];
   x->agg = agg[t], x->t = t;
+  for (int c = 0; c < 256; c++)
+    agg[t][c] = (Agg){.min = INT64_MAX, .max = INT64_MIN};
   regions(t);
   barrier(); // the region table is complete
   grow(&names[t]);
@@ -463,15 +451,10 @@ static void *worker(void *arg) {
         drain(t, x->agg);
     }
   }
-  for (int o = 0; o < NT; o++) { // the partial batches and the overflow,
-    post(x, o);                   // filing meanwhile so that two full
-    while (x->lo[o] < x->hi[o]) { // rings never wait on each other
-      if (!drain(t, x->agg))
-        _mm_pause();
-      post(x, o);
-    }
-  }
-  atomic_fetch_add(&finished, 1); // after every send, so the last drain sees all
+  for (int o = 0; o < NT; o++) // the partial batches
+    post(x, o);
+  // After every send, so the last drain sees all
+  atomic_fetch_add(&finished, 1);
   while (finished < NT)
     if (!drain(t, x->agg))
       _mm_pause();
@@ -483,14 +466,26 @@ static void *worker(void *arg) {
   return 0;
 }
 
-static int bycode(const void *a, const void *b) {
-  return strcmp(codes[*(const int *)a], codes[*(const int *)b]);
+static void money(FILE *o, long long v) { // cents as -?D+.DD
+  long long a = llabs(v);
+  fprintf(o, " %s%lld.%02lld", v < 0 ? "-" : "", a / 100, a % 100);
 }
-static char *money(char *o, int64_t v) { // cents as -?D+.DD
-  u64 a = v < 0 ? -v : v;
-  return o + sprintf(o, " %s%llu.%02llu", v < 0 ? "-" : "",
-                     (unsigned long long)(a / 100),
-                     (unsigned long long)(a % 100));
+
+// Country c's line: the threads' totals added up
+static void report(FILE *o, const char *code, int c) {
+  Agg g = agg[0][c];
+  for (int t = 1; t < NT; t++) {
+    Agg *a = &agg[t][c];
+    g.n += a->n, g.ids += a->ids, g.sum += a->sum, g.nb += a->nb;
+    g.tb += a->tb, g.names += a->names;
+    g.min = a->min < g.min ? a->min : g.min;
+    g.max = a->max > g.max ? a->max : g.max;
+  }
+  if (!g.n)
+    return;
+  fprintf(o, "%s %lld %lld", code, g.n, g.ids);
+  money(o, g.sum), money(o, g.min), money(o, g.max);
+  fprintf(o, " %lld %lld %lld\n", g.names, g.nb, g.tb);
 }
 
 int main(void) {
@@ -514,12 +509,6 @@ int main(void) {
     p--;
   maxreg = strtoull((const char *)reg + p, 0, 10);
   rtab = big(maxreg + 2); // the last entry: every id above the range
-  u64 *m = big(8 * RING * NT * NT);
-  for (int i = 0; i < NT * NT; i++)
-    (&ring[0][0])[i].m = m + RING * i;
-  for (int t = 0; t < NT; t++)
-    for (int c = 0; c < 256; c++)
-      agg[t][c] = (Agg){.min = INT64_MAX, .max = INT64_MIN};
   pthread_t th[NT];
   for (long t = 1; t < NT; t++)
     if (pthread_create(&th[t], 0, worker, (void *)t))
@@ -528,35 +517,15 @@ int main(void) {
   for (int t = 1; t < NT; t++)
     pthread_join(th[t], 0);
 
-  Agg tot[256];
-  int order[256], n = 0;
-  for (int c = 0; c <= ncountry; c++) {
-    tot[c] = agg[0][c];
-    for (int t = 1; t < NT; t++) {
-      Agg *a = &agg[t][c], *g = &tot[c];
-      g->n += a->n, g->ids += a->ids, g->sum += a->sum, g->nb += a->nb;
-      g->tb += a->tb, g->names += a->names;
-      g->min = a->min < g->min ? a->min : g->min;
-      g->max = a->max > g->max ? a->max : g->max;
-    }
-    if (c && tot[c].n)
-      order[n++] = c;
-  }
-  qsort(order, n, sizeof *order, bycode);
-  if (tot[0].n) // "_" sorts after every code, so unmatched is last
-    order[n++] = 0;
-  static char out[1 << 16];
-  char *o = out;
-  for (int i = 0; i < n; i++) {
-    Agg *g = &tot[order[i]];
-    o += sprintf(o, "%s %lld %lld", order[i] ? codes[order[i]] : "_UNMATCHED",
-                 (long long)g->n, (long long)g->ids);
-    o = money(money(money(o, g->sum), g->min), g->max);
-    o += sprintf(o, " %lld %lld %lld\n", (long long)g->names, (long long)g->nb,
-                 (long long)g->tb);
-  }
-  int fd = open("/out/aggregates.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-  if (fd < 0 || write(fd, out, o - out) != o - out)
-    die("write /out/aggregates.txt");
+  FILE *o = fopen("/out/aggregates.txt", "w");
+  if (!o)
+    die("/out/aggregates.txt");
+  for (int k = 0; k < 26 * 26 * 26; k++) // in code order
+    if (cidx[k])
+      report(o, (char[]){'A' + k / 676, 'A' + k / 26 % 26, 'A' + k % 26, 0},
+             cidx[k]);
+  report(o, "_UNMATCHED", 0); // "_" sorts after every code
+  if (fclose(o))
+    die("/out/aggregates.txt");
   return 0;
 }
