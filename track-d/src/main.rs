@@ -9,7 +9,7 @@
 use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
 use std::fs::File;
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::time::Instant;
 
 unsafe extern "C" {
@@ -162,12 +162,6 @@ type Graph = (Csr, Csr, Vec<u32>);
 /// Phase names and the time each ended, for the stderr phase line.
 type Phases = Vec<(&'static str, Instant)>;
 
-/// The reverse CSR is built in this many slabs of consecutive partitions (a design constant), so
-/// only half the edges sit in records next to both CSRs: build peak below the query phase's.
-/// Re-filing the parse records by head instead (no second read of fwd) measured 176 MB of anon
-/// peak locally at 12 workers against 134 MB this way, so the slabs stay.
-const REV_SLABS: usize = 2;
-
 /// Writes the rows of partitions first.. of g from the records filed for them (buckets[thread][k]
 /// for partition first + k; partition p = nodes with id >> shift == p), each partition on one
 /// thread: a local degree count, a prefix sum from the partition's first edge slot, then a scatter
@@ -299,14 +293,17 @@ fn relabel(old: Csr, threads: usize) -> (Csr, Csr, Vec<u32>) {
     (g, old, new_id)
 }
 
-/// Builds both CSRs without atomics. Parse: each thread parses its byte range once and files every
-/// edge as (tail, head, w) into its own bucket for the tail's partition; place() builds fwd. Rev, in
-/// REV_SLABS rounds: threads read forward partitions and file (head, tail, w) by head partition for
-/// this slab's heads, then place() builds those reverse partitions.
-/// Why: the atomic build paid two locked adds per line in each pass into random slots, and each
-/// locked add drains the store buffer behind the previous line's store misses. Measured on the box
-/// (d-7, 8a68049): build 104.6 -> 85 ms; locally (full seed 1, interleaved with the atomic two-pass
-/// build) 590-640 ms -> 185-200 ms at 12 workers.
+/// Builds both CSRs. fwd: parse (each thread parses its byte range once and files every edge as
+/// (tail, head, w) into its own bucket for the tail's partition), then place(). Rev (d-28 s3): a
+/// count pass over fwd's rows adds each edge into rev.end atomically, a serial prefix sum turns
+/// the counts into row starts, and a placement pass writes each packed edge at an atomic cursor,
+/// so no (head, tail, w) records exist next to both CSRs and the rev phase peak falls to the two
+/// CSRs. Row order inside a reverse row is whatever the fetch_add order was; a distance is a
+/// property of the graph, not of row order, and checks B and C prove it.
+/// Why atomics anyway: the slab build they replace kept one slab's records (~30 MB) next to both
+/// CSRs and set a 90-91 MB rev peak; the atomic passes cost time instead, which is the trade this
+/// experiment spends (measured d-28 s3: locally rev 24-45 -> 12-16 ms at 12 workers - faster than
+/// the slabs, not slower: no record allocation traffic, two streaming passes over fwd).
 /// Partitions are the smallest power-of-two node range that splits this input's n nodes into at
 /// most 4 * threads ranges (a design constant: enough that threads taking partitions from a counter
 /// finish together, few enough that each thread's per-partition buckets stay large).
@@ -334,29 +331,54 @@ fn build_graph(graph: &[u8], body: usize, n: usize, threads: usize, t: &mut Phas
     t.push(("fwd", Instant::now()));
     let (fwd, old, new_id) = relabel(fwd, threads);
     t.push(("relabel", Instant::now()));
-    // The rev CSR reuses the old forward CSR's buffers (same n and m; place() overwrites every end
-    // and edge slot): no 37 MB free and fresh allocation in the middle of the build, and the rev build
-    // writes into pages already faulted in.
+    // The rev CSR reuses the old forward CSR's buffers (same n and m; the passes below overwrite
+    // every end and edge slot): no 37 MB free and fresh allocation in the middle of the build, and
+    // the rev build writes into pages already faulted in.
     let mut rev = old;
-    rev.heavy.clear();
-    for slab in 0..REV_SLABS {
-        let (first, last) = (parts * slab / REV_SLABS, parts * (slab + 1) / REV_SLABS);
-        let next = AtomicUsize::new(0);
-        let by_head = on_threads(threads, |_| {
-            let mut mine = vec![Vec::new(); last - first];
-            while let Some(p) = Some(next.fetch_add(1, Ordering::Relaxed)).filter(|&p| p < parts) {
-                for u in p << shift..n.min((p + 1) << shift) {
-                    for (v, w) in fwd.row(u) {
-                        let q = (v >> shift) as usize;
-                        if (first..last).contains(&q) {
-                            mine[q - first].push((v, u as u32, w as u32));
-                        }
+    let hb = rev.hb;
+    {
+        let Csr { end: rev_end, edges: rev_edges, heavy: rev_heavy, .. } = &mut rev;
+        rev_heavy.clear();
+        rev_end.fill(0);
+        // Pass 1: in-degree of v is the number of forward edges into it; the counts are added
+        // atomically so the rows need not be assigned to threads first.
+        let ends: &[AtomicU32] = AtomicU32::from_mut_slice(rev_end);
+        on_threads(threads, |k| {
+            for u in n * k / threads..n * (k + 1) / threads {
+                for (v, _) in fwd.row(u) {
+                    ends[v as usize].fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        });
+        // Exclusive prefix sum, serial: n dependent adds, ~2 ms, next to two passes over m edges.
+        let mut sum = 0u32;
+        for e in rev_end.iter_mut() {
+            let d = *e;
+            *e = sum;
+            sum += d;
+        }
+        // Pass 2: each edge u -> v takes the next slot of v's row and writes there, head u. After
+        // the pass rev_end[v] is start + degree, the row END that Csr stores.
+        let ends: &[AtomicU32] = AtomicU32::from_mut_slice(rev_end);
+        let slots = Slots(rev_edges.as_mut_ptr());
+        let heavy = on_threads(threads, |k| {
+            let mut heavy = Vec::new();
+            for u in n * k / threads..n * (k + 1) / threads {
+                for (v, w) in fwd.row(u) {
+                    let slot = ends[v as usize].fetch_add(1, Ordering::Relaxed);
+                    let (e, is_heavy) = pack_edge(u as u32, w as u32, hb);
+                    // SAFETY: each fetch_add hands out a distinct slot of v's row, so only this
+                    // thread writes slot.
+                    unsafe { slots.put(slot as usize, e) };
+                    if is_heavy {
+                        heavy.push((slot, w as u32));
                     }
                 }
             }
-            mine
+            heavy
         });
-        place(&by_head, first, shift, &mut rev, threads);
+        *rev_heavy = heavy.concat();
+        rev_heavy.sort_unstable();
     }
     t.push(("rev", Instant::now()));
     (fwd, rev, new_id)
@@ -379,39 +401,43 @@ struct BucketQueue {
     occupied: [u64; NB / 64],
     overflow: std::collections::BinaryHeap<std::cmp::Reverse<(u64, u32)>>,
     base_bucket: u64,
+    len: usize,
 }
 
 impl BucketQueue {
     fn new() -> Self {
-        BucketQueue {
+        Self {
             buckets: (0..NB).map(|_| Vec::new()).collect(),
             occupied: [0; NB / 64],
             overflow: std::collections::BinaryHeap::new(),
             base_bucket: 0,
+            len: 0,
         }
     }
 
     fn clear(&mut self) {
-        for w in 0..NB / 64 {
-            let mut mask = self.occupied[w];
-            while mask != 0 {
-                let bit = mask.trailing_zeros() as usize;
-                self.buckets[w * 64 + bit].clear();
-                mask &= mask - 1;
+        for (w, m) in self.occupied.iter_mut().enumerate() {
+            while *m != 0 {
+                self.buckets[w * 64 + m.trailing_zeros() as usize].clear();
+                *m &= *m - 1;
             }
         }
-        self.occupied = [0; NB / 64];
+        (self.base_bucket, self.len) = (0, 0);
         self.overflow.clear();
-        self.base_bucket = 0;
+    }
+
+    #[inline(always)]
+    fn insert_ring(&mut self, dist: u64, node: u32) {
+        let b = ((dist / WB) as usize) % NB;
+        self.buckets[b].push(Entry { node, dist: dist as u32 });
+        self.occupied[b / 64] |= 1u64 << (b % 64);
     }
 
     #[inline(always)]
     fn push(&mut self, dist: u64, node: u32) {
-        let k = dist / WB;
-        if k < self.base_bucket + NB as u64 {
-            let b = (k as usize) % NB;
-            self.buckets[b].push(Entry { node, dist: dist as u32 });
-            self.occupied[b / 64] |= 1u64 << (b % 64);
+        self.len += 1;
+        if dist / WB < self.base_bucket + NB as u64 {
+            self.insert_ring(dist, node);
         } else {
             self.overflow.push(std::cmp::Reverse((dist, node)));
         }
@@ -419,38 +445,25 @@ impl BucketQueue {
 
     fn refill(&mut self) {
         let limit = (self.base_bucket + NB as u64) * WB;
-        while let Some(&std::cmp::Reverse((d, node))) = self.overflow.peek() {
-            if d < limit {
-                self.overflow.pop();
-                let b = ((d / WB) as usize) % NB;
-                self.buckets[b].push(Entry { node, dist: d as u32 });
-                self.occupied[b / 64] |= 1u64 << (b % 64);
-            } else {
-                break;
-            }
+        while let Some(&std::cmp::Reverse((d, node))) = self.overflow.peek().filter(|r| r.0.0 < limit) {
+            self.overflow.pop();
+            self.insert_ring(d, node);
         }
     }
 
     fn next_bucket(&self, curr: usize) -> Option<usize> {
-        let (w, bit) = (curr / 64, curr % 64);
-        let mask = self.occupied[w] & (!0u64 << bit);
-        if mask != 0 {
-            return Some(w * 64 + mask.trailing_zeros() as usize);
-        }
-        for w2 in (w + 1)..NB / 64 {
-            if self.occupied[w2] != 0 {
-                return Some(w2 * 64 + self.occupied[w2].trailing_zeros() as usize);
+        let (cw, bit) = (curr / 64, curr % 64);
+        for i in 0..=NB / 64 {
+            let w = (cw + i) % (NB / 64);
+            let mut m = self.occupied[w];
+            if i == 0 {
+                m &= !0u64 << bit;
             }
-        }
-        for w2 in 0..w {
-            if self.occupied[w2] != 0 {
-                return Some(w2 * 64 + self.occupied[w2].trailing_zeros() as usize);
+            if i == NB / 64 {
+                m &= (1u64 << bit) - 1;
             }
-        }
-        if bit > 0 {
-            let mask = self.occupied[w] & ((1u64 << bit) - 1);
-            if mask != 0 {
-                return Some(w * 64 + mask.trailing_zeros() as usize);
+            if m != 0 {
+                return Some(w * 64 + m.trailing_zeros() as usize);
             }
         }
         None
@@ -462,17 +475,14 @@ impl BucketQueue {
             return self.base_bucket * WB;
         }
         if let Some(next_b) = self.next_bucket(curr) {
-            let delta = if next_b >= curr { next_b - curr } else { NB - curr + next_b };
-            self.base_bucket += delta as u64;
-            self.refill();
-            return self.base_bucket * WB;
-        }
-        if let Some(&std::cmp::Reverse((min_d, _))) = self.overflow.peek() {
+            self.base_bucket += ((next_b + NB - curr) % NB) as u64;
+        } else if let Some(&std::cmp::Reverse((min_d, _))) = self.overflow.peek() {
             self.base_bucket = min_d / WB;
-            self.refill();
-            return self.base_bucket * WB;
+        } else {
+            return INF;
         }
-        INF
+        self.refill();
+        self.base_bucket * WB
     }
 }
 
@@ -654,9 +664,10 @@ impl Scratch {
 /// and prefetching each neighbour's label slot as well bought under 2 %, so neither is here.
 const PREFETCH_AHEAD: usize = 8;
 
-fn drain_bucket(g: &Csr, sc: &mut Scratch, side: usize, b: usize, bucket_start: u64, best: &mut u64) -> u64 {
-    let mut head = 0;
-    let mut settles = 0;
+fn drain_bucket(g: &Csr, sc: &mut Scratch, side: usize, best: &mut u64) -> u64 {
+    let (mut head, mut settles) = (0, 0);
+    let b = (sc.queues[side].base_bucket as usize) % NB;
+    let bucket_start = sc.queues[side].base_bucket * WB;
     while head < sc.queues[side].buckets[b].len() {
         if let Some(ahead) = sc.queues[side].buckets[b].get(head + PREFETCH_AHEAD) {
             g.prefetch(ahead.node as usize);
@@ -677,34 +688,35 @@ fn drain_bucket(g: &Csr, sc: &mut Scratch, side: usize, b: usize, bucket_start: 
             if nd < dist[side] {
                 dist[side] = nd;
                 l.dist = dist;
-                let other = dist[1 - side];
-                if other != INF {
-                    *best = (*best).min(nd + other);
-                }
+                *best = (*best).min(nd.saturating_add(dist[1 - side]));
                 sc.queues[side].push(nd, v);
             }
         }
     }
-    sc.queues[side].buckets[b].clear();
-    sc.queues[side].occupied[b / 64] &= !(1u64 << (b % 64));
+    let q = &mut sc.queues[side];
+    q.len -= q.buckets[b].len();
+    q.buckets[b].clear();
+    q.occupied[b / 64] &= !(1u64 << (b % 64));
     settles
 }
 
-/// Bidirectional Dijkstra (d-27 s2): 256-settle forward probe, backward side only when needed.
+/// Bidirectional Dijkstra (d-27 s2, d-27 r1 s2): probe returns as soon as target label is final
+/// (dt <= lower_f; weights >= 0 so no unsettled entry can go below current bucket start),
+/// backward side only when needed (after 256 settles).
 fn bidirectional(g: [&Csr; 2], sc: &mut Scratch, s: u32, t: u32) -> (u64, u64) {
     sc.reset();
     let is = sc.slot(s);
     sc.label(is).dist[0] = 0;
     sc.queues[0].push(0, s);
-    let mut settles = 0;
-    let mut best = INF;
+    let (mut settles, mut best) = (0, INF);
     while settles < 256 {
         let lower_f = sc.queues[0].lower();
-        if lower_f == INF {
-            break;
+        let it = sc.slot(t);
+        let dt = sc.label(it).dist[0];
+        if dt <= lower_f {
+            return (dt, settles);
         }
-        let b = (sc.queues[0].base_bucket as usize) % NB;
-        settles += drain_bucket(g[0], sc, 0, b, sc.queues[0].base_bucket * WB, &mut best);
+        settles += drain_bucket(g[0], sc, 0, &mut best);
     }
     let lower_f = sc.queues[0].lower();
     let it = sc.slot(t);
@@ -716,14 +728,14 @@ fn bidirectional(g: [&Csr; 2], sc: &mut Scratch, s: u32, t: u32) -> (u64, u64) {
     sc.queues[1].push(0, t);
     best = dt;
     loop {
-        let lower_f = sc.queues[0].lower();
-        let lower_b = sc.queues[1].lower();
-        if lower_f == INF || lower_b == INF || lower_f.saturating_add(lower_b) >= best {
+        let (lf, lb) = (sc.queues[0].lower(), sc.queues[1].lower());
+        if lf == INF || lb == INF || lf.saturating_add(lb) >= best {
             break;
         }
-        let side = if lower_b < lower_f { 1 } else { 0 };
-        let b = (sc.queues[side].base_bucket as usize) % NB;
-        settles += drain_bucket(g[side], sc, side, b, sc.queues[side].base_bucket * WB, &mut best);
+        // Balance the work of the two sides, not their radii (d-27 r1 s1); a far-ended probe no
+        // longer leaves one side running alone (measured case: 234,179 vs 279 settles, 52 ms on one fresh-seed query).
+        let side = if sc.queues[1].len < sc.queues[0].len { 1 } else { 0 };
+        settles += drain_bucket(g[side], sc, side, &mut best);
     }
     (best, settles)
 }
