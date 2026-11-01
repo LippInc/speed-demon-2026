@@ -45,7 +45,7 @@ typedef uint64_t u64;
 typedef uint32_t u32;
 typedef uint16_t u16;
 typedef uint8_t u8;
-enum { NT = 12, CHB = 256, RING = 512 }; // CHB: 64-byte blocks per pass 1
+enum { NT = 12, CHB = 256, RING = 512, READ = 32768 }; // CHB: 64-byte blocks per pass 1
 
 typedef struct { // one country's running totals, kept per thread
   int64_t n, ids, sum, min, max, nb, tb, names;
@@ -69,7 +69,8 @@ typedef struct { // one owner's names
   u64 (*row)[4];      // id -> a bit per country
 } Names;
 
-static const u8 *rec;                 // records.csv, mapped
+static const u8 *rec; // records.csv mapped, read only where parts start
+static int rfd;       // records.csv, read with pread
 static u64 rsize, regsize, maxreg;    // file sizes, the largest region id
 static const u8 *reg;                 // regions.csv, mapped
 static u8 *rtab;                      // region id -> country, 0 = unmatched
@@ -389,13 +390,30 @@ static void *worker(void *arg) {
   grow(&names[t]);
   u64 lo = record_start(rsize * t / NT);
   u64 hi = t + 1 < NT ? record_start(rsize * (t + 1) / NT) : rsize;
-  Scan z = {.f = rec + lo, .end = hi - lo};
+  // The part is read in READ-byte pieces into buf, which keeps the bytes of
+  // the first unparsed record onwards; offsets count from buf. The reserve
+  // covers a part that is one record, plus the vector loads' overrun.
+  u8 *buf = big(hi - lo + READ + 128);
+  Scan z = {.f = buf, .end = hi - lo};
   z.ix = big(4 * 64 * (CHB + 2));
-  for (int k = 1; z.at < z.end; k++) {
-    separators(&z, z.at + 64 * CHB < z.end ? z.at + 64 * CHB : z.end);
-    records(x, &z);
-    if (k % 4 == 0)
-      drain(t, x->agg);
+  for (u64 have = 0, pos = lo, k = 1; z.at < z.end;) {
+    u64 drop = z.start; // parsed: shift the rest to the front
+    memmove(buf, buf + drop, have - drop);
+    have -= drop, z.start = 0, z.at -= drop, z.end -= drop;
+    for (u32 i = 0; i < z.n; i++)
+      z.ix[i] -= drop;
+    u64 n = hi - pos < READ ? hi - pos : READ;
+    if (pread(rfd, buf + have, n, pos) != (ssize_t)n)
+      die("read records.csv");
+    have += n, pos += n;
+    // Pass 1 reads whole 64-byte blocks: all of them but the part's last
+    // wait until the bytes are in.
+    for (u64 top = pos == hi ? z.end : have - 63; z.at < top; k++) {
+      separators(&z, z.at + 64 * CHB < top ? z.at + 64 * CHB : top);
+      records(x, &z);
+      if (k % 4 == 0)
+        drain(t, x->agg);
+    }
   }
   for (int o = 0; o < NT; o++) // the partial lines
     post(x, o);
@@ -404,10 +422,6 @@ static void *worker(void *arg) {
     if (!drain(t, x->agg))
       _mm_pause();
   drain(t, x->agg);
-  // Every record is parsed: drop this thread's twelfth of the mapping, or
-  // exit tears down all 49,000 page-table entries on one CPU.
-  u64 a = rsize * t / NT & ~4095ull, e = rsize * (t + 1) / NT & ~4095ull;
-  madvise((void *)(rec + a), e - a, MADV_DONTNEED);
   return 0;
 }
 
@@ -422,21 +436,16 @@ static char *money(char *o, int64_t v) { // cents as -?D+.DD
 }
 
 int main(void) {
-  int rfd = open("/data/records.csv", O_RDONLY);
+  rfd = open("/data/records.csv", O_RDONLY);
   int gfd = open("/data/regions.csv", O_RDONLY);
   if (rfd < 0 || gfd < 0)
     die("open /data");
   rsize = lseek(rfd, 0, SEEK_END);
   regsize = lseek(gfd, 0, SEEK_END);
-  // records.csv is mapped over the start of a zeroed reservation one page
-  // longer, so the vector loads that run past its end read zeros.
-  u8 *f = big(rsize + 4096);
-  if (mmap(f, rsize, PROT_READ, MAP_PRIVATE | MAP_FIXED, rfd, 0) != f)
-    die("mmap records.csv");
-  rec = f;
+  rec = mmap(0, rsize, PROT_READ, MAP_PRIVATE, rfd, 0);
   reg = mmap(0, regsize, PROT_READ, MAP_PRIVATE, gfd, 0);
-  if (reg == MAP_FAILED)
-    die("mmap regions.csv");
+  if (rec == MAP_FAILED || reg == MAP_FAILED)
+    die("mmap /data");
   u64 p = regsize - 1; // ids ascend (spec 2.3): the last line has the largest
   while (reg[p - 1] != '\n')
     p--;
