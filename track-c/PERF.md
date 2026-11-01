@@ -9,30 +9,34 @@ The reference takes 14.44 s (K 1).
 | Run | T | M | S | K |
 |---|---|---|---|---|
 | Rust version, board run-fff3b356a7d3 (commit 2306aa9) | 28.1 ms | 9.6 MB | 585 | 36.48 |
-| join.c v21, organisers' harness on box 2 (run-f5ed3dcee970, run-e6258add888b, run-b426dc4df42d, run-3d8c94661195, run-37470e5c0dcb) | 24.37 ms | 10.75 MB | 419 | 40.2 |
 | join.c v21 on the board, run-fc3513efb0d2 (commit 816a29f) | 27.69 ms | 10.94 MB | 419 | 37.63 |
 | join.c v27, organisers' harness on box 2 (run-a61e717c2817, run-2668ae2f706a, run-bcf351d7d996, run-7032e46a98b9, run-a6d1b79f12a2) | 22.74 ms | 10.74 MB | 443 | 41.3 |
+| join.c v27 on the board, run-ca7e7d104000 (commit ec1791c) | 26.56 ms | 10.65 MB | 443 | 38.31 |
+| join.c v39, organisers' harness on box 2 (run-79fdadd1aeb9, run-fcfa3f190b88, run-e74d4b5ca8fd, run-4e384d44fd78, run-46f27f0b1569) | 20.93 ms | 10.60 MB | 425 | 43.5 |
 
-v21 ran 3.3 ms slower on the board than on box 2; the Rust version had matched within 0.7 ms. The cause is in "Other processes on the scoring box" below; v27 is the fix.
+The board has run each version 3.3 to 3.8 ms slower than box 2; "Other processes on the scoring box" below has what we know about why.
 
 ## Measuring
 
 - **The harness.** The organisers' run_submission.py (5 runs, median T, peak M) and static_axes.py (S) run on box 2 against the full seed-1 data.
-- **Fast loop.** A static build timed under `taskset 0-11`, 20 to 40 runs, median; A/B comparisons alternate the variants in rounds. Validated against the harness: the Rust binary measured 27.4 ms this way against 28.1 ms on the board.
+- **Fast loop.** A static build timed under `taskset 0-11`, 20 runs per round, median; A/B comparisons alternate the variants over 3 rounds. Validated against the harness: the Rust binary measured 27.4 ms this way against 28.1 ms on the board.
 - **Correctness.** Every variant is checked against 8 generated seeds (tiny, sample and full sizes) and the two published data sets before it is timed.
-- **Where the time goes.** `perf stat` instruction and cycle counts per variant, with parts of the program switched off one at a time (the "split" rows below), plus raw cache-miss and snoop events.
+- **Where the time goes.** `perf stat` instruction and cycle counts per variant; `perf record` on user and kernel code; variants with parts of the program switched off (the "split" rows below); a per-thread timeline from timestamps written into a copy of the program; and the cgroup's memory statistics sampled during a run, to split M into our pages and the kernel's.
 
 ## The design and why
 
 The comment at the top of join.c describes the program. The measurements behind its main choices:
 
 - **Floor.** Reading and scanning all 202 MB with 12 threads and nothing else: 5.6 ms with pread in 64 KB blocks, 7.6 ms mapped. Carry-less-multiply quote masks on top cost nothing (still 7.6 ms): the scan is memory-bound, so the parse can afford SIMD work per byte.
-- **Twelve threads taking 256 KB pieces from a shared counter.** A record start is found locally (an LF followed by a digit or BOM). On a quiet box a fixed twelfth per thread was as fast (24.05-24.13 against 24.1 ms): a hyperthread that finishes early hands its core to its sibling. The pieces are for a box that is not quiet (below).
-- **Two passes per 16 KB.** Pass 1 writes the offset of every separator outside quotes; pass 2 reads each record's fields at those offsets, so records do not wait on each other.
-- **Region lookups first.** Pass 2 looks up all of a block's regions in a short loop before doing the rest, so the misses on the 1 MB region table overlap.
+- **Twelve threads taking 256 KB pieces from a shared counter.** On a quiet box a fixed twelfth per thread was as fast (24.05-24.13 against 24.1 ms at v21); the pieces are for a box that is not quiet. Consecutive pieces are 2 MB apart (piece i is the (i / n)th piece of 2 MB stretch i % n): with neighbouring pieces, threads that faulted in the mapping at the same time took the same page-table page's lock, and a kernel profile of v37 had 24 % of kernel cycles spinning on that lock and 13 % in `filemap_map_pages`. Spread out, kernel cycles per run went from ~70 M to ~60 M and T down 0.13 ms (v38).
+- **Pass 1 finds record ends only.** Spec 2.2 makes an LF inside a quoted note always followed by a lowercase letter or a quote, and a record's own LF by a digit, a BOM or the end of the file. So pass 1 lists the LFs not followed by `[a-z"]`, three AVX2 compares per byte with no quote state, and a thread finds its piece's first record without reading anything before it. Against v27's pass 1, which listed every separator outside quotes: 43 instead of 79 instructions per record (v28).
+- **Pass 2 reads fields from both ends.** The region and the amount follow the record's last two commas, which its last 32 bytes always hold; the id runs to the first comma; the name is quoted, and the note is what lies between. 12.2 % of names contain a `""`: a cold path for them cost 8 % of cycles, so the name's end is found branch-free instead, as the first non-quote byte after an odd number of quotes (a carry-less multiply turns the quote mask into running parity).
+- **Region lookups first, prefetched.** Pass 2's first loop reads the three numbers (in one AVX2 multiply chain), computes each record's region table index and prefetches that byte; the second loop does the rest. In v30 the table load was 17.5 % of all cycles; the prefetch took T from 22.30 to 21.67 ms (v31).
 - **Names go to an owner thread.** A name's hash picks its owner; the reader sends an 8-byte message through a ring, 128 messages at a time (8 at a time: 1.5 ms slower; 16: 0.9; 32: 0.6; drain every 8 passes instead of 4: 0.2 ms faster). One table shared by all threads with an atomic OR per bit (measured in the Rust version) took 58.2 ms against 31.5 ms, with 3.03 M cross-core snoop loads against 0.23 M.
-- **AES-NI name hash.** Three AES rounds over 32 bytes at a time, cut to 64 bits: fewer instructions than the multiply hash it replaced (see v21).
-- **Memory.** 4 KB pages only (`MADV_NOHUGEPAGE`): with transparent huge pages on, first touches zeroed 2 MB pages, 5.4 ms. Each thread drops its share of the mapping at the end, so the exit does not tear down 49,000 page-table entries on one CPU: 2 ms.
+- **A sender whose ring is full files its own inbox while it waits.** So two threads that wait on each other both advance, and no batch needs a second home. This replaced v27's per-owner overflow queue (v32: 21.70 to 21.16 ms, together with rings in static memory and the output in code order without a sort; 53 fewer lines).
+- **AES-NI name hash.** Three AES rounds over 32 bytes at a time, cut to 64 bits: fewer instructions than the multiply hash it replaced (v21: 1.54 G to 1.17 G per run).
+- **Memory.** 4 KB pages only (`MADV_NOHUGEPAGE`): with transparent huge pages on, first touches zeroed 2 MB pages, 5.4 ms. One malloc arena (`M_ARENA_MAX` 1): with one per thread, each thread's first allocation mapped and trimmed its own arena and the threads queued on the process's mapping lock (`osq_lock` 6.6 % of kernel cycles): 0.17 ms (v39). Peak M is our 7.2 MB of pages, 1.0 MB of the kernel's (page tables 0.65) and 1.5 to 2 MB that the cgroup charges in per-CPU batches.
+- **The end.** Once every total is final, main writes the output while the other 11 threads each drop an eleventh of the mapping; otherwise exit tears down 49,000 page-table entries on one CPU (2 ms). Overlapping the two: 0.3 ms (v37).
 
 ## Steps
 
@@ -43,13 +47,22 @@ Box 2, fast loop, median T; none of these were board runs.
 - v19, 27.2 ms: pass 1 without quote counts; pass 2 split into a region loop and the rest; quotes counted from field bytes; branch-free name hash.
 - v20, 26.1 ms: 4-slot SIMD buckets, 56-bit name identity, the owner stores 16 bits per name instead of the key.
 - v20b, 25.55 ms: name hash fast path without a loop: stack spills in the record loop 47 to 2.
-- v21, 24.1 ms: AES-NI name hash: instructions 1.54 G to 1.17 G per run.
+- v21, 24.1 ms: AES-NI name hash.
 - v24, 22.55 ms: messages staged 128 per owner (was 8), rings of 256, owners drain every 8 passes.
 - v27, 22.63 ms: 256 KB pieces from a shared counter, and sends that never wait (below).
+- v28, 22.7 ms: pass 1 lists record ends only, pass 2 reads fields from both ends. The same 1.14 G instructions as v27: pass 1 lost 36 per record, pass 2 gained 25.
+- v29, 23.2 ms: the three numbers in one AVX2 chain. 1.10 G instructions but slower: GCC spilled the bases of the per-record arrays and rebuilt 64-bit constants inside the loop.
+- v30, 22.30 ms: the per-record array inside the thread's context (one base register), the id's comma by a vector compare: 1.04 G instructions, 581 M cycles (v27: 614 M).
+- v31, 21.67 ms: region table prefetch.
+- v32, 21.16 ms: senders drain while their ring is full, no overflow queue (below).
+- v33, same speed, 409 code lines.
+- v37, -0.3 ms: main writes the output while the other threads unmap.
+- v38, -0.13 ms: pieces 2 MB apart.
+- v39, 20.64 ms: one malloc arena.
 
 Wall time with parts switched off (v21): pass 1 alone 7.25 ms, the same as reading and scanning the file with nothing else (7.6 ms); then parsing and per-country sums +7.7, note lengths +0.8, name hash +0.85, sending names +3.0, owners filing them +4.5.
 
-Where v20b's work went (instructions / cycles, summed over threads): pass 1 287 M / 156 M; record parse 468 M / 213 M (141 instructions per record); text lengths 41 M / 22 M; name hash 157 M / 69 M (v21 cut most of this); sending 99 M / 84 M; owner draining 200 M / 131 M. The owner's region table and name tables (~1 MB + ~0.8 MB per core) do not fit a 1.25 MB L2 together: ~1 M L3 hits per run.
+The timeline of v33, from timestamps the threads record: the region table is complete at 0.48 ms, parsing ends at 19.4 to 19.7 ms, then unmapping takes 0.4 ms and the output 0.3 (overlapped since v37), and the exit 0.6. A static binary that does nothing takes 0.16 ms; creating and joining 12 threads 0.41 ms.
 
 ## Other processes on the scoring box
 
@@ -57,20 +70,25 @@ With a busy loop on one of CPUs 0-11 for 1 ms in every 5 (box 2, fast loop, medi
 
 - v24, fixed twelfths, a sender waits while its owner's ring is full: 22.55 ms quiet, 26.3 to 26.9 ms with the noise. One thread kept off its CPU stalls every thread that sends to it.
 - v26, pieces and an unbounded per-owner queue on the hot path: 23.8 quiet, 24.2 with noise.
-- v27, pieces, fixed batches, and an overflow queue used only when a ring is full: 22.63 quiet, 23.8 to 23.9 with noise.
+- v27, pieces, fixed batches, and an overflow queue used only when a ring is full: 22.66 quiet, 24.0 with noise.
+- v39, pieces, and a sender that drains while it waits: 20.64 quiet, 24.0 with noise.
 
 A busy loop on one CPU for the whole run made v24 25 times slower (546 ms) and v26 8 times (172 to 192 ms).
 
+v27 did not close the board gap: 3.8 ms slower on the board than on box 2, against 3.3 ms for v21, which had no defence against this noise. What matches the gap is another process using the shared L3: a cache-bound loop on the E-cores (CPUs 12-19) made v27 and the Rust version 3.3 to 3.8 ms slower alike, while a memory-bandwidth loop there cost nothing. Until the freeze the board's runs share the scoring machine; the final runs have it to themselves (organisers' FAQ), so v39 keeps the 2 ms it wins on a quiet box.
+
 ## What did not work (box 2)
 
-- `-march=alderlake` or `native` instead of x86-64-v3: 0.4 ms slower.
+- `-march=alderlake` or `native` instead of x86-64-v3: 0.4 ms slower. Profile-guided optimisation (`-fprofile-use`, at v27): 22.68 against 22.69 ms.
 - Reading with pread instead of mapping: 34.8 against 33.3 ms in the full program, although pread wins the bare scan; again at v21 (v22): 25.0 against 24.1 ms. The kernel's copy took 80 M cycles against 53 M for mapping and unmapping.
 - Each thread populating its part of the mapping up front (`MADV_POPULATE_READ`): 28 ms, the threads queue on the mapping's lock.
-- Region table misses: a probe without the lookup (wrong output) was 1.6 ms faster, but the same lookup into a 256 KB table recovered only 0.55 ms, so a compact table was not built.
+- Main touching all memory before starting the threads, which avoids the cgroup's per-CPU batches (~2 MB of M): 1.6 to 2.8 ms slower, all of it serial. Main allocating the owners' tables (+0.55 ms) or touching the rings and totals (+0.15 ms) before the threads start: slower too.
+- The owners' tables mapped with `mmap` instead of `aligned_alloc`: 0.7 ms slower, 13 % more user cycles. Letting GCC inline the cold path for long names: 29 M more instructions, 0.8 ms slower.
+- `_Alignas(64)` on the first field of the per-country totals: it aligns every field of the declaration, making the struct 512 bytes: 1.2 ms slower.
+- Name rows zeroed up front instead of when first used: no faster, M +0.4 MB. The threads adding up the per-country totals in parallel: no faster.
+- The output formatted by hand instead of with fprintf: 0.15 ms faster for 8 more lines, which is about even in K.
+- Region table misses, before the prefetch: a probe without the lookup (wrong output) was 1.6 ms faster, but the same lookup into a 256 KB table recovered only 0.55 ms, so a compact table was not built.
 - Rings of 128 messages: 0.2 ms slower than 256. Pass 1 over 4 KB instead of 16 KB: 0.2 ms slower.
-- `-mtune-ctrl=^avoid_false_dep_for_bmi`: 30 M fewer instructions, no change in time.
 - Without 64-byte message lines (one 8-byte store per message): 7 ms slower. Non-temporal stores for the lines: no change.
-- Two interleaved input streams per thread: slower.
-- Deferring the per-country updates through a record array: slower.
-- SIMD buckets against linear probing in the owner table: no difference at v17 (they won later, at v20, together with the smaller identity).
-- Branch misses: about 4 % of cycles at v18, so branch-free rewrites were not the lever; the program is bound by instruction count (67 % of slots retiring, about 2 instructions per cycle per thread).
+- Two interleaved input streams per thread: slower. Deferring the per-country updates through a record array: slower.
+- Branch misses: about 4 % of cycles at v18, so branch-free rewrites were not the lever; the program is bound by instruction count (about 60 % of slots retiring, about 2 instructions per cycle per thread).
