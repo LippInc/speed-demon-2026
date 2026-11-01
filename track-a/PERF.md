@@ -64,6 +64,12 @@ Terms used below: the board is the organisers' live leaderboard, one run per pus
 | 54 | a-47d, re-run (another track's push) | 134b2b2 · Track A (run-59f3735ada49) | 0.03 | 24 | 79.6 | OURS | 0.026-0.028 s | kept |
 | 55 | a-47d, re-run (another track's push) | 60b5493 · Track A (run-a1e8513b77c6) | 0.03 | 23 | 79.3 | OURS | 0.026-0.028 s | kept |
 | 56 | a-47d, re-run (another track's push) | e550f50 · Track A (run-ca6d3c048273) | 0.03 | 23 | 77.6 | OURS | 0.026-0.028 s | kept |
+| 57 | a-55: the a-55 lift (sd-kit-a a6b3205) | f245483 · Track A (run-8c41cebcaeef) | 0.03 | 21 | 80.4 | OURS | 0.023-0.025 s | kept |
+| 58 | a-55, re-run (another track's push) | 585ce17 · Track A (run-2c31c9241d23) | 0.03 | 21 | 81.0 | OURS | 0.023-0.025 s | kept |
+| 59 | a-55, re-run (another track's push) | b1438ef · Track A (run-de31ec2f2b8c) | 0.03 | 21 | 80.6 | OURS | 0.023-0.025 s | kept |
+| 60 | a-55, re-run (another track's push) | 55a0bc1 · Track A (run-66dd7b069673) | 0.03 | 22 | 80.5 | OURS | 0.023-0.025 s | kept |
+| 61 | a-55, re-run (another track's push) | bf07a3a · Track A (run-3bf9d051e3dc) | 0.03 | 20 | 80.2 | OURS | 0.023-0.025 s | kept |
+| 62 | a-55, re-run (another track's push) | a188bdf · Track A (run-6648069094f7) | 0.03 | 21 | 80.4 | OURS | 0.023-0.025 s | kept |
 
 ## What each push carried
 
@@ -208,6 +214,13 @@ Experiments measured on our bench box only, with no board run (their box status 
   - r2e (afc911c), in-place output formatting with fixed-size copies: `K 41.84 / 42.48 (lower: fresh; official 42.03 / 42.69) | T 0.023s | M 20.6-21.0MB | S 541`. Dropped: inside spread at S +11 lines; reverted to r2d (71473d6).
   - r3 (175024c), 4 interleaved line streams per block: `K 41.26 / 41.08 (lower: fresh; official 41.62 / 41.19) | T 0.024s | M 20.4-20.7MB | S 565`. Dropped. Split (perf stat): line loop is already throughput-bound on 1 worker (IPC 2.67), so overlapping chains cannot win; 4 streams added L1 misses (1 worker 5.79 -> 6.53 M, 12 workers 6.63 -> 7.49 M; cycles +1.6-1.8 %).
   - trim (a6b3205, on 739c1eb): cold-code line cuts (hot functions untouched), S 530 -> 463 (-67 lines): `K 42.54 / 43.04 (lower: fresh; official 42.82 / 43.05) | T 0.024s | M 20.2-20.4MB | S 463`. Kept in family, family tip: +5.7-8.1 % K over banked board tip 5c47d22 (39.80 / 40.25).
+- a-56 (OURS), kept (no board run; measured on bench box): forward line walk (44579b2), after HighVelocity's public
+  track-a line walk. The timestamp is always 27 bytes, so one 64-byte space mask from byte 28 holds the ends of method
+  and endpoint; status and latency sit at fixed offsets after them; the latency's digits are read 8 per load and
+  converted with two multiply-adds; one load checks the hour; the last 256 bytes take a cold copy path. Two readings:
+  `K 43.58 (lower: fresh) | official K 44.64 T 0.022s (0.021-0.023) | fresh K 43.58 T 0.023s (0.022-0.024) | M 20.7MB S 464 L | sha 5/5+5/5 OK`
+  and `K 43.80 (lower: fresh) | official K 43.89 T 0.023s (0.022-0.023) | fresh K 43.80 T 0.023s (0.023-0.024) | M 20.7MB S 464 L | sha 5/5+5/5 OK`,
+  against a6b3205's `K 42.96 / 43.04 / 42.54 (lower: fresh)`; five-round A/B medians 43.93 vs 43.02 (+2.1 % K).
 
 ## Decisions
 

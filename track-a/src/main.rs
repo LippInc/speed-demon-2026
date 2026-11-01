@@ -3,17 +3,13 @@
 //! per-hour records. An hour is finished (counted, selected, formatted) as soon as the registered prefix of the file holds
 //! a line two hours later, while other threads keep parsing, and finished hours are written in hour order: no thread
 //! waits for the whole scan, and only a few hours' records are alive at once.
-//! Main tricks: line_fields (a-5), parse_latency (a-13), Table (a-10, a-40), percentiles (a-20), the pipeline (a-55).
+//! Main tricks: line (a-56), Table (a-10, a-40), percentiles (a-20), the pipeline (a-55).
 
 use std::arch::x86_64::*;
 use std::sync::atomic::{AtomicUsize, Ordering::Acquire, Ordering::Relaxed, Ordering::Release};
 use std::sync::{Condvar, Mutex};
 use std::{cell::UnsafeCell, collections::BTreeMap, fs::File, io::prelude::*, os::fd::AsRawFd};
 
-// Spec 2 grammar: ts (27 bytes), SP, method (3 to 7 bytes), SP: the endpoint starts at byte 32 to 36 of a line.
-const ENDPOINT_MIN: usize = 32;
-// Spec 2 grammar: ts = "YYYY-MM-DDTHH..."; bytes 0..13 name the UTC hour.
-const HOUR_PREFIX: usize = 13;
 // Spec 2: every timestamp lies in the same 72 hours for every seed and scale, 2026-10-30T18:00Z to 2026-11-02T17:59Z.
 const HOURS: usize = 72;
 const DAYS: [&str; 4] = ["2026-10-30", "2026-10-31", "2026-11-01", "2026-11-02"];
@@ -52,65 +48,56 @@ unsafe fn mask32(data: &[u8], i: usize, byte: u8) -> u32 {
     unsafe { _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(byte as i8))) as u32 }
 }
 
-/// The endpoint's first byte and the LF of the line starting at p. The method holds no '/', so the first '/'
-/// from byte 32 opens the endpoint; one 32-byte load finds it and, for most lines, the LF too.
-/// Measured on this VM (seed 1 full, 4 workers; a-5): scan 108 -> 79 ns per line against byte-by-byte searches
-/// (an AVX2 LF search alone gave 95, adding a SWAR '/' search 86).
-fn line_fields(data: &[u8], p: usize) -> (usize, usize) {
-    let mut i = p + ENDPOINT_MIN;
-    if i + 64 > data.len() {
-        // Near the end of the input, where a 64-byte load would overrun: byte by byte.
-        let ep = find(data, i, b'/');
-        return (ep, find(data, ep, b'\n'));
-    }
-    // One 64-byte window from byte 32 holds the '/' and, for lines of up to 96 bytes (about 90 % of seed 1's), the
-    // LF, so most lines take no loop turn (a-40a). Cachegrind, 1 worker, against one 32-byte load and a loop: scan
-    // 230.7 -> 218.2 instructions per line (seed 1), 232.4 -> 220.5 (seed 4242); conditional mispredicts -0.40 per
-    // line (seed 1), -0.45 (seed 4242).
-    // Safety: i + 64 <= data.len(), checked above.
-    let ep = i + unsafe { mask32(data, i, b'/') }.trailing_zeros() as usize;
-    let lf = unsafe { mask32(data, i, b'\n') as u64 | (mask32(data, i + 32, b'\n') as u64) << 32 };
-    if lf != 0 {
-        return (ep, i + lf.trailing_zeros() as usize);
-    }
-    i += 64;
-    loop {
-        if i + 32 > data.len() {
-            return (ep, find(data, i, b'\n'));
-        }
-        let lf = unsafe { mask32(data, i, b'\n') }; // Safety: i + 32 <= data.len(), checked just above.
-        if lf != 0 {
-            return (ep, i + lf.trailing_zeros() as usize);
-        }
-        i += 32;
-    }
+/// The value of 8 decimal digits, one per byte (0 to 9), the most significant in the low byte: two multiply-add steps
+/// fold digit pairs, then 2-digit pairs, into two 4-digit halves.
+fn digits8(v: u64) -> u64 {
+    // Safety: SSE2 and SSSE3 are part of the x86-64-v3 baseline.
+    let r = unsafe {
+        let pairs = _mm_maddubs_epi16(_mm_cvtsi64_si128(v as i64), _mm_set1_epi16(0x010a));
+        _mm_cvtsi128_si64(_mm_madd_epi16(pairs, _mm_set1_epi32(0x0001_0064))) as u64
+    };
+    (r & 0xffff_ffff) * 10_000 + (r >> 32)
 }
 
-/// The space before the latency and the latency's value, for the line ending at lf, with no per-digit loop.
-/// One 16-byte load ends at the LF (spec 2: every line is at least 40 bytes, so it stays inside the line); the
-/// highest space in it precedes the latency's 1 to 10 digits (spec 2). Lanes left of the digits are zeroed,
-/// so the digits sit right-aligned in 16 lanes, and two multiply-add steps fold them into four 4-digit groups.
-/// Spec 2 rules out the malformed cases (no space, over 10 digits, a non-digit, a value over u32), so none is checked.
-/// Measured on this VM (cachegrind, seed 7 sample, 1 worker; a-13): conditional mispredicts 6.86 -> 5.32 per line,
-/// instructions 726 -> 693 per line, against walking back to the space and a per-digit checked loop.
-fn parse_latency(data: &[u8], lf: usize) -> (usize, u32) {
-    let v = &data[lf - 16..lf];
-    // Safety: v is 16 readable bytes; SSE2 and SSSE3 are part of the x86-64-v3 baseline.
-    unsafe {
-        let x = _mm_loadu_si128(v.as_ptr() as *const __m128i);
-        let spaces = _mm_movemask_epi8(_mm_cmpeq_epi8(x, _mm_set1_epi8(b' ' as i8))) as u32;
-        let sp = 31 - spaces.leading_zeros();
-        let lanes = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
-        let keep = _mm_cmpgt_epi8(lanes, _mm_set1_epi8(sp as i8));
-        let digits = _mm_and_si128(_mm_sub_epi8(x, _mm_set1_epi8(b'0' as i8)), keep);
-        let tens = _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1);
-        let pairs = _mm_maddubs_epi16(digits, tens);
-        let hundreds = _mm_setr_epi16(100, 1, 100, 1, 100, 1, 100, 1);
-        let q: [u32; 4] = std::mem::transmute(_mm_madd_epi16(pairs, hundreds));
-        // At most 10 digits, so lane 0 (bytes 0..4) is always zero.
-        let value = q[1] as u64 * 100_000_000 + q[2] as u64 * 10_000 + q[3] as u64;
-        (lf - 16 + sp as usize, value as u32)
-    }
+/// The endpoint's start and length, the 5xx flag, the latency and the next line's start, for the line at p, read
+/// forward with no '/' or LF search (a-56, after HighVelocity's track-a line walk). Spec 2: the timestamp is always
+/// 27 bytes, so the method starts at byte 28, and one 64-byte space mask from there holds the space after the method
+/// and, unless method and endpoint pass 63 bytes, the one after the endpoint; status and latency follow at fixed
+/// offsets; the latency's digits are read 8 at a time, and the first non-digit after them is the LF.
+/// Safety: p + 256 <= data.len() (a line has at most 27 + 1 + 7 + 1 + 125 + 1 + 3 + 1 + 10 + 1 = 177 bytes).
+unsafe fn line(data: &[u8], p: usize) -> (usize, usize, u64, u32, usize) {
+    let q = p + 28;
+    let mut m = unsafe { mask32(data, q, b' ') as u64 | (mask32(data, q + 32, b' ') as u64) << 32 };
+    let k1 = m.trailing_zeros() as usize;
+    m &= m - 1;
+    let k2 = if m != 0 { m.trailing_zeros() as usize } else { find(data, q + 64, b' ') - q };
+    let s = q + k2 + 1; // the status; its first digit is '5' exactly for a 5xx (spec 2: three digits, 100 to 599)
+    let v = u64::from_le_bytes(data[s + 4..s + 12].try_into().unwrap()) ^ 0x3030_3030_3030_3030;
+    // A byte's top bit is set here exactly when it is not a digit; the lowest such byte ends the latency.
+    let other = (v.wrapping_add(0x7676_7676_7676_7676) | v) & 0x8080_8080_8080_8080;
+    let (latency, lf) = if other != 0 {
+        let n = other.trailing_zeros() as usize / 8;
+        (digits8(v << (64 - 8 * n)), s + 4 + n)
+    } else {
+        // 8 to 10 digits (spec 2: at most 10).
+        let (mut lat, mut i) = (digits8(v), s + 12);
+        while data[i] != b'\n' {
+            (lat, i) = (lat * 10 + (data[i] - b'0') as u64, i + 1);
+        }
+        (lat, i)
+    };
+    (q + k1 + 1, k2 - k1 - 1, (data[s] == b'5') as u64, latency as u32, lf + 1)
+}
+
+/// `line` and the endpoint lookup for a line within 256 bytes of the input's end, on a zero-padded copy, so no load
+/// passes the end. Returns the endpoint's id, the 5xx flag, the latency and the next line's start.
+#[cold]
+fn tail_line(data: &[u8], p: usize, table: &mut Table, dict: &Dict) -> (u32, u64, u32, usize) {
+    let mut pad = [0u8; 512];
+    pad[..data.len() - p].copy_from_slice(&data[p..]);
+    // Safety: 256 <= pad.len().
+    let (ep, len, error, latency, next) = unsafe { line(&pad, 0) };
+    (table.endpoint(dict, &pad, ep, len), error, latency, p + next)
 }
 
 /// 32 bytes at p, zeroed from byte n on (n <= 32): one 32-byte chunk of an endpoint. Spec 2 endpoints hold no zero
@@ -288,12 +275,11 @@ impl Table {
 /// 32 bits and, above them, the endpoint's global id | 5xx << 11, so the hour's counts come from its records.
 fn parse(data: &[u8], start: usize, end: usize, table: &mut Table, dict: &Dict) -> Vec<(usize, Vec<u64>)> {
     let mut runs: Vec<(usize, Vec<u64>)> = Vec::new();
-    let (mut prev_prefix, mut at, mut p) = ((u64::MAX, u64::MAX), 0, start);
+    let (mut prev_prefix, mut at, mut p) = (u64::MAX, 0, start);
     while p < end {
-        // Lines usually share the previous line's hour, so compare its 13-byte prefix first, as two overlapping
-        // u64 loads (bytes 0..8 and 5..13) rather than a slice compare.
-        let word = |i: usize| u64::from_le_bytes(data[i..i + 8].try_into().unwrap());
-        let prefix = (word(p), word(p + HOUR_PREFIX - 8));
+        // Lines usually share the previous line's hour, so compare it first: spec 2's year is always 2026, so bytes
+        // 5..13 ("MM-DDTHH") name the hour, one u64 load (a-56).
+        let prefix = u64::from_le_bytes(data[p + 5..p + 13].try_into().unwrap());
         if prefix != prev_prefix {
             let h = hour_index(&data[p..]);
             at = match runs.iter().position(|r| r.0 == h) {
@@ -306,23 +292,15 @@ fn parse(data: &[u8], start: usize, end: usize, table: &mut Table, dict: &Dict) 
             };
             prev_prefix = prefix;
         }
-        let (ep_start, lf) = line_fields(data, p);
-        let (sp, latency) = parse_latency(data, lf);
-        // Spec 2 grammar: status is three digits, 100 to 599, followed by SP; it is a 5xx error exactly when its
-        // first digit is '5', so only that byte is read.
-        let error = (data[sp - 3] == b'5') as u64;
-        let len = sp - 4 - ep_start;
-        let e = match data.get(..ep_start + 128) {
-            Some(b) => table.endpoint(dict, b, ep_start, len),
-            None => {
-                // The input's last 128 bytes: the endpoint is copied into a zeroed buffer, so no load passes the end.
-                let mut buf = [0u8; 128];
-                buf[..len].copy_from_slice(&data[ep_start..sp - 4]);
-                table.endpoint(dict, &buf, 0, len)
-            }
+        let (e, error, latency, next) = if p + 256 <= data.len() {
+            // Safety: p + 256 <= data.len(), checked just above; the endpoint starts by byte 36, so its 128 bytes too.
+            let (ep, len, error, latency, next) = unsafe { line(data, p) };
+            (table.endpoint(dict, data, ep, len), error, latency, next)
+        } else {
+            tail_line(data, p, table, dict)
         };
         runs[at].1.push(latency as u64 | (e as u64 | error << 11) << 32);
-        p = lf + 1;
+        p = next;
     }
     runs
 }
