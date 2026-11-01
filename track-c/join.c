@@ -64,7 +64,7 @@ typedef struct { // a thread's part of records.csv, parsed in two passes
   u32 *ix, n;         // separators pass 1 found that no record has used
 } Scan;
 typedef struct { // one owner's names
-  u64 *slot, mask, n; // linear probing; slot: message bits 24-63 | id + 1
+  u64 *slot, mask, n; // 4-slot buckets (mask: their number - 1), see find()
   u16 *lo;            // id -> its message's bits 8-23, to refile on grow
   u64 (*row)[4];      // id -> a bit per country
 } Names;
@@ -106,8 +106,8 @@ static inline u64 load(const u8 *p) {
   return v;
 }
 static inline u64 mix(u64 a, u64 b) { // wyhash's mum: a 128-bit product, folded
-  __uint128_t p = (__uint128_t)a * b;
-  return (u64)p ^ (u64)(p >> 64);
+  unsigned long long hi, lo = _mulx_u64(a, b, &hi);
+  return lo ^ hi;
 }
 
 static void barrier(void) { // all NT threads meet here
@@ -140,27 +140,38 @@ static inline u64 quotes(const u8 *p) { // a bit per quote byte of p[0, 64)
               _mm256_cmpeq_epi8(_mm256_loadu_si256((const void *)(p + 32)), q));
 }
 
-// The hash of the name bytes p[0, n), 32 at a time (names are under 32 bytes
-// in practice), and in *len their length once unescaped: every quote inside
-// a name is half of a "".
-static inline u64 name(const u8 *p, u64 n, u64 *len) {
-  u64 h = n, q = 0;
-  for (u64 i = 0;; i += 32) {
-    u64 left = n - i < 32 ? n - i : 32;
-    __m256i v = _mm256_and_si256(
-        _mm256_loadu_si256((const void *)(p + i)),
-        _mm256_loadu_si256((const void *)(KEEP + 32 - left)));
-    q += _mm_popcnt_u32(
-        _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8('"'))));
-    h = mix(_mm256_extract_epi64(v, 0) ^ h ^ 0xA0761D6478BD642F,
+// Name hashing, 32 bytes v at a time into h; q counts the quote bytes.
+typedef struct {
+  const u8 *p;
+  u64 n, h, q;
+} Name;
+static inline Name step(Name s, __m256i v) {
+  s.q += _mm_popcnt_u32(
+      _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8('"'))));
+  s.h = mix(_mm256_extract_epi64(v, 0) ^ s.h ^ 0xA0761D6478BD642F,
             _mm256_extract_epi64(v, 1) ^ 0xE7037ED1A0B428DB) ^
         mix(_mm256_extract_epi64(v, 2) ^ 0x8EBC6AF09C88C6E3,
             _mm256_extract_epi64(v, 3) ^ 0x589965CC75374CC3);
-    if (n - i <= 32)
-      break;
-  }
-  *len = n - q / 2;
-  return mix(h, 0x1D8E4E27C47D124F);
+  return s;
+}
+// All but the last 32 bytes of a long name (spec 2.2 sets no bound; the
+// published data has none over 32 bytes, so this stays out of the loop).
+__attribute__((cold, noinline)) static Name head(Name s) {
+  for (; s.n > 32; s.n -= 32, s.p += 32)
+    s = step(s, _mm256_loadu_si256((const void *)s.p));
+  return s;
+}
+// The hash of the name bytes p[0, n), and in *len their length once
+// unescaped: every quote inside a name is half of a "".
+static inline u64 name(const u8 *p, u64 n, u64 *len) {
+  Name s = {p, n, n, 0};
+  if (n > 32)
+    s = head(s);
+  s = step(s, _mm256_and_si256(
+                  _mm256_loadu_si256((const void *)s.p),
+                  _mm256_loadu_si256((const void *)(KEEP + 32 - s.n))));
+  *len = n - s.q / 2;
+  return mix(s.h, 0x1D8E4E27C47D124F);
 }
 
 // The length of the text field p[0, n) once unescaped: an unquoted field is
@@ -173,39 +184,47 @@ static inline u64 text(const u8 *p, u64 n) {
   return n - q / 2 - (q > 0);
 }
 
-static void grow(Names *m);
-
-// Files the name of message msg, seen for the first time, and returns its
-// slot: message bits 24-63 (the tag) and the name's id + 1.
-__attribute__((cold)) static u64 add(Names *m, u64 msg) {
-  if (8 * m->n >= 5 * (m->mask + 1))
-    grow(m);
-  u64 i = msg >> 8 & m->mask;
-  while (m->slot[i])
-    i = (i + 1) & m->mask;
-  memset(m->row[m->n], 0, 32); // rows are touched only once used
-  m->lo[m->n] = msg >> 8;
-  return m->slot[i] = msg >> 24 << 24 | ++m->n;
+// The slot of the name of message msg, or the free slot where it goes. A slot
+// holds message bits 20-63 (the tag) and the name's id + 1. The walk starts
+// at the 4-slot bucket that message bits 8-19 pick and goes on past full
+// buckets; slots fill in order and never empty, so a name that is there comes
+// before the walk's first free slot. Bucket and tag together are 56 bits.
+static inline u64 *find(u64 *slot, u64 mask, u64 msg) {
+  __m256i tag = _mm256_set1_epi64x(msg >> 20), zero = _mm256_setzero_si256();
+  for (u64 b = msg >> 8 & mask;; b = (b + 1) & mask) {
+    __m256i v = _mm256_load_si256((const __m256i *)(slot + 4 * b));
+    u32 m = _mm256_movemask_pd(_mm256_castsi256_pd(
+        _mm256_or_si256(_mm256_cmpeq_epi64(_mm256_srli_epi64(v, 20), tag),
+                        _mm256_cmpeq_epi64(v, zero))));
+    if (m)
+      return slot + 4 * b + _tzcnt_u32(m);
+  }
 }
 
-// Doubles the table and refiles every name; ids and rows stay. A slot holds
-// key bits 16-55 and lo[id] bits 0-15, so the key is never stored twice.
+// Doubles the table and refiles every name; ids and rows stay. lo[id] keeps
+// the message bits 8-19 that the slot lacks.
 static void grow(Names *m) {
-  u64 *old = m->slot, n = old ? m->mask + 1 : 0, size = old ? 2 * n : 1 << 14;
-  m->slot = calloc(size, 8);
+  u64 *old = m->slot, n = old ? 4 * (m->mask + 1) : 0, size = old ? 2 * n : 1 << 14;
+  m->slot = aligned_alloc(32, size * 8);
   m->lo = realloc(m->lo, size * 5 / 8 * sizeof *m->lo);
   m->row = realloc(m->row, size * 5 / 8 * sizeof *m->row);
   if (!m->slot || !m->lo || !m->row)
     die("malloc");
-  m->mask = size - 1;
-  for (u64 j = 0; j < n; j++)
-    if (old[j]) {
-      u64 i = (old[j] >> 24 << 16 | m->lo[(old[j] & 0xFFFFFF) - 1]) & m->mask;
-      while (m->slot[i])
-        i = (i + 1) & m->mask;
-      m->slot[i] = old[j];
-    }
+  memset(m->slot, 0, size * 8);
+  m->mask = size / 4 - 1;
+  for (u64 i = 0; i < n; i++)
+    if (old[i])
+      *find(m->slot, m->mask, old[i] >> 20 << 20 | (u64)(m->lo[(old[i] & 0xFFFFF) - 1] & 0xFFF) << 8) = old[i];
   free(old);
+}
+
+// Files the name of message msg, seen for the first time; returns its slot.
+__attribute__((cold)) static u64 add(Names *m, u64 msg) {
+  if (8 * m->n >= 5 * 4 * (m->mask + 1))
+    grow(m);
+  memset(m->row[m->n], 0, 32); // rows are touched only once used
+  m->lo[m->n] = msg >> 8;
+  return *find(m->slot, m->mask, msg) = msg >> 20 << 20 | ++m->n;
 }
 
 static int country(const u8 *p) { // numbers countries in order of first sight
@@ -285,12 +304,10 @@ static u64 drain(int t, Agg *a) {
       u32 id[64];
       u64 *slot = nm->slot, mask = nm->mask, (*row)[4] = nm->row;
       for (u64 j = h; j < e; j++) {
-        u64 msg = m[j % RING], i = msg >> 8 & mask, s;
-        while ((s = slot[i]) && (s ^ msg) >> 24)
-          i = (i + 1) & mask;
+        u64 msg = m[j % RING], s = *find(slot, mask, msg);
         if (!s)
           s = add(nm, msg), slot = nm->slot, mask = nm->mask, row = nm->row;
-        id[j - h] = (s & 0xFFFFFF) - 1;
+        id[j - h] = (s & 0xFFFFF) - 1;
         _mm_prefetch((const char *)row[id[j - h]], _MM_HINT_T0);
       }
       for (u64 j = h; j < e; j++) {
