@@ -34,7 +34,8 @@ typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t
 #define MAXQ 10           // ids printed per query
 #define WMAX 64
 #define ANCHOR (1u << 31) // table value flag: phrases are checked at this term
-#define NONE 0xFFFFFFFFu
+#define MISS 0x7FFFFFFFu  // lookup value of a token that is no query term
+#define PROBE 0x7FFFFFFEu // a bucket's miss value once a key was probed past it
 
 #ifdef TIMING
 #include <time.h>
@@ -50,11 +51,11 @@ static void die(const char *m) { fprintf(stderr, "bindex: %s\n", m); exit(1); }
 enum { AND = 1, OR, NOT };
 typedef struct { u32 q, gid; } Hit;            // phrase query q matches document gid
 typedef struct {
-    _Alignas(64) u64 *keys, *bm, *bt, *dm;     // aligned: no two workers share a cache line
+    _Alignas(64) u64 *keys, *bm, *bt;     // aligned: no two workers share a cache line
     u8 *heap; size_t hsize;                    // the part arrays, unmapped before the merge
     u32 *ids, *aps, *sdf, *off, *end, *docoff, *rec, nrec, nsd, w64, nhit, hcap, cnt[3];
     u16 *la, *lb, *stream, *post;
-    u8 *qdone;
+    u8 *qdone, *db;
     Hit *hit;
     char *out; size_t outlen;
 } Worker;
@@ -105,11 +106,11 @@ static const u8 *map_file(const char *dir, const char *name, size_t *len) {
 // u64 (no token holds a NUL, so different lengths differ). Longer tokens XOR in
 // each further 8 bytes times an odd constant, so two tokens share a key only by
 // a 64-bit coincidence. A bucket holds 5 keys and their values in one cache
-// line. Its slots fill in order, and ovf marks a bucket a key was probed past,
-// so a search ends at the first bucket that holds the key or has no ovf: almost
-// always the home bucket, so the branch is predictable. A slot's value is its
-// own index until the workers renumber the terms.
-typedef struct { _Alignas(64) u64 key[5]; u32 val[5], ovf; } Bucket;
+// line, plus a sixth value that answers a miss: MISS, or PROBE once a key was
+// probed past the bucket. A lookup compares all five keys at once and reads
+// val[index of the match, or 5], so a hit and a miss take the same path. A
+// slot's value is its own index until the workers renumber the terms.
+typedef struct { _Alignas(64) u64 key[5]; u32 val[6]; } Bucket;
 static Bucket *tab;                            // on one huge page: lookups take no TLB misses
 #define BMASK ((1u << BBITS) - 1)
 
@@ -133,13 +134,20 @@ static inline u64 key_at(const u8 *p, u32 L) {
     return k;
 }
 
-static inline u32 lookup(u64 k) {
-    const __m256i kk = _mm256_set1_epi64x((long long)k);
-    for (u32 b = bucket_of(k);; b = (b + 1) & BMASK) {   // all five compares in vectors, so no branch on a hit
-        u32 m = (u32)_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(_mm256_load_si256((const __m256i *)tab[b].key), kk)))
-              | ((u32)_mm_movemask_pd(_mm_castsi128_pd(_mm_cmpeq_epi64(_mm_loadl_epi64((const __m128i *)&tab[b].key[4]), _mm256_castsi256_si128(kk)))) & 1) << 4;
-        if ((tab[b].ovf & (u32)(m == 0)) == 0) return tab[b].val[_tzcnt_u32(m) & 7] | -(u32)(m == 0);   // NONE on a miss
+static u32 probe(u64 k, u32 b) {               // the key may sit in a later bucket
+    for (;;) {
+        b = (b + 1) & BMASK;
+        for (u32 i = 0; i < 5; i++) if (tab[b].key[i] == k) return tab[b].val[i];
+        if (tab[b].val[5] != PROBE) return MISS;
     }
+}
+
+static inline u32 lookup(u64 k) {
+    const Bucket *t = &tab[bucket_of(k)];
+    u32 m = (u32)_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(_mm256_load_si256((const __m256i *)t->key), _mm256_set1_epi64x((long long)k))))
+          | (u32)(t->key[4] == k) << 4;
+    u32 v = t->val[_tzcnt_u32(m | 32)];
+    return v == PROBE ? probe(k, bucket_of(k)) : v;
 }
 
 static u32 intern(u64 k) {                     // called by all workers at once
@@ -150,7 +158,7 @@ static u32 intern(u64 k) {                     // called by all workers at once
                 return tab[b].val[i] = b * 5 + i;
             if (cur == k) return b * 5 + i;
         }
-        __atomic_store_n(&tab[b].ovf, 1, __ATOMIC_RELAXED);
+        __atomic_store_n(&tab[b].val[5], PROBE, __ATOMIC_RELAXED);
     }
 }
 
@@ -234,7 +242,7 @@ static void sample(Worker *me, int w) {
         d++;
         for (u32 i = 0; i < n; i++) {
             u32 v = lookup(me->keys[i]);
-            if (v != NONE && sdf[v] >> 16 != d) sdf[v] = d << 16 | ((sdf[v] + 1) & 0xFFFF);
+            if (v != MISS && sdf[v] >> 16 != d) sdf[v] = d << 16 | ((sdf[v] + 1) & 0xFFFF);
         }
     }
     me->nsd = d;
@@ -284,39 +292,40 @@ static void transpose64(u64 *a) {
         }
 }
 
-// Per doc: all lookups first (independent loads, many in flight; the next doc
-// is tokenized just before, so its prefetches have a whole doc to land), then per
-// token a dense term sets its bit in the doc's own small bitset dm, a rare BOOL
-// term appends to the stream and an anchor is noted for the phrase check;
-// branch-free, the other cases write to a spare word. dm has four copies, used
-// in turn, so a common term's bit-sets do not wait on each other. Every 64 docs
-// their bitsets (bt) turn into a word of each dense term's row by 64x64 transposes, and the
-// stream is counted and scattered into per-term doc lists, list s =
-// post[off[s] .. end[s]), each after a 0xFFFF sentinel so a repeat of the same
-// doc is dropped by comparing with the last.
+// Per token, in one loop: the lookup, then a dense term sets its flag byte in
+// db, a rare BOOL term appends to the stream and an anchor is noted for the
+// phrase check; branch-free, other tokens flag a spare byte. The next doc is
+// tokenized first, so its prefetches have a whole doc to land. The flags of 64
+// docs (bt, one bit per term) turn into a word of each dense term's row by
+// 64x64 transposes, and the stream is counted and scattered into per-term doc
+// lists, list s = post[off[s] .. end[s]), each after a 0xFFFF sentinel so a
+// repeat of the same doc is dropped by comparing with the last.
 static void scan_part(Worker *me, int p) {
-    const u32 ND = ndense, NS = nsparse, DW = ND / 64 + 1, DS = DW + 1, W64 = me->w64, first = pfirst[p], nd = pfirst[p + 1] - first;
-    u64 *bt = me->bt, *dm = me->dm, *bm = me->bm, *kc = me->keys, *kn = kc + MAXTOK, *kt;
+    const u32 ND = ndense, NS = nsparse, DW = ND / 64 + 1, JB = DW * 64, W64 = me->w64, first = pfirst[p], nd = pfirst[p + 1] - first;
+    u64 *bt = me->bt, *bm = me->bm, *kc = me->keys, *kn = kc + MAXTOK, *kt;
     u32 *ids = me->ids, *aps = me->aps, *docoff = me->docoff, sl = 0, n = 0, nn = 0;
     u16 *stream = me->stream;
+    u8 *db = me->db;
     const u8 *q = doc + pstart[p];
     memset(bm, 0, (size_t)ND * W64 * 8);
     if (nd) q = tokenize(skip_id(q), kc, &n);
     for (u32 d = 0; d < nd; d++) {
         if (d + 1 < nd) q = tokenize(skip_id(q), kn, &nn);   // its prefetches get this doc's time to land
-        for (u32 i = 0; i < n; i++) ids[i] = lookup(kc[i]);
-        memset(dm, 0, 4 * DS * 8);
         u32 na = 0;
         for (u32 i = 0; i < n; i++) {
-            u32 v = ids[i], id = v & ~ANCHOR, s = id - ND;
+            u32 v = lookup(kc[i]), id = v & ~ANCHOR, s = id - ND;
             ids[i] = id;
-            dm[(i & 3) * DS + (id < ND ? id >> 6 : DW)] |= 1ull << (id & 63);
+            db[id < ND ? id : JB] = 0x80;
             stream[sl] = (u16)s;
             sl += s < NS;
             aps[na] = i;
-            na += (v >> 31) & (v != NONE);
+            na += v >> 31;
         }
-        for (u32 w = 0; w < DW; w++) bt[(d & 63) * DW + w] = dm[w] | dm[DS + w] | dm[2 * DS + w] | dm[3 * DS + w];
+        for (u32 w = 0; w < DW; w++) {
+            __m256i *f = (__m256i *)(db + 64 * w);
+            bt[(d & 63) * DW + w] = (u32)_mm256_movemask_epi8(f[0]) | (u64)(u32)_mm256_movemask_epi8(f[1]) << 32;
+            f[0] = f[1] = _mm256_setzero_si256();
+        }
         if ((d & 63) == 63 || d + 1 == nd) {
             memset(bt + ((d & 63) + 1) * DW, 0, (63 - (d & 63)) * DW * 8);
             for (u32 w = 0; w < DW; w++) {
@@ -578,7 +587,7 @@ static void *worker(void *arg) {
     for (int pass = 0; pass < 2; pass++) {     // pass 0 sizes the arena, pass 1 carves it
         u8 *h = me->heap = pass ? arena(me->hsize) : NULL;
         me->bm = take(&h, ((size_t)ndense + 2) * W64 * 8);
-        me->bt = take(&h, 64 * (ndense / 64 + 1) * 8); me->dm = take(&h, (ndense / 64 + 2) * 32);
+        me->bt = take(&h, 64 * (ndense / 64 + 1) * 8); me->db = take(&h, (ndense / 64 + 2) * 64);
         me->la = take(&h, maxnd * 2 + 64); me->lb = take(&h, maxnd * 2 + 64);
         me->off = take(&h, nsparse * 4); me->end = take(&h, nsparse * 4); me->docoff = take(&h, maxnd * 4 + 4);
         me->stream = take(&h, maxb); me->post = take(&h, maxb + nsparse * 2);   // a token takes two bytes of text
@@ -621,6 +630,7 @@ int main(int argc, char **argv) {
     }
     size_t maxq = qlen / 7 + 1;                // the shortest query line is `BOOL a` + LF
     tab = huge(sizeof(Bucket) << BBITS);
+    for (u32 b = 0; b <= BMASK; b++) tab[b].val[5] = MISS;
     for (u32 L = 0, a; L <= 16; L++)
         a = L < 8 ? L : 8, KM[L][0] = a == 8 ? ~0ull : (1ull << 8 * a) - 1, KM[L][1] = L - a == 8 ? ~0ull : (1ull << 8 * (L - a)) - 1;
     sdfs = huge(sdfsize = (size_t)(nw + 2) * NSLOT * 4);   // each worker's sample counts, their sums, the new ids
