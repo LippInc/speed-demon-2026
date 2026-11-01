@@ -8,7 +8,7 @@
 //! document's place in the chunk. At the chunk's end the log is sorted by term, each query that one of its terms
 //! triggers is folded once over its terms' rows (a rare term's row built from its log entries) with branch-free
 //! operator masks, the count is a popcount and the id sum comes from bit slices.
-//! Main tricks: `ChunkLog` and `fold_chunk` (b-68), `hold` (b-64), `PhrasePlan` (b-8), `TermTable` (b-36a),
+//! Main tricks: `ChunkLog` and `fold_chunk` (b-68), `doc_b` and `Table` (b-112), `PhrasePlan` (b-8),
 //! `estimate_df` (b-11), `Interner` (b-84).
 
 use std::arch::x86_64::*;
@@ -21,7 +21,7 @@ const NIL: u32 = u32::MAX;
 const MAX_TERM: usize = 32; // spec 2.3: a query term is 1 to 32 bytes, so a longer token is never a query term
 const FIRST_IDS: usize = 10; // spec 4: the ten smallest ids
 
-/// 32 bytes of the corpus in an AVX2 register (x86-64-v3, the build target), zero past the end of `data`.
+/// 32 bytes of queries.txt in an AVX2 register (x86-64-v3, the build target), zero past the end of `data`.
 struct Chunk(__m256i);
 
 impl Chunk {
@@ -36,40 +36,12 @@ impl Chunk {
         Chunk(unsafe { _mm256_loadu_si256(tail.as_ptr() as *const __m256i) })
     }
 
-    /// Bit k: byte k is a token byte, a-z, A-Z or 0-9 (spec 2.2). Signed compares, so bytes from 0x80 never match.
-    #[inline(always)]
-    fn token_mask(&self) -> u32 {
-        unsafe {
-            let lower = _mm256_or_si256(self.0, _mm256_set1_epi8(0x20));
-            let between = |v, lo: u8, hi: u8| {
-                let above = _mm256_cmpgt_epi8(v, _mm256_set1_epi8(lo as i8 - 1));
-                _mm256_andnot_si256(_mm256_cmpgt_epi8(v, _mm256_set1_epi8(hi as i8)), above)
-            };
-            let tok = _mm256_or_si256(between(lower, b'a', b'z'), between(self.0, b'0', b'9'));
-            _mm256_movemask_epi8(tok) as u32
-        }
-    }
-
     /// Bit k: byte k is `b`.
     #[inline(always)]
     fn eq_mask(&self, b: u8) -> u32 {
         unsafe { _mm256_movemask_epi8(_mm256_cmpeq_epi8(self.0, _mm256_set1_epi8(b as i8))) as u32 }
     }
 
-    /// The first n bytes lower-cased (bit 5 set), the rest zero.
-    #[inline(always)]
-    fn folded(&self, n: usize) -> [u8; 32] {
-        let mut out = [0u8; 32];
-        unsafe {
-            let keep = _mm256_cmpgt_epi8(_mm256_set1_epi8(n as i8), _mm256_setr_epi8(
-                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
-                29, 30, 31,
-            ));
-            let v = _mm256_and_si256(_mm256_or_si256(self.0, _mm256_set1_epi8(0x20)), keep);
-            _mm256_storeu_si256(out.as_mut_ptr() as *mut __m256i, v);
-        }
-        out
-    }
 }
 
 extern "C" {
@@ -98,20 +70,16 @@ fn parallel<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
 }
 
 /// The hash of a term zero-padded to 32 bytes: CRC32-C (SSE4.2, part of x86-64-v3) of its two 16-byte halves xor-ed,
-/// a word at a time. A fixed amount of work per token, with no loop whose exit depends on the token's length (b-31b).
-/// The bytes decide every match, so the hash only spreads the slots. (b-74) Two `crc32` replaced four 64-bit
-/// multiplies whose constants were reloaded at every token: the lookup's instructions fell by 0.66 G, its misses
-/// and mispredicts unchanged (cachegrind, 1 worker, seed 1).
+/// a word at a time. The bytes decide every match, so the hash only spreads the slots.
 #[inline(always)]
 fn hash32(t: &[u8; MAX_TERM]) -> u32 {
     let w = |k: usize| u64::from_le_bytes(t[8 * k..8 * k + 8].try_into().unwrap());
     unsafe { _mm_crc32_u64(_mm_crc32_u64(0, w(0) ^ w(2)), w(1) ^ w(3)) as u32 }
 }
 
-/// The query terms: interned into it while queries.txt is parsed, then probed for every token of the pass. A 4-byte
-/// slot holds the hash's top 2 bits and id + 1, so a miss reads one cache line; a hash match is then confirmed
-/// against the term's bytes, stored inline and zero-padded to 32 B (one more line). b-4 probed slots sized from
-/// every term occurrence (4 MB), a separate hash array, and a slice into queries.txt per term.
+/// The query terms, interned into it while queries.txt is parsed (`Interner`); the pass looks its tokens up in
+/// `Table` instead (b-112). A 4-byte slot holds the hash's top 2 bits and id + 1; a hash match is then confirmed
+/// against the term's bytes, stored inline and zero-padded to 32 B.
 struct TermTable {
     // 4 B slots: the hash's top 2 bits | (term id + 1) in the low 30 (TERM: ids stay below 2^30, spec 2.4),
     // 0 = empty. The tag only filters and the bytes decide, so any query file is exact. Half the bytes of 8 B slots
@@ -125,114 +93,251 @@ struct TermTable {
 #[derive(Clone, Copy)]
 struct TermBytes([u8; MAX_TERM]);
 
-impl TermTable {
-    /// Renumbers the terms by ascending `key` in place: the slots keep their hash and get the new id, and the
-    /// entries move (cheaper than rebuilding the table after the df sample). Returns each term's new id.
-    fn renumber(&mut self, key: &[u64]) -> Vec<u32> {
-        let mut order: Vec<usize> = (0..key.len()).collect();
-        order.sort_by_key(|&t| key[t]);
-        let mut new_id = vec![0; key.len()];
-        for (new, &old) in order.iter().enumerate() {
-            new_id[old] = new as u32;
-        }
-        for s in self.slots.iter_mut().filter(|s| **s != 0) {
-            *s = *s & !TERM | (new_id[(*s & TERM) as usize - 1] + 1);
-        }
-        self.bytes = order.iter().map(|&t| self.bytes[t]).collect();
-        new_id
-    }
-
-    /// The tag only filters; the bytes decide. Token and entry are both zero-padded to 32 bytes, so one 32-byte
-    /// compare settles the bytes and the length (it replaced a memcmp call and a length test per hash match).
-    /// (b-31c) box T 0.330 → 0.318 s. The probe starts at slot i = `slot(h)`, which the pass already computed for
-    /// its prefetch (b-74).
-    #[inline]
-    fn find(&self, token: &[u8; MAX_TERM], h: u32, mut i: usize) -> Option<u32> {
-        loop {
-            let s = self.slots[i];
-            if s == 0 {
-                return None;
-            }
-            if (s ^ h) & !TERM == 0 {
-                let t = (s & TERM) - 1;
-                if self.bytes[t as usize].0 == *token {
-                    return Some(t);
-                }
-            }
-            i = (i + 1) & (self.slots.len() - 1);
-        }
-    }
-
-    /// Looks up the token held back by `hold`, if any, and reports it. (b-64)
-    #[rustfmt::skip]
-    #[inline(always)]
-    fn settle(&self, pend: &mut Option<(usize, Option<([u8; MAX_TERM], u32, usize)>)>, f: &mut impl FnMut(usize, Option<u32>)) {
-        if let Some((s, tok)) = pend.take() { f(s, tok.and_then(|(t, h, i)| self.find(&t, h, i))); }
-    }
-
-    /// Folds and hashes the token at from..to and prefetches its slot, then settles the token before it and holds this
-    /// one back: the slot's read overlaps the previous token's probe and hit work. Box T 0.268 -> 0.251 s. (b-64)
-    #[rustfmt::skip]
-    #[inline(always)]
-    fn hold(&self, data: &[u8], from: usize, to: usize, pend: &mut Option<(usize, Option<([u8; MAX_TERM], u32, usize)>)>, f: &mut impl FnMut(usize, Option<u32>)) {
-        let tok = (to - from <= MAX_TERM).then(|| {
-            let t = Chunk::load(data, from).folded(to - from);
-            let h = hash32(&t);
-            let i = slot(h, self.shift);
-            unsafe { _mm_prefetch(self.slots.as_ptr().add(i) as *const i8, _MM_HINT_T0) };
-            (t, h, i)
-        });
-        self.settle(pend, f);
-        *pend = Some((from, tok));
-    }
-
-    /// `tokenize` with each token's start offset passed to `f` too: the phrase anchors need it (b-56). The text is
-    /// classified 32 bytes at a time (`Chunk`), and tokens are cut where the token-byte mask changes, so no branch is
-    /// taken per byte: the byte loop's two branches (separator skip, token end) were 71 M of the run's 161 M
-    /// mispredicts (cachegrind, 1 worker, seed 1). (b-31a, b-31b, b-31c)
-    /// Starts and ends are two masks, the i-th end closing the i-th start, so no branch decides per edge. (b-55)
-    /// Each token is reported one token late, after the next one's slot is prefetched. (b-64)
-    #[inline(always)]
-    fn walk(&self, data: &[u8], mut i: usize, mut f: impl FnMut(usize, Option<u32>)) -> usize {
-        let mut start = NIL as usize; // the token in progress, if any
-        let mut pend = None;
-        loop {
-            let chunk = Chunk::load(data, i);
-            let (lf, tok) = (chunk.eq_mask(b'\n'), chunk.token_mask());
-            let tok = tok & lf.wrapping_sub(1) & !lf; // only the bytes before the doc's LF
-            let prev = tok << 1 | (start != NIL as usize) as u32; // bit k: byte i + k - 1 is a token byte
-            let mut starts = tok & !prev; // bit k: a token starts at byte i + k
-            let mut ends = !tok & prev; // bit k: a token ends just before byte i + k
-            if start != NIL as usize && ends != 0 {
-                // the token carried in from the previous chunk ends at the first end bit
-                self.hold(data, start, i + ends.trailing_zeros() as usize, &mut pend, &mut f);
-                ends &= ends - 1;
-                start = NIL as usize;
-            }
-            while ends != 0 {
-                // every remaining end closes the earliest open start in this chunk
-                let (s, e) = (starts.trailing_zeros() as usize, ends.trailing_zeros() as usize);
-                self.hold(data, i + s, i + e, &mut pend, &mut f);
-                starts &= starts - 1;
-                ends &= ends - 1;
-            }
-            if starts != 0 {
-                start = i + starts.trailing_zeros() as usize; // the last token runs into the next chunk
-            }
-            // The LF is no token byte, so a token that runs up to it has ended in the loop above.
-            if lf != 0 {
-                self.settle(&mut pend, &mut f);
-                return i + lf.trailing_zeros() as usize + 1;
-            }
-            i += 32;
-        }
-    }
-}
-
 /// The slot where the probe for hash `h` starts, in a table of 2^(32 - shift) slots.
 #[inline]
 fn slot(h: u32, shift: u32) -> usize {
     (h.wrapping_mul(0x9e37_79b1) >> shift) as usize
+}
+
+/// (b-112) The scan of the lead's probe, module 1: a document's tokens become 64-bit keys first (`doc_b`), then one
+/// loop looks the keys up in a table of 64-byte buckets (`Table`), prefetching the bucket 8 keys ahead. The key is the
+/// token itself for tokens of 8 bytes or less (bytes OR 0x20, the ASCII lower case of spec 2.2's token bytes, zero
+/// past the end) and a CRC of it with bit 63 set and the length in bits 32-39 for longer ones, so equal keys are equal
+/// tokens up to a CRC collision between two long tokens (odds about 3e-10 per run, accepted by the design; the bytes
+/// are not compared again). The probe's bare read-lookup-record work: 58.6-63.7 ms per worker on box 1 (12 workers,
+/// seed 1 full) against about 95 ms for the same work in the chunk engine (tokenize 18 + lookup 53 + hits 24).
+const NONE: u32 = u32::MAX;
+const FOLD: u64 = 0x2020_2020_2020_2020;
+fn mix(k: u64) -> u64 {
+    k.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
+/// b-112f: the key of a token of 9 bytes or more is 63 bits of hash, as the design above counts it: the CRC in bits 0-31
+/// and the top 31 bits of a multiply chain over the same words in bits 32-62. The CRC alone is 32 bits (its length
+/// field adds none), so two same-length tokens collided about once per 4e9 pairs, which a full run reaches (`lailsteel`
+/// and `slochaija` have one key); the multiply is not linear over GF(2) like the CRC, so no xor difference of two
+/// tokens can cancel in both.
+unsafe fn long_key(p: *const u8, n: usize) -> u64 {
+    let (mut h, mut g) = (n as u64, n as u64);
+    let mut i = 0;
+    while i < n {
+        let w = (p.add(i) as *const u64).read_unaligned() | FOLD;
+        let m = if n - i >= 8 { u64::MAX } else { (1u64 << (8 * (n - i))) - 1 };
+        h = _mm_crc32_u64(h, w & m);
+        g = (g ^ (w & m)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        i += 8;
+    }
+    h | (g >> 33) << 32 | 1 << 63
+}
+#[inline(always)]
+unsafe fn short_key(p: *const u8, n: usize) -> u64 {
+    // b-112f: `u64::MAX >> (8 * (8 - n))` shifted by 64 for n = 0 (UB-shaped; the hardware masks the count to 0, so the
+    // zeroed entry of an unused id got the key 0x2020..20, not the 0 `term_key` promises); bzhi gives 0 for n = 0.
+    _bzhi_u64((p as *const u64).read_unaligned() | FOLD, 8 * n.min(8) as u32)
+}
+
+/// Four keys and their values in one cache line; v[4] stays NONE, the value of a key the bucket does not hold.
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct Bucket {
+    k: [u64; 4],
+    v: [u32; 5],
+    _p: [u32; 3],
+}
+struct Table {
+    b: Vec<Bucket>,
+    bits: u32,
+}
+impl Table {
+    fn new(bits: u32) -> Table {
+        Table { b: vec![Bucket { k: [0; 4], v: [NONE; 5], _p: [0; 3] }; 1 << bits], bits }
+    }
+    #[inline(always)]
+    fn at(&self, k: u64) -> usize {
+        (mix(k) >> (64 - self.bits)) as usize
+    }
+    fn insert(&mut self, k: u64, v: u32) -> u32 {
+        let (mut i, m) = (self.at(k), self.b.len() - 1);
+        loop {
+            let b = &mut self.b[i];
+            for j in 0..4 {
+                if b.k[j] == k {
+                    return b.v[j];
+                }
+                if b.k[j] == 0 {
+                    b.k[j] = k;
+                    b.v[j] = v;
+                    return v;
+                }
+            }
+            i = (i + 1) & m;
+        }
+    }
+    #[inline(never)]
+    fn slow(&self, k: u64, mut i: usize) -> u32 {
+        let m = self.b.len() - 1;
+        loop {
+            i = (i + 1) & m;
+            let b = &self.b[i];
+            for j in 0..4 {
+                if b.k[j] == k {
+                    return b.v[j];
+                }
+                if b.k[j] == 0 {
+                    return NONE;
+                }
+            }
+        }
+    }
+    /// The value of key k, NONE if absent: one 32-byte compare of the bucket's four keys; only a full bucket that
+    /// does not hold k goes on to the next (`slow`).
+    #[inline(always)]
+    fn find(&self, k: u64) -> u32 {
+        let i = self.at(k);
+        let b = unsafe { self.b.get_unchecked(i) };
+        let eq = unsafe {
+            _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(
+                _mm256_load_si256(b.k.as_ptr() as *const __m256i),
+                _mm256_set1_epi64x(k as i64),
+            ))) as u32
+        };
+        let id = unsafe { *b.v.get_unchecked((eq | 16).trailing_zeros() as usize) };
+        if (eq == 0) & (b.k[3] != 0) {
+            return self.slow(k, i);
+        }
+        id
+    }
+    #[inline(always)]
+    fn prefetch(&self, k: u64) {
+        unsafe { _mm_prefetch(self.b.as_ptr().add(self.at(k)) as *const i8, _MM_HINT_T0) }
+    }
+    /// Replaces every value v by f(v).
+    fn remap(&mut self, f: impl Fn(u32) -> u32) {
+        for b in &mut self.b {
+            (0..4).filter(|&j| b.k[j] != 0).for_each(|j| b.v[j] = f(b.v[j]));
+        }
+    }
+}
+
+/// For 64 bytes at p: bit k of the first mask says byte k is a token byte (spec 2.2: a-z, A-Z, 0-9; unsigned
+/// compares, so no byte from 0x80 matches), bit k of the second that it is the LF.
+#[inline(always)]
+unsafe fn masks(p: *const u8) -> (u64, u64) {
+    let f = |v: __m256i| {
+        let a = _mm256_sub_epi8(_mm256_or_si256(v, _mm256_set1_epi8(0x20)), _mm256_set1_epi8(b'a' as i8));
+        let l = _mm256_cmpeq_epi8(_mm256_min_epu8(a, _mm256_set1_epi8(25)), a);
+        let d = _mm256_sub_epi8(v, _mm256_set1_epi8(b'0' as i8));
+        let g = _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(9)), d);
+        let n = _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'\n' as i8));
+        (_mm256_movemask_epi8(_mm256_or_si256(l, g)) as u32 as u64, _mm256_movemask_epi8(n) as u32 as u64)
+    };
+    let (t0, n0) = f(_mm256_loadu_si256(p as *const __m256i));
+    let (t1, n1) = f(_mm256_loadu_si256(p.add(32) as *const __m256i));
+    (t0 | t1 << 32, n0 | n1 << 32)
+}
+
+/// Writes the keys of the tokens of the document text starting at s to keys[0..], in order, and returns the index
+/// of its LF and the token count. It reads 64-byte blocks and one block ahead, up to 63 bytes past the LF (`Corpus`
+/// keeps that inside the data). A token's length comes from the token mask of its block and the next; a long
+/// token's start goes to `long`, and its CRC key is filled in after the walk. `keys` and `long` hold `cap` entries
+/// (b-112f); a 64-byte block holds at most 32 tokens, so the walk gives up with None, before a block that might not
+/// fit, and `Corpus::doc` runs it again on larger buffers.
+#[inline(always)]
+unsafe fn doc_b(d: &[u8], s: usize, keys: *mut u64, long: *mut u64, cap: usize) -> Option<(usize, usize)> {
+    let p0 = d.as_ptr();
+    let (mut n_tok, mut nlong, mut base, mut carry) = (0usize, 0usize, s, 0u64);
+    let (mut m, mut nl) = masks(p0.add(base));
+    loop {
+        if n_tok + 32 > cap {
+            return None;
+        }
+        let last = nl != 0;
+        let (m2, nl2) = if last { (0, 0) } else { masks(p0.add(base + 64)) };
+        let lim = if last { (1u64 << nl.trailing_zeros()) - 1 } else { u64::MAX };
+        let mut a = m & !((m << 1) | carry) & lim;
+        let m2s = m2 << 1;
+        while a != 0 {
+            let o = a.trailing_zeros();
+            let n = (!((m >> o) | (m2s << (63 - o)))).trailing_zeros();
+            let at = base + o as usize;
+            *keys.add(n_tok) = _bzhi_u64((p0.add(at) as *const u64).read_unaligned() | FOLD, 8 * n.min(8));
+            *long.add(nlong) = (at as u64) << 32 | (n_tok as u64) << 8 | n as u64;
+            nlong += (n > 8) as usize;
+            n_tok += 1;
+            a &= a - 1;
+        }
+        if last {
+            break;
+        }
+        carry = m >> 63;
+        m = m2;
+        nl = nl2;
+        base += 64;
+    }
+    for j in 0..nlong {
+        let x = *long.add(j);
+        *keys.add(((x >> 8) & 0xff_ffff) as usize) = long_key(p0.add((x >> 32) as usize), (x & 0xff) as usize);
+    }
+    Some((base + nl.trailing_zeros() as usize, n_tok))
+}
+
+/// The key of a query term (spec 2.3: 1 to 32 bytes of a-z and 0-9), zero-padded to 32 bytes; 0 for the zeroed
+/// entry of an id no term took (`parse`), which is then left out of the table.
+fn term_key(t: &[u8; MAX_TERM]) -> u64 {
+    let n = t.iter().position(|&b| b == 0).unwrap_or(MAX_TERM);
+    unsafe { if n <= 8 { short_key(t.as_ptr(), n) } else { long_key(t.as_ptr(), n) } }
+}
+
+/// A document's tokens, bounded by spec 2.4: 1 to 999 word units, a unit being a word, a legal phrase of a few words
+/// or a citation of at most 7 tokens (`Fed. R. Civ. P. 12(b)(6)`), with at most one more token (`s`) from its
+/// separator; 16 per unit leaves room for the injected cases. The buffers start at this size and `grow_doc` doubles
+/// them for a longer document (b-112f).
+const MAX_DOC_TOKENS: usize = 999 * 16;
+
+/// docs.txt, and a zero-padded copy of its last lines: the lines whose LF is within 64 bytes of the end of the file
+/// (spec 2.1: it ends right after the last LF), which `doc_b` reads from the copy so its block reads stay inside.
+struct Corpus<'a> {
+    docs: &'a [u8],
+    tail: usize, // the start of the first line read from `pad`
+    pad: Vec<u8>,
+}
+
+impl<'a> Corpus<'a> {
+    fn new(docs: &'a [u8]) -> Self {
+        let tail = docs[..docs.len().saturating_sub(64)].iter().rposition(|&b| b == b'\n').map_or(0, |p| p + 1);
+        let mut pad = docs[tail..].to_vec();
+        pad.resize(pad.len() + 128, 0);
+        Corpus { docs, tail, pad }
+    }
+
+    /// Fills `keys` with the keys of the document whose line starts at i; returns its id, the start of the next line
+    /// and its token count. `keys` (8 entries more than the doc's keys, for the prefetch ahead) and `long` start at
+    /// MAX_DOC_TOKENS and, b-112f, double for a document with more tokens than that: they stay the same length.
+    #[inline(always)]
+    fn doc(&self, i: usize, keys: &mut Vec<u64>, long: &mut Vec<u64>) -> (u32, usize, usize) {
+        let (buf, off) = if i < self.tail { (self.docs, 0) } else { (&self.pad[..], self.tail) };
+        let (id, text) = parse_id(buf, i - off);
+        loop {
+            if let Some((lf, n)) = unsafe { doc_b(buf, text, keys.as_mut_ptr(), long.as_mut_ptr(), keys.len() - 8) } {
+                return (id, lf + 1 + off, n);
+            }
+            grow_doc(keys, long);
+        }
+    }
+}
+
+/// b-112f: doubles the buffers of a document with more tokens than they hold (`doc_b` gave up). Out of line: only a
+/// document of over MAX_DOC_TOKENS tokens, which spec 2.4 does not allow, ever gets here.
+#[cold]
+#[inline(never)]
+fn grow_doc(keys: &mut Vec<u64>, long: &mut Vec<u64>) {
+    keys.resize(keys.len() * 2, 0);
+    long.resize(keys.len(), 0);
+}
+
+/// A table for `n` keys at a load of 1/4 to 1/2 (at least two buckets).
+fn table_bits(n: usize) -> u32 {
+    n.max(4).next_power_of_two().trailing_zeros() - 1
 }
 
 /// Ids are drawn from the shared counter this many at a time, so the workers rarely touch its cache line.
@@ -316,21 +421,21 @@ fn by_term<T: Copy + Default>(n_terms: usize, items: &[(u32, T)]) -> (Vec<u32>, 
 
 /// PHRASE matching by anchor checks (b-8). Each PHRASE line is one pattern and gets one anchor: its term with the
 /// lowest estimated df (the df sample only picks the anchor; a term in no doc has df 0, so a phrase with an absent
-/// term is never even checked). The pass records only a doc's anchor occurrences, each with its byte offset; at the
-/// doc's end each one is a candidate for every pattern anchored there at offset j, confirmed by reading the
-/// pattern's other terms off the doc's bytes around it (b-56).
+/// term is never even checked). The pass records only a doc's anchor occurrences, each with its token index; at the
+/// doc's end each one is a candidate for every pattern anchored there at offset j, confirmed by comparing the
+/// pattern's term keys with the doc's token keys around it (b-112; b-56 read the doc's bytes again).
 /// It replaces an Aho-Corasick automaton whose edge probes, fail walks and output checks were the pass's largest
 /// part (about 0.9-1.1 s of 4.0-4.3 s at 1 worker on seed 1).
 struct PhrasePlan {
-    terms: Vec<u32>,
+    keys: Vec<u64>,        // the patterns' terms' keys, pattern after pattern
     anchor_bits: Vec<u64>, // by term id: the term anchors at least one pattern (tested for every hit)
     anchor_start: Vec<u32>, // by term id, into anchors (CSR)
     anchors: Vec<(u32, u32, u32, u32)>, // (pattern, offset of the anchor in it, its terms' range in `terms`)
 }
 
 impl PhrasePlan {
-    /// Pattern p's terms are `terms[ends[p - 1]..ends[p]]` (from 0 for p = 0).
-    fn new(terms: Vec<u32>, ends: &[u32], n_terms: usize, df: &[u32]) -> Self {
+    /// Pattern p's terms are `terms[ends[p - 1]..ends[p]]` (from 0 for p = 0), and `keys` their keys.
+    fn new(terms: &[u32], keys: Vec<u64>, ends: &[u32], n_terms: usize, df: &[u32]) -> Self {
         let mut anchor_bits = vec![0u64; n_terms.div_ceil(64)];
         let (mut anchors, mut lo) = (Vec::new(), 0);
         for (pi, &hi) in ends.iter().enumerate() {
@@ -342,39 +447,25 @@ impl PhrasePlan {
             lo = hi;
         }
         let (anchor_start, anchors) = by_term(n_terms, &anchors);
-        PhrasePlan { terms, anchor_bits, anchor_start, anchors }
+        PhrasePlan { keys, anchor_bits, anchor_start, anchors }
     }
 
-    /// Calls `f(p)` for each pattern with an anchor occurrence in `hits` (term, byte offset in `doc`) at its anchor
-    /// offset and its other terms around it. `doc` is the doc's text without its LF.
-    ///
-    /// (b-56) Why the bytes decide what the doc's full token sequence did: a token is a maximal run of a-z, A-Z and
-    /// 0-9 and every other byte separates (the TAB before `doc`, the LF after it, bytes from 0x80), so the
-    /// non-empty pieces of doc[at..] split at separators are the doc's own tokens from the anchor on, and those
-    /// of doc[..at] split from the right are the tokens before it in reverse; no phrase spans two docs. A term
-    /// equals a token when its bytes equal the token's up to ASCII case and end there (the term table's own
-    /// test). The per-token sequence push is gone: 36.3 M pushes on seed 1 for 1.1 M anchor hits.
+    /// Calls `f(p)` for each pattern with an anchor occurrence in `hits` (term, token index) at its anchor offset
+    /// and its other terms around it: the doc's keys from the anchor's index - j on equal the pattern's keys.
+    /// Equal keys are equal tokens (`doc_b`), so this is the token sequence's own test; no phrase spans two docs.
     #[inline]
-    fn check(&self, dt: &TermTable, doc: &[u8], hits: &[(usize, usize, u32)], mut f: impl FnMut(u32)) {
-        let sep = |b: &u8| !b.is_ascii_alphanumeric();
-        let is_term = |token: Option<&[u8]>, t: u32| {
-            token.is_some_and(|tk| {
-                let term = &dt.bytes[t as usize].0;
-                term[..tk.len()].eq_ignore_ascii_case(tk) && term.get(tk.len()).unwrap_or(&0) == &0
-            })
-        };
-        for &(t, at, left) in hits {
-            let (from, to) = (self.anchor_start[t] as usize, self.anchor_start[t + 1] as usize);
-            for &(p, j, lo, hi) in &self.anchors[from..to] {
-                let (before, after) = self.terms[lo as usize..hi as usize].split_at(j as usize);
-                // b-98: the doc's token just before the anchor (its term id, NIL if none) must be the pattern's term
-                // before it: one compare skips the pattern before any byte is read (box T 0.216 -> 0.211 s).
-                if before.last().is_some_and(|&b| b != left) {
+    fn check(&self, keys: &[u64], hits: &[(u32, u32)], mut f: impl FnMut(u32)) {
+        for &(t, i) in hits {
+            let (t, i) = (t as usize, i as usize);
+            for &(p, j, lo, hi) in &self.anchors[self.anchor_start[t] as usize..self.anchor_start[t + 1] as usize] {
+                let (j, pattern) = (j as usize, &self.keys[lo as usize..hi as usize]);
+                let Some(at) = i.checked_sub(j) else { continue };
+                // b-98: the doc's token just before the anchor must be the pattern's term before it: one compare
+                // skips the pattern (box T 0.216 -> 0.211 s).
+                if j > 0 && keys[i - 1] != pattern[j - 1] {
                     continue;
                 }
-                let mut fwd = doc[at..].split(sep).filter(|t| !t.is_empty());
-                let mut bwd = doc[..at].rsplit(sep).filter(|t| !t.is_empty());
-                if after.iter().all(|&t| is_term(fwd.next(), t)) && before.iter().rev().all(|&t| is_term(bwd.next(), t)) {
+                if keys.get(at..at + pattern.len()) == Some(pattern) {
                     f(p);
                 }
             }
@@ -411,25 +502,30 @@ fn parse_id(data: &[u8], mut i: usize) -> (u32, usize) {
 const SAMPLE_WINDOWS: usize = 64;
 const SAMPLE_SHARE: usize = 128;
 
-/// Returns the estimated df per term and the number of docs sampled.
-fn estimate_df(docs: &[u8], dict: &TermTable, workers: usize) -> (Vec<u32>, u32) {
-    let (n_terms, window) = (dict.bytes.len(), docs.len() / SAMPLE_SHARE / SAMPLE_WINDOWS);
+/// Returns the estimated df per term (`table` values are term ids) and the number of docs sampled.
+fn estimate_df(corpus: &Corpus, table: &Table, n_terms: usize, workers: usize) -> (Vec<u32>, u32) {
+    let docs = corpus.docs;
+    let window = docs.len() / SAMPLE_SHARE / SAMPLE_WINDOWS;
     // The windows are spread over the workers (window k on worker k % n) and their counts summed: the sample was
     // 15 ms of serial prologue on the box. (b-11)
     let n = workers.clamp(1, SAMPLE_WINDOWS);
     let parts = parallel(n, |w| {
         let (mut df, mut seen, mut stamp) = (vec![0u32; n_terms], vec![0u32; n_terms], 0u32);
+        let (mut keys, mut long) = (vec![0u64; MAX_DOC_TOKENS + 8], vec![0u64; MAX_DOC_TOKENS + 8]);
         for k in (w..SAMPLE_WINDOWS).step_by(n) {
             let mut i = line_start(docs, docs.len() * k / SAMPLE_WINDOWS);
             let stop = (i + window).min(docs.len());
             while i < stop {
                 stamp += 1;
-                i = dict.walk(docs, parse_id(docs, i).1, |_, t| {
-                    if let Some(t) = t.filter(|&t| seen[t as usize] != stamp) {
+                let (_, next, n_tok) = corpus.doc(i, &mut keys, &mut long);
+                for &key in &keys[..n_tok] {
+                    let t = table.find(key);
+                    if t != NONE && seen[t as usize] != stamp {
                         seen[t as usize] = stamp;
                         df[t as usize] += 1;
                     }
-                });
+                }
+                i = next;
             }
         }
         (df, stamp)
@@ -607,21 +703,22 @@ impl ChunkLog {
         }
     }
 
-    /// Records that doc `id` of this chunk contains BOOL term t: no branch on dense or sparse.
+    /// Records a token of doc base + local, by its meta word m (`TOKEN_META`): no branch on dense, sparse, other
+    /// or no term. A dense term sets its bit; anything else sets the dummy row's (its term part is n_dense or more),
+    /// and only a sparse term's log entry is kept. (b-112, the probe's payload: the store always, the count by flag.)
     #[inline(always)]
-    fn hit(&mut self, n_dense: usize, t: usize, id: u32) {
-        let local = id - self.base;
+    fn hit(&mut self, n_dense: usize, m: u32, local: u32) {
+        let t = (m & TERM) as usize;
         self.rows[t.min(n_dense) * ROW + local as usize / 64] |= 1 << (local % 64);
-        let key = (t + 1).saturating_sub(n_dense) as u32;
         if self.n == self.log.len() {
             self.grow();
         }
-        self.log[self.n] = key << LOCAL_BITS | local;
-        self.n += (key != 0) as usize;
+        self.log[self.n] = ((t + 1).wrapping_sub(n_dense) as u32) << LOCAL_BITS | local;
+        self.n += (!(m >> SPARSE_BIT) & 1) as usize;
     }
 
     /// Doubles the log, only while the first chunks size it. Out of line, so the hit stays small enough to be inlined
-    /// into the token walk: inline, the resize made the hit a call per token. (b-68) The pass's instructions fell by
+    /// into the token loop: inline, the resize made the hit a call per token. (b-68) The pass's instructions fell by
     /// 0.85 G (cachegrind, 1 worker, seed 1).
     #[cold]
     #[inline(never)]
@@ -759,40 +856,49 @@ impl FirstIds {
 /// matches in doc order.
 type Shard = (Vec<BoolAcc>, Vec<(u32, u32)>);
 
-fn scan(data: &[u8], dict: &TermTable, phrases: &PhrasePlan, plan: &BoolPlan) -> Shard {
+/// A token's meta word, the value `Table` holds for its key (b-112): the term id in the low 30 bits (TERM),
+/// SPARSE_BIT clear for a sparse BOOL term, ANCHOR_BIT clear for a phrase anchor. NONE, an unknown token, reads as
+/// term TERM with both bits set: no BOOL term and no anchor.
+const SPARSE_BIT: u32 = 30;
+const ANCHOR_BIT: u32 = 31;
+
+fn scan(corpus: &Corpus, from: usize, to: usize, table: &Table, phrases: &PhrasePlan, plan: &BoolPlan) -> Shard {
     let (mut acc, mut matches) = (vec![BoolAcc::default(); plan.slot.len()], Vec::new());
     // Ending a chunk with no hits adds nothing, so the first chunk needs no special case.
     let mut chunk = ChunkLog::new(plan);
-    // The doc's anchor occurrences as (term, byte offset, the term before it); per pattern the last doc id + 1 it was
-    // reported for.
-    let (mut hits, mut pattern_last) = (Vec::new(), vec![0u32; phrases.anchors.len()]);
-    let mut i = 0;
-    while i < data.len() {
-        let (id, text) = parse_id(data, i);
+    // The doc's keys (8 more, so the prefetch 8 keys ahead stays inside), its anchor occurrences as (term, token
+    // index); per pattern the last doc id + 1 it was reported for.
+    let (mut keys, mut long) = (vec![0u64; MAX_DOC_TOKENS + 8], vec![0u64; MAX_DOC_TOKENS + 8]);
+    let (mut hits, mut pattern_last) = (vec![(0u32, 0u32); MAX_DOC_TOKENS], vec![0u32; phrases.anchors.len()]);
+    let mut i = from;
+    while i < to {
+        let (id, next, n) = corpus.doc(i, &mut keys, &mut long);
+        if hits.len() < n {
+            hits.resize(keys.len(), (0, 0)); // b-112f: a document that made `doc` grow its buffers
+        }
         // Ids are dense and ascending through docs.txt (specs/b-index.md), so a chunk, once left, never returns.
         if id / CHUNK * CHUNK != chunk.base {
             chunk.end(plan, &mut acc);
             chunk.base = id / CHUNK * CHUNK;
         }
-        let mut left = NIL; // the previous token's term id in this doc (b-98)
-        i = dict.walk(data, text, |start, hit| {
-            let before = std::mem::replace(&mut left, hit.unwrap_or(NIL));
-            let Some(t) = hit else { return };
-            if phrases.anchor_bits[t as usize / 64] >> (t % 64) & 1 != 0 {
-                hits.push((t as usize, start - text, before));
-            }
-            if (t as usize) < plan.n_bool {
-                chunk.hit(plan.n_dense, t as usize, id);
-            }
-        });
-        // `i - 1` is the doc's LF, so the check reads this doc's text only.
-        phrases.check(dict, &data[text..i - 1], &hits, |p| {
+        let (local, mut n_hits) = (id - chunk.base, 0);
+        for k in 0..n {
+            // k + 8 < n + 8 <= keys.len() and n_hits <= k < n <= hits.len(): inside both buffers.
+            let m = unsafe {
+                table.prefetch(*keys.get_unchecked(k + 8));
+                table.find(*keys.get_unchecked(k))
+            };
+            chunk.hit(plan.n_dense, m, local);
+            unsafe { *hits.get_unchecked_mut(n_hits) = (m & TERM, k as u32) };
+            n_hits += (!(m >> ANCHOR_BIT) & 1) as usize;
+        }
+        phrases.check(&keys[..n], &hits[..n_hits], |p| {
             if pattern_last[p as usize] != id + 1 {
                 pattern_last[p as usize] = id + 1;
                 matches.push((p, id));
             }
         });
-        hits.clear();
+        i = next;
     }
     chunk.end(plan, &mut acc);
     (acc, matches)
@@ -879,7 +985,7 @@ fn main() {
     // (seed 1: 75,747 in 1.76 MB, 2^18 slots), sized from the input as a speed hint only: more terms parse again at
     // twice the slots. The doublings up to there were 4 ms of the VM's 17 ms parse (medians of 21 runs, seed 1). (b-69)
     let mut n_slots = (qtext.len() / 8).next_power_of_two().max(2);
-    let (mut terms, parts) = loop {
+    let (terms, parts) = loop {
         let bytes = Vec::with_capacity(n_slots / 3);
         let mut table = TermTable { slots: vec![0; n_slots], shift: 32 - n_slots.trailing_zeros(), bytes };
         let interner = Interner::new(&mut table);
@@ -905,8 +1011,12 @@ fn main() {
     }
     let n_terms = terms.bytes.len();
 
-    let docs = map_file(&format!("{data_dir}/docs.txt"));
-    let (df, n_sample) = estimate_df(docs, &terms, workers);
+    let corpus = Corpus::new(map_file(&format!("{data_dir}/docs.txt")));
+    // The token table: each term's key, its value the term id until the renumbering below.
+    let keys: Vec<u64> = terms.bytes.iter().map(|b| term_key(&b.0)).collect();
+    let mut table = Table::new(table_bits(n_terms));
+    keys.iter().enumerate().filter(|(_, &k)| k != 0).for_each(|(t, &k)| _ = table.insert(k, t as u32));
+    let (df, n_sample) = estimate_df(&corpus, &table, n_terms, workers);
     // Renumber the terms: BOOL terms first, so a chunk's rows and log keys cover them only (53,444 of 75,747 terms
     // on seed 1), each part by descending sampled df, so the terms most tokens hit have neighbouring ids and their
     // per-term entries and rows share a few hundred KB of cache lines. Only speed depends on the order.
@@ -914,7 +1024,13 @@ fn main() {
     bools.iter().flatten().filter(|&&w| w != NIL).for_each(|&w| in_bool[(w & TERM) as usize] = true);
     let n_bool = in_bool.iter().filter(|&&b| b).count();
     let key: Vec<u64> = (0..n_terms).map(|t| (!in_bool[t] as u64) << 32 | (!df[t]) as u64).collect();
-    let new_id = terms.renumber(&key);
+    let mut order: Vec<usize> = (0..n_terms).collect();
+    order.sort_by_key(|&t| key[t]);
+    let mut new_id = vec![0; n_terms];
+    for (new, &old) in order.iter().enumerate() {
+        new_id[old] = new as u32;
+    }
+    let phrase_keys = phrase_terms.iter().map(|&t| keys[t as usize]).collect();
     let mut df = vec![0; n_terms];
     for (t, &d) in key.iter().enumerate() {
         df[new_id[t] as usize] = !d as u32;
@@ -927,7 +1043,7 @@ fn main() {
     }
     // The two plans are independent: build them on two threads.
     let (plan, phrases) = std::thread::scope(|s| {
-        let phrases = s.spawn(|| PhrasePlan::new(phrase_terms, &phrase_ends, n_terms, &df));
+        let phrases = s.spawn(|| PhrasePlan::new(&phrase_terms, phrase_keys, &phrase_ends, n_terms, &df));
         // Dense: sampled in at least 1/64 of the sampled docs, so a chunk holds about CHUNK / 64 = ROW or more of
         // its docs and a row of ROW words is no larger than its log entries would be. BOOL ids are in descending
         // df, so the dense terms are the first n_dense. (b-68)
@@ -935,10 +1051,18 @@ fn main() {
     let plan = BoolPlan::new(&bools, n_dense, n_bool, &df);
         (plan, phrases.join().unwrap())
     });
+    // Each term's meta word (`SPARSE_BIT`) in place of its old id.
+    table.remap(|old| {
+        let t = new_id[old as usize];
+        let sparse = (plan.n_dense..plan.n_bool).contains(&(t as usize));
+        let anchor = phrases.anchor_bits[t as usize / 64] >> (t % 64) & 1 != 0;
+        t | (!sparse as u32) << SPARSE_BIT | (!anchor as u32) << ANCHOR_BIT
+    });
 
     // The pass: one doc range per worker, cut at line starts.
+    let docs = corpus.docs;
     let cut = |k: usize| line_start(docs, docs.len() * k / workers);
-    let shards = parallel(workers, |k| scan(&docs[cut(k)..cut(k + 1)], &terms, &phrases, &plan));
+    let shards = parallel(workers, |k| scan(&corpus, cut(k), cut(k + 1), &table, &phrases, &plan));
 
     // An answer is count, exact id sum and the smallest ids (spec 4). BOOL answers are by slot.
     let mut bool_results = vec![(0, 0, Vec::new()); bools.len()];
