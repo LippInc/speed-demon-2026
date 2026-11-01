@@ -135,11 +135,10 @@ static inline u64 key_at(const u8 *p, u32 L) {
 
 static inline u32 lookup(u64 k) {
     const __m256i kk = _mm256_set1_epi64x((long long)k);
-    for (u32 b = bucket_of(k);; b = (b + 1) & BMASK) {
-        __m256i e = _mm256_cmpeq_epi64(_mm256_load_si256((const __m256i *)tab[b].key), kk);
-        u32 m = (u32)_mm256_movemask_pd(_mm256_castsi256_pd(e)) | (u32)(tab[b].key[4] == k) << 4;
-        u32 v = tab[b].val[_tzcnt_u32(m) & 7], r = m ? v : NONE;
-        if ((m != 0) | (tab[b].ovf == 0)) return r;   // one branch, taken unless the bucket overflowed
+    for (u32 b = bucket_of(k);; b = (b + 1) & BMASK) {   // all five compares in vectors, so no branch on a hit
+        u32 m = (u32)_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(_mm256_load_si256((const __m256i *)tab[b].key), kk)))
+              | ((u32)_mm_movemask_pd(_mm_castsi128_pd(_mm_cmpeq_epi64(_mm_loadl_epi64((const __m128i *)&tab[b].key[4]), _mm256_castsi256_si128(kk)))) & 1) << 4;
+        if ((tab[b].ovf & (u32)(m == 0)) == 0) return tab[b].val[_tzcnt_u32(m) & 7] | -(u32)(m == 0);   // NONE on a miss
     }
 }
 

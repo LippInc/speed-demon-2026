@@ -13,15 +13,15 @@ Reads `queries.txt` (50,000 BOOL and PHRASE queries) and `docs.txt` (254 MB, one
 
 | Trick | Where |
 |---|---|
-| Only the query terms are indexed. All workers parse the queries at once into one shared table; a new term is claimed with a compare-and-swap, no lock | [`intern`](bindex.c#L146), [`parse`](bindex.c#L205) |
-| A token of up to 8 bytes is its own key (its lowercased bytes as one 64-bit word), built with two masks picked by its length, so a match needs no byte compare. A bucket holds 5 keys and their values in one cache line, and a mark on each bucket a key was probed past ends almost every search at the first bucket, with one predictable branch. The table sits on one 2 MB page | [`key_at`](bindex.c#L125), [`lookup`](bindex.c#L136) |
-| Tokens cut 64 bytes at a time from AVX2 class masks; each token's bucket is prefetched a whole document before its lookup | [`tokenize`](bindex.c#L183), [`scan_part`](bindex.c#L298) |
-| Common terms (in over 1/16 of the sampled documents) get a bitmap row, built 64 documents at a time by 64×64 bit transposes; the rest get sorted 16-bit document lists | [`transpose64`](bindex.c#L278), [`scan_part`](bindex.c#L298) |
-| Term ids renumbered by sampled frequency: common terms first, then rare BOOL terms, then phrase-only terms. Every worker counts one slot range by class, and the counts' prefix sums give each range its first ids, so the renumbering runs on all threads and gives the serial order's ids | [`cls`](bindex.c#L255), [`worker`](bindex.c#L518) |
-| Phrases checked during the scan at each occurrence of their rarest term, against the document's own token ids | [`match_phrases`](bindex.c#L258) |
-| BOOL queries answered per part, strictly left to right, on lists while the result is small and on bitmaps once a common term joins by OR; AND and NOT compare 8-value blocks all to all with SSE4.2, and a short list against a long one binary-searches the long one | [`eval_part`](bindex.c#L424), [`filt`](bindex.c#L366) |
-| Counts by popcount, id sums by bit-sliced popcounts, and only as many ids as the query still lacks | [`emit`](bindex.c#L396) |
-| Each worker merges and formats the queries it parsed; one write per worker's slice | [`finish`](bindex.c#L488) |
+| Only the query terms are indexed. All workers parse the queries at once into one shared table; a new term is claimed with a compare-and-swap, no lock | [`intern`](bindex.c#L145), [`parse`](bindex.c#L204) |
+| A token of up to 8 bytes is its own key (its lowercased bytes as one 64-bit word), built with two masks picked by its length, so a match needs no byte compare. A bucket holds 5 keys and their values in one cache line, and a mark on each bucket a key was probed past ends almost every search at the first bucket. All five keys are compared in vector registers and the value picked without a branch, so the only branch is on that rarely set mark: the compiler had turned the fifth key's compare into a branch, and the hit-or-miss branch after it missed on about one token in four. The table sits on one 2 MB page | [`key_at`](bindex.c#L125), [`lookup`](bindex.c#L136) |
+| Tokens cut 64 bytes at a time from AVX2 class masks; each token's bucket is prefetched a whole document before its lookup | [`tokenize`](bindex.c#L182), [`scan_part`](bindex.c#L297) |
+| Common terms (in over 1/16 of the sampled documents) get a bitmap row, built 64 documents at a time by 64×64 bit transposes; the rest get sorted 16-bit document lists | [`transpose64`](bindex.c#L277), [`scan_part`](bindex.c#L297) |
+| Term ids renumbered by sampled frequency: common terms first, then rare BOOL terms, then phrase-only terms. Every worker counts one slot range by class, and the counts' prefix sums give each range its first ids, so the renumbering runs on all threads and gives the serial order's ids | [`cls`](bindex.c#L254), [`worker`](bindex.c#L517) |
+| Phrases checked during the scan at each occurrence of their rarest term, against the document's own token ids | [`match_phrases`](bindex.c#L257) |
+| BOOL queries answered per part, strictly left to right, on lists while the result is small and on bitmaps once a common term joins by OR; AND and NOT compare 8-value blocks all to all with SSE4.2, and a short list against a long one binary-searches the long one | [`eval_part`](bindex.c#L423), [`filt`](bindex.c#L365) |
+| Counts by popcount, id sums by bit-sliced popcounts, and only as many ids as the query still lacks | [`emit`](bindex.c#L395) |
+| Each worker merges and formats the queries it parsed; one write per worker's slice | [`finish`](bindex.c#L487) |
 
 ## The approach
 
