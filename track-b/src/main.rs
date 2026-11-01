@@ -14,7 +14,10 @@
 use std::arch::x86_64::*;
 use std::fs::File;
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicU32, Ordering::{Acquire, Relaxed, Release}};
+use std::sync::atomic::{
+    AtomicU32,
+    Ordering::{Acquire, Relaxed, Release},
+};
 use std::sync::Mutex;
 
 const NIL: u32 = u32::MAX;
@@ -41,7 +44,6 @@ impl Chunk {
     fn eq_mask(&self, b: u8) -> u32 {
         unsafe { _mm256_movemask_epi8(_mm256_cmpeq_epi8(self.0, _mm256_set1_epi8(b as i8))) as u32 }
     }
-
 }
 
 extern "C" {
@@ -122,7 +124,11 @@ unsafe fn long_key(p: *const u8, n: usize) -> u64 {
     let mut i = 0;
     while i < n {
         let w = (p.add(i) as *const u64).read_unaligned() | FOLD;
-        let m = if n - i >= 8 { u64::MAX } else { (1u64 << (8 * (n - i))) - 1 };
+        let m = if n - i >= 8 {
+            u64::MAX
+        } else {
+            (1u64 << (8 * (n - i))) - 1
+        };
         h = _mm_crc32_u64(h, w & m);
         g = (g ^ (w & m)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         i += 8;
@@ -133,7 +139,8 @@ unsafe fn long_key(p: *const u8, n: usize) -> u64 {
 unsafe fn short_key(p: *const u8, n: usize) -> u64 {
     // b-112f: `u64::MAX >> (8 * (8 - n))` shifted by 64 for n = 0 (UB-shaped; the hardware masks the count to 0, so the
     // zeroed entry of an unused id got the key 0x2020..20, not the 0 `term_key` promises); bzhi gives 0 for n = 0.
-    _bzhi_u64((p as *const u64).read_unaligned() | FOLD, 8 * n.min(8) as u32)
+    let w = (p as *const u64).read_unaligned() | FOLD;
+    _bzhi_u64(w, 8 * n.min(8) as u32)
 }
 
 /// Four keys and their values in one cache line; v[4] stays NONE, the value of a key the bucket does not hold.
@@ -150,7 +157,17 @@ struct Table {
 }
 impl Table {
     fn new(bits: u32) -> Table {
-        Table { b: vec![Bucket { k: [0; 4], v: [NONE; 5], _p: [0; 3] }; 1 << bits], bits }
+        Table {
+            b: vec![
+                Bucket {
+                    k: [0; 4],
+                    v: [NONE; 5],
+                    _p: [0; 3]
+                };
+                1 << bits
+            ],
+            bits,
+        }
     }
     #[inline(always)]
     fn at(&self, k: u64) -> usize {
@@ -214,7 +231,9 @@ impl Table {
     /// Replaces every value v by f(v).
     fn remap(&mut self, f: impl Fn(u32) -> u32) {
         for b in &mut self.b {
-            (0..4).filter(|&j| b.k[j] != 0).for_each(|j| b.v[j] = f(b.v[j]));
+            (0..4)
+                .filter(|&j| b.k[j] != 0)
+                .for_each(|j| b.v[j] = f(b.v[j]));
         }
     }
 }
@@ -224,12 +243,18 @@ impl Table {
 #[inline(always)]
 unsafe fn masks(p: *const u8) -> (u64, u64) {
     let f = |v: __m256i| {
-        let a = _mm256_sub_epi8(_mm256_or_si256(v, _mm256_set1_epi8(0x20)), _mm256_set1_epi8(b'a' as i8));
+        let a = _mm256_sub_epi8(
+            _mm256_or_si256(v, _mm256_set1_epi8(0x20)),
+            _mm256_set1_epi8(b'a' as i8),
+        );
         let l = _mm256_cmpeq_epi8(_mm256_min_epu8(a, _mm256_set1_epi8(25)), a);
         let d = _mm256_sub_epi8(v, _mm256_set1_epi8(b'0' as i8));
         let g = _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(9)), d);
         let n = _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'\n' as i8));
-        (_mm256_movemask_epi8(_mm256_or_si256(l, g)) as u32 as u64, _mm256_movemask_epi8(n) as u32 as u64)
+        (
+            _mm256_movemask_epi8(_mm256_or_si256(l, g)) as u32 as u64,
+            _mm256_movemask_epi8(n) as u32 as u64,
+        )
     };
     let (t0, n0) = f(_mm256_loadu_si256(p as *const __m256i));
     let (t1, n1) = f(_mm256_loadu_si256(p.add(32) as *const __m256i));
@@ -243,7 +268,13 @@ unsafe fn masks(p: *const u8) -> (u64, u64) {
 /// (b-112f); a 64-byte block holds at most 32 tokens, so the walk gives up with None, before a block that might not
 /// fit, and `Corpus::doc` runs it again on larger buffers.
 #[inline(always)]
-unsafe fn doc_b(d: &[u8], s: usize, keys: *mut u64, long: *mut u64, cap: usize) -> Option<(usize, usize)> {
+unsafe fn doc_b(
+    d: &[u8],
+    s: usize,
+    keys: *mut u64,
+    long: *mut u64,
+    cap: usize,
+) -> Option<(usize, usize)> {
     let p0 = d.as_ptr();
     let (mut n_tok, mut nlong, mut base, mut carry) = (0usize, 0usize, s, 0u64);
     let (mut m, mut nl) = masks(p0.add(base));
@@ -252,15 +283,26 @@ unsafe fn doc_b(d: &[u8], s: usize, keys: *mut u64, long: *mut u64, cap: usize) 
             return None;
         }
         let last = nl != 0;
-        let (m2, nl2) = if last { (0, 0) } else { masks(p0.add(base + 64)) };
-        let lim = if last { (1u64 << nl.trailing_zeros()) - 1 } else { u64::MAX };
+        let (m2, nl2) = if last {
+            (0, 0)
+        } else {
+            masks(p0.add(base + 64))
+        };
+        let lim = if last {
+            (1u64 << nl.trailing_zeros()) - 1
+        } else {
+            u64::MAX
+        };
         let mut a = m & !((m << 1) | carry) & lim;
         let m2s = m2 << 1;
         while a != 0 {
             let o = a.trailing_zeros();
             let n = (!((m >> o) | (m2s << (63 - o)))).trailing_zeros();
             let at = base + o as usize;
-            *keys.add(n_tok) = _bzhi_u64((p0.add(at) as *const u64).read_unaligned() | FOLD, 8 * n.min(8));
+            *keys.add(n_tok) = _bzhi_u64(
+                (p0.add(at) as *const u64).read_unaligned() | FOLD,
+                8 * n.min(8),
+            );
             *long.add(nlong) = (at as u64) << 32 | (n_tok as u64) << 8 | n as u64;
             nlong += (n > 8) as usize;
             n_tok += 1;
@@ -276,7 +318,8 @@ unsafe fn doc_b(d: &[u8], s: usize, keys: *mut u64, long: *mut u64, cap: usize) 
     }
     for j in 0..nlong {
         let x = *long.add(j);
-        *keys.add(((x >> 8) & 0xff_ffff) as usize) = long_key(p0.add((x >> 32) as usize), (x & 0xff) as usize);
+        *keys.add(((x >> 8) & 0xff_ffff) as usize) =
+            long_key(p0.add((x >> 32) as usize), (x & 0xff) as usize);
     }
     Some((base + nl.trailing_zeros() as usize, n_tok))
 }
@@ -285,7 +328,13 @@ unsafe fn doc_b(d: &[u8], s: usize, keys: *mut u64, long: *mut u64, cap: usize) 
 /// entry of an id no term took (`parse`), which is then left out of the table.
 fn term_key(t: &[u8; MAX_TERM]) -> u64 {
     let n = t.iter().position(|&b| b == 0).unwrap_or(MAX_TERM);
-    unsafe { if n <= 8 { short_key(t.as_ptr(), n) } else { long_key(t.as_ptr(), n) } }
+    unsafe {
+        if n <= 8 {
+            short_key(t.as_ptr(), n)
+        } else {
+            long_key(t.as_ptr(), n)
+        }
+    }
 }
 
 /// A document's tokens, bounded by spec 2.4: 1 to 999 word units, a unit being a word, a legal phrase of a few words
@@ -304,7 +353,8 @@ struct Corpus<'a> {
 
 impl<'a> Corpus<'a> {
     fn new(docs: &'a [u8]) -> Self {
-        let tail = docs[..docs.len().saturating_sub(64)].iter().rposition(|&b| b == b'\n').map_or(0, |p| p + 1);
+        let d = &docs[..docs.len().saturating_sub(64)];
+        let tail = d.iter().rposition(|&b| b == b'\n').map_or(0, |p| p + 1);
         let mut pad = docs[tail..].to_vec();
         pad.resize(pad.len() + 128, 0);
         Corpus { docs, tail, pad }
@@ -315,10 +365,15 @@ impl<'a> Corpus<'a> {
     /// MAX_DOC_TOKENS and, b-112f, double for a document with more tokens than that: they stay the same length.
     #[inline(always)]
     fn doc(&self, i: usize, keys: &mut Vec<u64>, long: &mut Vec<u64>) -> (u32, usize, usize) {
-        let (buf, off) = if i < self.tail { (self.docs, 0) } else { (&self.pad[..], self.tail) };
+        let (buf, off) = if i < self.tail {
+            (self.docs, 0)
+        } else {
+            (&self.pad[..], self.tail)
+        };
         let (id, text) = parse_id(buf, i - off);
         loop {
-            if let Some((lf, n)) = unsafe { doc_b(buf, text, keys.as_mut_ptr(), long.as_mut_ptr(), keys.len() - 8) } {
+            let (kp, lp, cap) = (keys.as_mut_ptr(), long.as_mut_ptr(), keys.len() - 8);
+            if let Some((lf, n)) = unsafe { doc_b(buf, text, kp, lp, cap) } {
                 return (id, lf + 1 + off, n);
             }
             grow_doc(keys, long);
@@ -364,7 +419,13 @@ impl<'a> Interner<'a> {
         // AtomicU32 has u32's size and alignment; the &mut makes the slots ours for 'a.
         let slots = unsafe { &*(table.slots.as_mut_slice() as *mut [u32] as *const [AtomicU32]) };
         let (shift, cap) = (table.shift, (table.slots.len() / 3) as u32);
-        Interner { slots, shift, bytes: table.bytes.as_mut_ptr(), cap, next: AtomicU32::new(0) }
+        Interner {
+            slots,
+            shift,
+            bytes: table.bytes.as_mut_ptr(),
+            cap,
+            next: AtomicU32::new(0),
+        }
     }
 
     /// The id of `term` (spec 2.3: 1 to 32 bytes), added if new (any id once the table is too small). `ids` are this
@@ -386,13 +447,15 @@ impl<'a> Interner<'a> {
                     return 0;
                 }
                 unsafe { self.bytes.add(id as usize).write(TermBytes(padded)) };
-                if self.slots[i].compare_exchange(0, h & !TERM | id + 1, Release, Relaxed).is_ok() {
+                let (p, e) = (h & !TERM | id + 1, Release);
+                if self.slots[i].compare_exchange(0, p, e, Relaxed).is_ok() {
                     ids.start += 1;
                     return id;
                 }
                 continue; // another worker took the slot: read it again
             }
-            if (s ^ h) & !TERM == 0 && unsafe { &*self.bytes.add((s & TERM) as usize - 1) }.0 == padded {
+            let b = unsafe { &*self.bytes.add((s & TERM) as usize - 1) }.0;
+            if (s ^ h) & !TERM == 0 && b == padded {
                 return (s & TERM) - 1;
             }
             i = (i + 1) & (self.slots.len() - 1);
@@ -403,12 +466,8 @@ impl<'a> Interner<'a> {
 /// Lists of items by term id (CSR): list t is `items[start[t]..start[t + 1]]`, in the order `items` gives them.
 fn by_term<T: Copy + Default>(n_terms: usize, items: &[(u32, T)]) -> (Vec<u32>, Vec<T>) {
     let mut start = vec![0u32; n_terms + 2];
-    for &(t, _) in items {
-        start[t as usize + 2] += 1;
-    }
-    for t in 2..start.len() {
-        start[t] += start[t - 1];
-    }
+    items.iter().for_each(|&(t, _)| start[t as usize + 2] += 1);
+    (2..start.len()).for_each(|t| start[t] += start[t - 1]);
     // start[t + 1] is now where list t begins; filling list t moves it to where list t ends.
     let mut lists = vec![T::default(); items.len()];
     for &(t, x) in items {
@@ -427,7 +486,7 @@ fn by_term<T: Copy + Default>(n_terms: usize, items: &[(u32, T)]) -> (Vec<u32>, 
 /// It replaces an Aho-Corasick automaton whose edge probes, fail walks and output checks were the pass's largest
 /// part (about 0.9-1.1 s of 4.0-4.3 s at 1 worker on seed 1).
 struct PhrasePlan {
-    keys: Vec<u64>,        // the patterns' terms' keys, pattern after pattern
+    keys: Vec<u64>,                     // the patterns' terms' keys, pattern after pattern
     anchor_bits: Vec<u64>, // by term id: the term anchors at least one pattern (tested for every hit)
     anchor_start: Vec<u32>, // by term id, into anchors (CSR)
     anchors: Vec<(u32, u32, u32, u32)>, // (pattern, offset of the anchor in it, its terms' range in `terms`)
@@ -441,13 +500,21 @@ impl PhrasePlan {
         for (pi, &hi) in ends.iter().enumerate() {
             let p = &terms[lo as usize..hi as usize];
             // b-99a: an anchor with a term before it is filtered by that term (b-98), so it may be 8x commoner (T -2 ms).
-            let j = (0..p.len()).min_by_key(|&j| df[p[j] as usize] as u64 * if j == 0 && p.len() > 1 { 8 } else { 1 }).unwrap();
+            let w = if p.len() > 1 { 8 } else { 1 };
+            let j = (0..p.len())
+                .min_by_key(|&j| df[p[j] as usize] as u64 * if j == 0 { w } else { 1 })
+                .unwrap();
             anchor_bits[p[j] as usize / 64] |= 1 << (p[j] % 64);
             anchors.push((p[j], (pi as u32, j as u32, lo, hi)));
             lo = hi;
         }
         let (anchor_start, anchors) = by_term(n_terms, &anchors);
-        PhrasePlan { keys, anchor_bits, anchor_start, anchors }
+        PhrasePlan {
+            keys,
+            anchor_bits,
+            anchor_start,
+            anchors,
+        }
     }
 
     /// Calls `f(p)` for each pattern with an anchor occurrence in `hits` (term, token index) at its anchor offset
@@ -457,7 +524,9 @@ impl PhrasePlan {
     fn check(&self, keys: &[u64], hits: &[(u32, u32)], mut f: impl FnMut(u32)) {
         for &(t, i) in hits {
             let (t, i) = (t as usize, i as usize);
-            for &(p, j, lo, hi) in &self.anchors[self.anchor_start[t] as usize..self.anchor_start[t + 1] as usize] {
+            for &(p, j, lo, hi) in
+                &self.anchors[self.anchor_start[t] as usize..self.anchor_start[t + 1] as usize]
+            {
                 let (j, pattern) = (j as usize, &self.keys[lo as usize..hi as usize]);
                 let Some(at) = i.checked_sub(j) else { continue };
                 // b-98: the doc's token just before the anchor must be the pattern's term before it: one compare
@@ -477,11 +546,13 @@ impl PhrasePlan {
 /// every line ends with LF).
 /// A `from` that is itself a line start returns the next line; both ends of a cut use this, so the ranges still tile.
 fn line_start(data: &[u8], from: usize) -> usize {
-    match data[from..].iter().position(|&b| b == b'\n') {
-        _ if from == 0 => 0,
-        Some(p) => from + p + 1,
-        None => data.len(),
+    if from == 0 {
+        return 0;
     }
+    data[from..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map_or(data.len(), |p| from + p + 1)
 }
 
 /// Reads the decimal doc id that starts the line at `i` (spec 2.1); returns it and the index just past its TAB.
@@ -511,7 +582,8 @@ fn estimate_df(corpus: &Corpus, table: &Table, n_terms: usize, workers: usize) -
     let n = workers.clamp(1, SAMPLE_WINDOWS);
     let parts = parallel(n, |w| {
         let (mut df, mut seen, mut stamp) = (vec![0u32; n_terms], vec![0u32; n_terms], 0u32);
-        let (mut keys, mut long) = (vec![0u64; MAX_DOC_TOKENS + 8], vec![0u64; MAX_DOC_TOKENS + 8]);
+        let mut keys = vec![0u64; MAX_DOC_TOKENS + 8];
+        let mut long = vec![0u64; MAX_DOC_TOKENS + 8];
         for k in (w..SAMPLE_WINDOWS).step_by(n) {
             let mut i = line_start(docs, docs.len() * k / SAMPLE_WINDOWS);
             let stop = (i + window).min(docs.len());
@@ -606,7 +678,10 @@ impl BoolPlan {
         let (mut every_chunk, mut triggers, mut terms) = (Vec::new(), Vec::new(), Vec::new());
         for (qi, q) in queries.iter().enumerate() {
             cover(q, df, &mut terms);
-            let trig = Trigger { query: qi as u32, code: *q };
+            let trig = Trigger {
+                query: qi as u32,
+                code: *q,
+            };
             if terms[0] < n_dense as u32 {
                 every_chunk.push(trig); // sorted: a dense term, if any, comes first
             } else {
@@ -624,7 +699,15 @@ impl BoolPlan {
             trig.query = slot[q];
         }
         let ids = FirstIds::new(queries.len());
-        BoolPlan { n_dense, n_bool, every_chunk, trigger_start, triggers, slot, ids }
+        BoolPlan {
+            n_dense,
+            n_bool,
+            every_chunk,
+            trigger_start,
+            triggers,
+            slot,
+            ids,
+        }
     }
 }
 
@@ -640,7 +723,9 @@ fn fold_chunk(code: &Code, row: impl Fn(u32) -> [u64; ROW]) -> [u64; ROW] {
     let mut r = row(code[0]);
     for &w in code[1..].iter().take_while(|&&w| w != NIL) {
         let (b, (x, y, o)) = (row(w & TERM), OP_MASKS[(w >> OP_SHIFT) as usize]);
-        r.iter_mut().zip(b).for_each(|(r, b)| *r = *r & (b ^ x | y) | b & o);
+        r.iter_mut()
+            .zip(b)
+            .for_each(|(r, b)| *r = *r & (b ^ x | y) | b & o);
     }
     r
 }
@@ -677,8 +762,8 @@ fn record(acc: &mut BoolAcc, ids: &FirstIds, q: usize, base: u32, r: u64) {
 /// window's folds. (b-68) box T 0.250 → 0.238 s.
 struct ChunkLog {
     base: u32,
-    rows: Vec<u64>,  // ROW words per dense term, and a dummy row that every sparse hit ORs into instead
-    log: Vec<u32>,   // log[..n] is this chunk's; the entry at n is written by every hit and kept by a sparse one
+    rows: Vec<u64>, // ROW words per dense term, and a dummy row that every sparse hit ORs into instead
+    log: Vec<u32>, // log[..n] is this chunk's; the entry at n is written by every hit and kept by a sparse one
     n: usize,
     tmp: Vec<u32>,   // the radix sort's other buffer
     count: Vec<u32>, // the radix sort's digit counts
@@ -751,7 +836,11 @@ impl ChunkLog {
         let (mut m, mut prev, mut start) = (0, !log.first().copied().unwrap_or(0), 0);
         for i in 0..n {
             let e = log[i];
-            start = if e >> LOCAL_BITS != prev >> LOCAL_BITS { m } else { start };
+            start = if e >> LOCAL_BITS != prev >> LOCAL_BITS {
+                m
+            } else {
+                start
+            };
             log[m] = e;
             m += (e != prev) as usize;
             self.span[(e >> LOCAL_BITS) as usize] = (start as u64) << 32 | m as u64;
@@ -791,7 +880,10 @@ impl ChunkLog {
             let r = fold_chunk(&trig.code, row);
             // Only the words with a match are recorded, found through a mask of them, not a branch per word.
             // (b-68) The evaluation's mispredicts fell to 21.6 M (cachegrind, 1 worker, seed 1).
-            let mut words = r.iter().enumerate().fold(0u32, |m, (j, &w)| m | ((w != 0) as u32) << j);
+            let mut words = r
+                .iter()
+                .enumerate()
+                .fold(0u32, |m, (j, &w)| m | ((w != 0) as u32) << j);
             while words != 0 {
                 let j = words.trailing_zeros();
                 record(&mut acc[q], &plan.ids, q, self.base + 64 * j, r[j as usize]);
@@ -803,7 +895,9 @@ impl ChunkLog {
         while i < m {
             let key = (log[i] >> LOCAL_BITS) as usize;
             let (from, to) = (plan.trigger_start[key], plan.trigger_start[key + 1]);
-            plan.triggers[from as usize..to as usize].iter().for_each(&mut fold);
+            plan.triggers[from as usize..to as usize]
+                .iter()
+                .for_each(&mut fold);
             i = span[key] as u32 as usize;
         }
         for k in 0..m {
@@ -862,17 +956,21 @@ type Shard = (Vec<BoolAcc>, Vec<(u32, u32)>);
 const SPARSE_BIT: u32 = 30;
 const ANCHOR_BIT: u32 = 31;
 
-fn scan(corpus: &Corpus, from: usize, to: usize, table: &Table, phrases: &PhrasePlan, plan: &BoolPlan) -> Shard {
+fn scan(c: &Corpus, from: usize, to: usize, t: &Table, ph: &PhrasePlan, plan: &BoolPlan) -> Shard {
     let (mut acc, mut matches) = (vec![BoolAcc::default(); plan.slot.len()], Vec::new());
     // Ending a chunk with no hits adds nothing, so the first chunk needs no special case.
     let mut chunk = ChunkLog::new(plan);
     // The doc's keys (8 more, so the prefetch 8 keys ahead stays inside), its anchor occurrences as (term, token
     // index); per pattern the last doc id + 1 it was reported for.
-    let (mut keys, mut long) = (vec![0u64; MAX_DOC_TOKENS + 8], vec![0u64; MAX_DOC_TOKENS + 8]);
-    let (mut hits, mut pattern_last) = (vec![(0u32, 0u32); MAX_DOC_TOKENS], vec![0u32; phrases.anchors.len()]);
+    let (mut keys, mut long) = (
+        vec![0u64; MAX_DOC_TOKENS + 8],
+        vec![0u64; MAX_DOC_TOKENS + 8],
+    );
+    let mut hits = vec![(0u32, 0u32); MAX_DOC_TOKENS];
+    let mut pattern_last = vec![0u32; ph.anchors.len()];
     let mut i = from;
     while i < to {
-        let (id, next, n) = corpus.doc(i, &mut keys, &mut long);
+        let (id, next, n) = c.doc(i, &mut keys, &mut long);
         if hits.len() < n {
             hits.resize(keys.len(), (0, 0)); // b-112f: a document that made `doc` grow its buffers
         }
@@ -885,14 +983,14 @@ fn scan(corpus: &Corpus, from: usize, to: usize, table: &Table, phrases: &Phrase
         for k in 0..n {
             // k + 8 < n + 8 <= keys.len() and n_hits <= k < n <= hits.len(): inside both buffers.
             let m = unsafe {
-                table.prefetch(*keys.get_unchecked(k + 8));
-                table.find(*keys.get_unchecked(k))
+                t.prefetch(*keys.get_unchecked(k + 8));
+                t.find(*keys.get_unchecked(k))
             };
             chunk.hit(plan.n_dense, m, local);
             unsafe { *hits.get_unchecked_mut(n_hits) = (m & TERM, k as u32) };
             n_hits += (!(m >> ANCHOR_BIT) & 1) as usize;
         }
-        phrases.check(&keys[..n], &hits[..n_hits], |p| {
+        ph.check(&keys[..n], &hits[..n_hits], |p| {
             if pattern_last[p as usize] != id + 1 {
                 pattern_last[p as usize] = id + 1;
                 matches.push((p, id));
@@ -949,8 +1047,9 @@ fn parse(text: &[u8], terms: &Interner) -> Parsed {
                     let mut code = [NIL; MAX_BOOL_TERMS];
                     code[0] = intern(words[1]);
                     for (w, pair) in code[1..].iter_mut().zip(words[2..].chunks(2)) {
-                        let op = (pair[0] == b"OR") as u32 * OP_OR + (pair[0] == b"NOT") as u32 * OP_NOT;
-                        *w = op << OP_SHIFT | intern(pair[1]);
+                        let (p0, p1) = (pair[0], pair[1]);
+                        let op = (p0 == b"OR") as u32 * OP_OR + (p0 == b"NOT") as u32 * OP_NOT;
+                        *w = op << OP_SHIFT | intern(p1);
                     }
                     p.bools.push(code);
                     Query::Bool(p.bools.len() - 1)
@@ -987,7 +1086,11 @@ fn main() {
     let mut n_slots = (qtext.len() / 8).next_power_of_two().max(2);
     let (terms, parts) = loop {
         let bytes = Vec::with_capacity(n_slots / 3);
-        let mut table = TermTable { slots: vec![0; n_slots], shift: 32 - n_slots.trailing_zeros(), bytes };
+        let mut table = TermTable {
+            slots: vec![0; n_slots],
+            shift: 32 - n_slots.trailing_zeros(),
+            bytes,
+        };
         let interner = Interner::new(&mut table);
         let parts = parallel(workers, |k| parse(&qtext[cut(k)..cut(k + 1)], &interner));
         let (n, cap) = (interner.next.into_inner(), interner.cap);
@@ -998,7 +1101,8 @@ fn main() {
         n_slots *= 2;
     };
     // The ranges joined in file order, their BOOL and PHRASE numbers moved past the ranges before them.
-    let (mut queries, mut bools, mut phrase_terms, mut phrase_ends) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut queries, mut bools, mut phrase_terms, mut phrase_ends) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for p in parts {
         let (b, ph, t) = (bools.len(), phrase_ends.len(), phrase_terms.len() as u32);
         queries.extend(p.queries.iter().map(|&q| match q {
@@ -1015,15 +1119,24 @@ fn main() {
     // The token table: each term's key, its value the term id until the renumbering below.
     let keys: Vec<u64> = terms.bytes.iter().map(|b| term_key(&b.0)).collect();
     let mut table = Table::new(table_bits(n_terms));
-    keys.iter().enumerate().filter(|(_, &k)| k != 0).for_each(|(t, &k)| _ = table.insert(k, t as u32));
+    keys.iter()
+        .enumerate()
+        .filter(|(_, &k)| k != 0)
+        .for_each(|(t, &k)| _ = table.insert(k, t as u32));
     let (df, n_sample) = estimate_df(&corpus, &table, n_terms, workers);
     // Renumber the terms: BOOL terms first, so a chunk's rows and log keys cover them only (53,444 of 75,747 terms
     // on seed 1), each part by descending sampled df, so the terms most tokens hit have neighbouring ids and their
     // per-term entries and rows share a few hundred KB of cache lines. Only speed depends on the order.
     let mut in_bool = vec![false; n_terms];
-    bools.iter().flatten().filter(|&&w| w != NIL).for_each(|&w| in_bool[(w & TERM) as usize] = true);
+    bools
+        .iter()
+        .flatten()
+        .filter(|&&w| w != NIL)
+        .for_each(|&w| in_bool[(w & TERM) as usize] = true);
     let n_bool = in_bool.iter().filter(|&&b| b).count();
-    let key: Vec<u64> = (0..n_terms).map(|t| (!in_bool[t] as u64) << 32 | (!df[t]) as u64).collect();
+    let key: Vec<u64> = (0..n_terms)
+        .map(|t| (!in_bool[t] as u64) << 32 | (!df[t]) as u64)
+        .collect();
     let mut order: Vec<usize> = (0..n_terms).collect();
     order.sort_by_key(|&t| key[t]);
     let mut new_id = vec![0; n_terms];
@@ -1043,12 +1156,15 @@ fn main() {
     }
     // The two plans are independent: build them on two threads.
     let (plan, phrases) = std::thread::scope(|s| {
-        let phrases = s.spawn(|| PhrasePlan::new(&phrase_terms, phrase_keys, &phrase_ends, n_terms, &df));
+        let phrases =
+            s.spawn(|| PhrasePlan::new(&phrase_terms, phrase_keys, &phrase_ends, n_terms, &df));
         // Dense: sampled in at least 1/64 of the sampled docs, so a chunk holds about CHUNK / 64 = ROW or more of
         // its docs and a row of ROW words is no larger than its log entries would be. BOOL ids are in descending
         // df, so the dense terms are the first n_dense. (b-68)
-    let n_dense = (0..n_bool).take_while(|&t| df[t] > 0 && df[t] as u64 * 64 >= n_sample as u64).count();
-    let plan = BoolPlan::new(&bools, n_dense, n_bool, &df);
+        let n_dense = (0..n_bool)
+            .take_while(|&t| df[t] > 0 && df[t] as u64 * 64 >= n_sample as u64)
+            .count();
+        let plan = BoolPlan::new(&bools, n_dense, n_bool, &df);
         (plan, phrases.join().unwrap())
     });
     // Each term's meta word (`SPARSE_BIT`) in place of its old id.
@@ -1062,7 +1178,9 @@ fn main() {
     // The pass: one doc range per worker, cut at line starts.
     let docs = corpus.docs;
     let cut = |k: usize| line_start(docs, docs.len() * k / workers);
-    let shards = parallel(workers, |k| scan(&corpus, cut(k), cut(k + 1), &table, &phrases, &plan));
+    let shards = parallel(workers, |k| {
+        scan(&corpus, cut(k), cut(k + 1), &table, &phrases, &plan)
+    });
 
     // An answer is count, exact id sum and the smallest ids (spec 4). BOOL answers are by slot.
     let mut bool_results = vec![(0, 0, Vec::new()); bools.len()];
