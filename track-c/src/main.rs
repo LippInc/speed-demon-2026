@@ -10,10 +10,9 @@ mod regions;
 use std::{env, fs::File, io::Write, os::fd::AsRawFd};
 
 /// Integer cents as `-?[0-9]+\.[0-9]{2}`, never `-0.00` (c-join.md:131).
-fn money(cents: i64) -> String {
-    let abs = cents.unsigned_abs();
-    let sign = if cents < 0 { "-" } else { "" };
-    format!("{sign}{}.{:02}", abs / 100, abs % 100)
+fn money(c: i64) -> String {
+    let a = c.unsigned_abs();
+    format!("{}{}.{:02}", if c < 0 { "-" } else { "" }, a / 100, a % 100)
 }
 
 // Read-only file mappings through libc's mmap (std links libc; no crate needed).
@@ -28,17 +27,16 @@ unsafe extern "C" {
 /// last page tail or the reservation, both private and zero; the guard is written there (at most one
 /// page copied, 4 KiB of M). Every scan then stops at the guard, so the parse needs no bounds checks.
 fn map_padded(path: &str) -> &'static [u8] {
-    let file = File::open(path).expect("open input");
-    let len = file.metadata().expect("stat").len() as usize;
+    let f = File::open(path).expect("open input");
+    let len = f.metadata().expect("stat").len() as usize;
     // SAFETY: fresh private mappings: the reservation, then the file over its first `len` bytes.
     unsafe {
         // prot 3 = PROT_READ | PROT_WRITE; flags 2 = MAP_PRIVATE, 0x20 = MAP_ANONYMOUS, 0x10 = MAP_FIXED.
-        let base = mmap(std::ptr::null_mut(), len + 4096, 3, 2 | 0x20, -1, 0);
+        let base = mmap(std::ptr::null_mut(), len + 4096, 3, 0x22, -1, 0);
         // An empty file (outside 2.2, but kit case c14 madv-empty-* feeds one): the zeroed
         // reservation alone is the file's bytes; mmap of length 0 would fail.
         if len != 0 {
-            let at = mmap(base, len, 3, 2 | 0x10, file.as_raw_fd(), 0);
-            assert!(at == base, "mmap failed");
+            assert!(mmap(base, len, 3, 0x12, f.as_raw_fd(), 0) == base);
         }
         (0..records::GUARD).for_each(|k| *base.add(len + k) = b"\",\n"[k % 3]);
         std::slice::from_raw_parts(base, len)
@@ -47,24 +45,21 @@ fn map_padded(path: &str) -> &'static [u8] {
 
 fn main() -> std::io::Result<()> {
     // The board runs it with no arguments; `c-join <data-dir> <out-dir>` is for local runs.
-    let data = env::args().nth(1).unwrap_or("/data".into());
-    let out_dir = env::args().nth(2).unwrap_or("/out".into());
+    let arg = |n, d: &str| env::args().nth(n).unwrap_or(d.into());
+    let (data, out_dir) = (arg(1, "/data"), arg(2, "/out"));
     // SD_WORKERS is rule 30's test-only override (the hash runs force 1, 4, 12, 24); the board never
     // sets it, so the scored run uses 12, the scoring box's hardware threads.
     let workers = env::var("SD_WORKERS").map_or(12, |v| v.parse().unwrap());
 
     // regions.csv is parsed by the workers together at their start (regions::Build).
     let regions = regions::Build::new(map_padded(&format!("{data}/regions.csv")));
-    let (totals, distinct) = pass2::run(
-        map_padded(&format!("{data}/records.csv")),
-        workers,
-        &regions,
-    );
+    let recs = map_padded(&format!("{data}/records.csv"));
+    let (totals, distinct) = pass2::run(recs, workers, &regions);
     let keys = regions.keys();
     // One line per group with records, sorted by key bytewise (c-join.md:127-129): the keys are
     // packed big-endian (regions.rs), with `_UNMATCHED`'s (`_UN`) above every code, so u32 order is
     // bytewise.
-    let mut lines: Vec<usize> = (0..keys.len()).filter(|&g| totals[g].count > 0).collect();
+    let mut lines: Vec<_> = (0..keys.len()).filter(|&g| totals[g].count > 0).collect();
     lines.sort_unstable_by_key(|&g| keys[g]);
     let mut out = Vec::new();
     for g in lines {

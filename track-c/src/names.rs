@@ -61,18 +61,27 @@ impl Name {
     }
 }
 
-/// One cache line of a table's index: eight entries `tag << 32 | id`, filled in order. A tag is the
-/// key's hash with bit 31 set, so an entry is in use exactly when its sign bit is set.
-#[repr(align(64))] struct Bucket([u64; 8]);
+/// One cache line of a table's index: 16 entries `1 << 31 | tag | id`, filled in order. Bit 31 set =
+/// in use; bits `idb..=30` = the key hash's tag bits; bits `0..idb` = the record id. The split is
+/// `Table`'s `idb`, set per index size: the tag takes every bit the ids do not need, and it wants
+/// them — a false tag hit costs a key read from `recs`, a likely cache miss (7 tag bits cost
+/// +3.2 % T in c-84 s1, deb7823).
+#[repr(align(64))] struct Bucket([u32; 16]);
 
-/// One owner's names: an index of 8-entry buckets over a dense array of records
+/// One owner's names: an index of 16-entry buckets over a dense array of records
 /// `(key, groups)`, bit g of the groups set once group g has seen the name (256 bits, regions.rs's
-/// limit). Lookups start at the hash's home bucket and walk on to the next only past a full one;
-/// entries are never moved or deleted, so a key that is there sits before the first free entry of
-/// its walk. The index starts at 2.2's planning pool (100,000 names over the workers, six entries
-/// per bucket at the load limit, pass2) and doubles past 3/4 full, rehashing from the tags alone; a
-/// record keeps its id, so no input size or count ever sizes it (rule 31); grow is the fallback.
-struct Table { index: Box<[Bucket]>, recs: Vec<(u64, [u64; 4])> }
+/// limit). Lookups start at the hash's home bucket and walk on to the next only past a full one
+/// (all 16 entries in use); entries are never moved or deleted, so a key that is there sits before
+/// the first free entry of its walk. Each entry splits its 32 bits at run time as `idb` id bits
+/// below the tag: the index grows once ids reach `12 * len` (3/4 of 16 entries), so `idb` sizes to
+/// the bits of `12 * len - 1` and the tag gets every bit left above it — a wider tag means fewer
+/// false tag hits, and each one costs a key read from `recs` (7 bits cost +3.2 % T in c-84 s1,
+/// deb7823). Tag bits stay >= 1 while `12 * len <= 2^30`, far past any run (a full-size file has
+/// 3,320,000 records, c-join.md 2.4). The index starts at 2.2's planning pool (100,000 names over
+/// the workers, 12 entries per bucket at the load limit, pass2) and doubles past 3/4 full,
+/// rehashing from the keys (the tag no longer holds the hash's home bits); a record keeps its id,
+/// so no input size or count ever sizes it (rule 31); grow is the fallback.
+struct Table { index: Box<[Bucket]>, recs: Vec<(u64, [u64; 4])>, idb: u32 }
 
 impl Table {
     /// A zeroed index of `n` buckets: every entry free.
@@ -82,11 +91,19 @@ impl Table {
     }
 
     fn new(buckets: usize) -> Self {
-        // Sized to the first index's capacity (3/4 of 8 entries per bucket) so the records never double
+        // Sized to the first index's capacity (3/4 of 16 entries per bucket) so the records never double
         // and copy at full size (2.2's planning pool, via pass2's sizing); a larger input still grows both.
-        Table { index: Self::zeros(buckets), recs: Vec::with_capacity(6 * buckets) }
+        // Ids stay below 12 * buckets, so the id field takes the bits of 12 * buckets - 1.
+        let idb = (12 * buckets - 1).ilog2() + 1;
+        Table { index: Self::zeros(buckets), recs: Vec::with_capacity(12 * buckets), idb }
     }
 
+    /// The tag bits of an entry: the hash above the id field (bit 31, the in-use flag, excepted).
+    #[inline(always)]
+    fn tag_mask(&self) -> u32 { 0x7FFF_FFFF & !((1 << self.idb) - 1) }
+
+    /// A hash's home bucket: `log2 len` low bits of `h`, which sit below the id field (`log2 len <
+    /// idb`, sized to `12 * len`), so tag and home bucket use different bits of `h`.
     #[inline(always)]
     fn home(&self, h: u32) -> usize { h as usize & (self.index.len() - 1) }
 
@@ -100,29 +117,36 @@ impl Table {
     /// The groups of the key `key` with hash `h`, inserting it if it is not there.
     #[inline(always)]
     fn groups(&mut self, h: u32, key: u64) -> &mut [u64; 4] {
-        let (tag, mut at) = (h | 1 << 31, self.home(h));
+        let (tag, mask, mut at) = (1 << 31 | h & self.tag_mask(), (1 << self.idb) - 1, self.home(h));
         // SAFETY: AVX2 is on at compile time; `at` stays inside the index; each id in an entry indexes
-        // `recs` (it was its length when the entry went in).
+        // `recs` (it was its length when the entry went in) and fits the id field (insert grows first).
         unsafe {
             let tags = _mm256_set1_epi32(tag as i32);
+            let keep = _mm256_set1_epi32((1 << 31 | self.tag_mask()) as i32);
             loop {
                 let line = self.index.as_ptr().add(at) as *const __m256i;
                 let (lo, hi) = (_mm256_load_si256(line), _mm256_load_si256(line.add(1)));
-                // One bit per 32-bit half; an entry's tag is its upper half, the odd bits.
-                let eq =
-                    |v| _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(v, tags))) as u32;
-                let mut hits = (eq(lo) | eq(hi) << 8) & 0xAAAA;
+                // One bit per entry: the entry's tag bits equal the key's, the in-use bit included (a
+                // free entry is all zero and never matches a tag, whose bit 31 is set).
+                let eq = |v| {
+                    _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(
+                        _mm256_and_si256(v, keep),
+                        tags,
+                    ))) as u32
+                };
+                let mut hits = eq(lo) | eq(hi) << 8;
                 while hits != 0 {
-                    let id = self.index[at].0[hits.trailing_zeros() as usize / 2] as u32 as usize;
+                    let id = (self.index[at].0[hits.trailing_zeros() as usize] & mask) as usize;
                     if self.recs.get_unchecked(id).0 == key {
                         return &mut self.recs.get_unchecked_mut(id).1;
                     }
                     hits &= hits - 1;
                 }
-                let used = _mm256_movemask_pd(_mm256_castsi256_pd(lo))
-                    | _mm256_movemask_pd(_mm256_castsi256_pd(hi)) << 4;
-                if used != 0xFF {
-                    return self.insert(at, used.count_ones() as usize, tag, key);
+                // Each entry's sign bit: in use exactly when set, so 0xFFFF is a full line.
+                let used = _mm256_movemask_ps(_mm256_castsi256_ps(lo)) as u32
+                    | (_mm256_movemask_ps(_mm256_castsi256_ps(hi)) as u32) << 8;
+                if used != 0xFFFF {
+                    return self.insert(at, used.count_ones() as usize, h, key);
                 }
                 at = (at + 1) & (self.index.len() - 1);
             }
@@ -132,33 +156,37 @@ impl Table {
     /// Files a new key in entry `lane` of bucket `at` (its first free one), growing first past 3/4.
     #[cold]
     #[inline(never)]
-    fn insert(&mut self, mut at: usize, mut lane: usize, tag: u32, key: u64) -> &mut [u64; 4] {
+    fn insert(&mut self, mut at: usize, mut lane: usize, h: u32, key: u64) -> &mut [u64; 4] {
         let id = self.recs.len();
-        if 4 * (id + 1) > 3 * 8 * self.index.len() {
+        if 4 * (id + 1) > 3 * 16 * self.index.len() {
             self.grow();
-            (at, lane) = self.free(tag);
+            (at, lane) = self.free(h);
         }
-        self.index[at].0[lane] = (tag as u64) << 32 | id as u64;
+        self.index[at].0[lane] = 1 << 31 | h & self.tag_mask() | id as u32;
         self.recs.push((key, [0; 4]));
         &mut self.recs[id].1
     }
 
-    /// The first free entry on a tag's walk, as (bucket, lane).
-    fn free(&self, tag: u32) -> (usize, usize) {
-        let mut at = self.home(tag);
+    /// The first free entry on a hash's walk, as (bucket, lane).
+    fn free(&self, h: u32) -> (usize, usize) {
+        let mut at = self.home(h);
         loop {
             if let Some(lane) = self.index[at].0.iter().position(|&e| e == 0) { return (at, lane); }
             at = (at + 1) & (self.index.len() - 1);
         }
     }
 
-    /// Doubles the index and refiles every entry by its tag, whose low bits are the hash's.
+    /// Doubles the index and refiles every entry, recomputing its hash from the key: the tag's bits
+    /// above the id field move as the ids widen, and the tag alone no longer knows the home bucket.
     fn grow(&mut self) {
         let bigger = Self::zeros(2 * self.index.len());
         let old = std::mem::replace(&mut self.index, bigger);
+        let mask = (1 << self.idb) - 1;
+        self.idb += 1;
         for &e in old.iter().flat_map(|b| &b.0).filter(|&&e| e != 0) {
-            let (at, lane) = self.free((e >> 32) as u32);
-            self.index[at].0[lane] = e;
+            let h = crc(self.recs[(e & mask) as usize].0);
+            let (at, lane) = self.free(h);
+            self.index[at].0[lane] = 1 << 31 | h & self.tag_mask() | e & mask;
         }
     }
 }

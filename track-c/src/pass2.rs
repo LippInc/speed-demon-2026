@@ -142,8 +142,8 @@ pub fn run(b: &[u8], workers: usize, regions: &Build) -> Totals {
     let start = |k: usize| record_start(b, (k * CHUNK).min(b.len()));
     let boxes: Vec<Mutex<Mailbox>> = (0..workers).map(|_| Mutex::default()).collect();
     // Each owner's first index holds 2.2's planning pool (100,000 names) split over the workers at
-    // its load limit (6 of 8 entries per bucket), rounded up to a power of two (the index masks).
-    let idx = (100_000 / workers / 6).next_power_of_two();
+    // its load limit (12 of 16 entries per bucket), rounded up to a power of two (the index masks).
+    let idx = (100_000 / workers / 12).next_power_of_two();
     let owners: Vec<Mutex<Owner>> = (0..workers).map(|_| Mutex::new(Owner::new(idx))).collect();
     let totals = Mutex::new((vec![Slot::new(); 256], vec![0; 256]));
     let (next, flushed) = (AtomicUsize::new(0), AtomicUsize::new(0));
