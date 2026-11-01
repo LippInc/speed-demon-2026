@@ -17,11 +17,11 @@ Reads `queries.txt` (50,000 BOOL and PHRASE queries) and `docs.txt` (254 MB, one
 | A token of up to 8 bytes is its own key (its lowercased bytes as one 64-bit word), built with two masks picked by its length, so a match needs no byte compare. A bucket holds 5 keys and their values in one cache line, and a mark on each bucket a key was probed past ends almost every search at the first bucket, with one predictable branch. The table sits on one 2 MB page | [`key_at`](bindex.c#L125), [`lookup`](bindex.c#L136) |
 | Tokens cut 64 bytes at a time from AVX2 class masks; each token's bucket is prefetched a whole document before its lookup | [`tokenize`](bindex.c#L183), [`scan_part`](bindex.c#L298) |
 | Common terms (in over 1/16 of the sampled documents) get a bitmap row, built 64 documents at a time by 64×64 bit transposes; the rest get sorted 16-bit document lists | [`transpose64`](bindex.c#L278), [`scan_part`](bindex.c#L298) |
-| Term ids renumbered by sampled frequency: common terms first, then rare BOOL terms, then phrase-only terms. Every worker counts one slot range by class, and the counts' prefix sums give each range its first ids, so the renumbering runs on all threads and gives the serial order's ids | [`cls`](bindex.c#L255), [`worker`](bindex.c#L507) |
+| Term ids renumbered by sampled frequency: common terms first, then rare BOOL terms, then phrase-only terms. Every worker counts one slot range by class, and the counts' prefix sums give each range its first ids, so the renumbering runs on all threads and gives the serial order's ids | [`cls`](bindex.c#L255), [`worker`](bindex.c#L518) |
 | Phrases checked during the scan at each occurrence of their rarest term, against the document's own token ids | [`match_phrases`](bindex.c#L258) |
-| BOOL queries answered per part, strictly left to right, on lists while the result is small and on bitmaps once a common term joins by OR; a short list against a long one binary-searches the long one | [`eval_part`](bindex.c#L413), [`isect`](bindex.c#L358) |
-| Counts by popcount, id sums by bit-sliced popcounts, and only as many ids as the query still lacks | [`emit`](bindex.c#L385) |
-| Each worker merges and formats the queries it parsed; one write per worker's slice | [`finish`](bindex.c#L477) |
+| BOOL queries answered per part, strictly left to right, on lists while the result is small and on bitmaps once a common term joins by OR; AND and NOT compare 8-value blocks all to all with SSE4.2, and a short list against a long one binary-searches the long one | [`eval_part`](bindex.c#L424), [`filt`](bindex.c#L366) |
+| Counts by popcount, id sums by bit-sliced popcounts, and only as many ids as the query still lacks | [`emit`](bindex.c#L396) |
+| Each worker merges and formats the queries it parsed; one write per worker's slice | [`finish`](bindex.c#L488) |
 
 ## The approach
 
@@ -50,7 +50,7 @@ None. The C standard library and POSIX threads, linked statically. Built by the 
 
 Per token on one thread (box, 2.5 GHz): tokenize about 14 cycles, lookup 16, the branch-free pass 12, count and scatter 5, answering 18.
 
-- **The answer phase.** The list merges are its biggest share (`unite` 9 %, `isect` 8.5 % of cycles). Most folds are over short lists; merging them with SIMD compares instead of one element per step is next.
+- **The answer phase.** AND and NOT now compare 8-value blocks with SSE4.2 (b-103). OR as a min/max merge network gained 1 ms for 34 more lines, under the 0.05 ms a line costs in the score, so it is not in. Each part still answers every BOOL query; answering a worker's three parts at once would cut that fixed cost, but needs the memory the parts save.
 - **The lookup.** One bucket line per token, prefetched a document ahead. A smaller table for the hot short tokens would keep it in L1.
 - **The rare-term lists.** Counting and scattering the scan's stream into per-term lists is about a fifth of the scan's cycles, from random writes into 53,000 counters. Splitting the stream by term range first would keep each range's counters in L1.
 

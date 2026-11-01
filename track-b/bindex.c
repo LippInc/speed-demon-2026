@@ -354,13 +354,33 @@ static inline u32 lower(const u16 *p, u32 n, u16 x) {
     for (; n > 1; n -= n / 2) b += b[n / 2] < x ? n / 2 : 0;
     return (u32)(b - p) + (*b < x);
 }
-// a short list against a long one binary-searches the long one
-static u32 isect(const u16 *a, u32 an, const u16 *b, u32 bn, u16 *d) {
-    if (an > bn) { const u16 *t = a; a = b; b = t; u32 tn = an; an = bn; bn = tn; }
-    u32 i = 0, j = 0, n = 0;
+// tbl[m]: the shuffle that packs the 16-bit lanes set in m to the front
+static u8 tbl[256][16];
+static inline __m128i ld128(const void *p) { return _mm_loadu_si128((const __m128i *)p); }
+
+// AND (keep 1) or NOT (keep 0) of sorted lists. 8-value blocks are compared all
+// to all (SSE4.2); an a block collects its matches over every b block it meets
+// and is written once its last value <= b's last, so no later b can match it.
+// The tail restarts at the b block where the unwritten a block began. A short
+// list against a long one binary-searches the long one.
+static u32 filt(const u16 *a, u32 an, const u16 *b, u32 bn, u16 *d, u32 keep) {
+    if (keep && an > bn) { const u16 *t = a; a = b; b = t; u32 tn = an; an = bn; bn = tn; }
+    u32 i = 0, j = 0, n = 0, acc = 0, j0 = 0;
     if (an * 16 < bn)
-        for (; i < an; i++) { j += lower(b + j, bn - j, a[i]); d[n] = a[i]; n += j < bn && b[j] == a[i]; }
-    while (i < an && j < bn) { u16 x = a[i], y = b[j]; d[n] = x; n += x == y; i += x <= y; j += y <= x; }
+        for (; i < an; i++) { j += lower(b + j, bn - j, a[i]); d[n] = a[i]; n += (j < bn && b[j] == a[i]) == keep; }
+    for (; i + 8 <= an && j + 8 <= bn; j0 = acc ? j0 : j) {
+        __m128i A = ld128(a + i);
+        u32 x = a[i + 7], y = b[j + 7];
+        acc |= (u32)_mm_cvtsi128_si32(_mm_cmpestrm(ld128(b + j), 8, A, 8, _SIDD_UWORD_OPS | _SIDD_CMP_EQUAL_ANY));
+        if (x <= y) {
+            u32 m = (acc ^ (keep - 1)) & 0xFF;
+            _mm_storeu_si128((__m128i *)(d + n), _mm_shuffle_epi8(A, ld128(tbl[m])));
+            n += (u32)_mm_popcnt_u32(m); i += 8; acc = 0;
+        }
+        j += y <= x ? 8 : 0;
+    }
+    for (j = j0 < j ? j0 : j; i < an && j < bn;) { u16 x = a[i], y = b[j]; d[n] = x; n += keep ? x == y : x < y; i += x <= y; j += y <= x; }
+    while (!keep && i < an) d[n++] = a[i++];
     return n;
 }
 static u32 unite(const u16 *a, u32 an, const u16 *b, u32 bn, u16 *d) {
@@ -370,15 +390,6 @@ static u32 unite(const u16 *a, u32 an, const u16 *b, u32 bn, u16 *d) {
     while (j < bn) d[n++] = b[j++];
     return n;
 }
-static u32 minus(const u16 *a, u32 an, const u16 *b, u32 bn, u16 *d) {
-    u32 i = 0, j = 0, n = 0;
-    if (an * 16 < bn)
-        for (; i < an; i++) { j += lower(b + j, bn - j, a[i]); d[n] = a[i]; n += !(j < bn && b[j] == a[i]); }
-    while (i < an && j < bn) { u16 x = a[i], y = b[j]; d[n] = x; n += x < y; i += x <= y; j += y <= x; }
-    while (i < an) d[n++] = a[i++];
-    return n;
-}
-
 // Record for a query that matched in the part: q | nid << 24, count, the sum of
 // the docs' part-local numbers, then the smallest of those numbers as u16s, as
 // many as the worker still lacks.
@@ -447,7 +458,7 @@ static void eval_part(Worker *me, int p) {
             const u16 *xl = post + off[x - ND];
             u32 xn = end[x - ND] - off[x - ND];
             if (!rb) {
-                rn = o == AND ? isect(rl, rn, xl, xn, dl) : o == OR ? unite(rl, rn, xl, xn, dl) : minus(rl, rn, xl, xn, dl);
+                rn = o == OR ? unite(rl, rn, xl, xn, dl) : filt(rl, rn, xl, xn, dl, o == AND);
                 rl = dl;
             } else if (o == AND) {
                 for (u32 k = 0; k < xn; k++) { dl[m] = xl[k]; m += bit(rb, xl[k]); }
@@ -569,7 +580,7 @@ static void *worker(void *arg) {
         u8 *h = me->heap = pass ? arena(me->hsize) : NULL;
         me->bm = take(&h, ((size_t)ndense + 2) * W64 * 8);
         me->bt = take(&h, 64 * (ndense / 64 + 1) * 8); me->dm = take(&h, (ndense / 64 + 2) * 32);
-        me->la = take(&h, maxnd * 2); me->lb = take(&h, maxnd * 2);
+        me->la = take(&h, maxnd * 2 + 64); me->lb = take(&h, maxnd * 2 + 64);
         me->off = take(&h, nsparse * 4); me->end = take(&h, nsparse * 4); me->docoff = take(&h, maxnd * 4 + 4);
         me->stream = take(&h, maxb); me->post = take(&h, maxb + nsparse * 2);   // a token takes two bytes of text
         me->hsize = (size_t)(h - me->heap);
@@ -631,6 +642,8 @@ int main(int argc, char **argv) {
         pfirst[p] = o < dlen ? id_at(doc + o) : ndocs;
         if (p && pfirst[p] - pfirst[p - 1] > MAXPART) die("a part holds over 32,768 documents");
     }
+    for (u32 m = 0; m < 256; m++)
+        for (u32 l = 0, k = 0; l < 8; l++) if (m >> l & 1) tbl[m][2 * k] = (u8)(2 * l), tbl[m][2 * k++ + 1] = (u8)(2 * l + 1);
     pthread_barrier_init(&bar, NULL, (unsigned)nw);
     pthread_t th[WMAX];
     for (int w = 1; w < nw; w++) pthread_create(&th[w], NULL, worker, (void *)(long)w);
