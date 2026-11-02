@@ -427,16 +427,7 @@ The plan's core choices (KNOWN = the known-best technique's version, OURS = our 
 - 3, free the latencies before the output and never hold a full copy of `summary.txt` (OURS): held in aim, but the in-place mapped writer was never built. Each hour's records are freed as soon as they are placed, and its lines go out in output order as the hour finishes; a-55 pipeline finishes hours early behind a 2-hour watermark of the registered prefix (a-3, a-4, a-29, a-55).
 
 Rejected:
-a-2 (OURS): a two-pass counting sort into one flat latency array; K 14.63 against a-1's K 15.46: the second pass cost as much as the one-thread tail it removed.
-a-7 (KNOWN): batched prefetching of the table slots, groups and chunk writes (batch 4, 8 and 16); no variant beat a-6 on our test machine, so nothing was pushed for it.
-a-8 (KNOWN): a cheaper hash, a 16-byte endpoint prefix in each slot, and a 32-byte vector compare; none beat a-6; cachegrind placed the lookup's cost in branch mispredictions of the linear probe.
-a-14 (OURS): four ranges per worker, each thread's own range first and the rest claimed from a shared counter; K 28.24 (official; fresh 29.61) against a-13's K 30.17-30.36 (M 24.1MB): each thread's tables spanned more hours, so memory and the merge grew, and the balance did not win the time back.
-a-15 (OURS): the per-hour exact latency layout; K 30.47 (official; fresh 30.66), and 30.45 on a second reading, against a-13's 30.17-30.36: inside the spread. It saved 1.4 MB for 55 more lines and ran twice as slow on a shuffled file, so a-13 stayed the base.
-a-16 (KNOWN): one 64-byte block load for both the LF and '/' masks, and a 16-wide tag-group probe (SwissTable style) for the endpoint table; both raised instructions per line (651 -> 685 and 671) and neither lowered the scan time.
-a-18 (OURS): latency chunks that double from 3 to 24 slots instead of 3 then 15; the box read K 31.40 (official; fresh 31.58), below a-17's K 31.83-32.44 and above its M 24.9-25.3MB: the test machine's 1 MB cut did not reach the box.
-a-22 (OURS): the endpoint hit confirmed by four masked 32-byte compares instead of memcmp, and the LF found in two 32-byte windows per turn; the box read K 31.85 / 32.41, inside a-21's spread, with 32 more lines: no box gain.
-a-23 (OURS): the tail's references placed by dense rank into per-rank linked lists instead of a comparison sort; on a-21's code the box read K 32.19 (the lower; fresh 32.87, M 26.9MB), inside a-21's K 32.09-32.58, so it was not merged.
-a-25 (OURS): the worker count capped at 6, 8 and 10 threads; the box read K 30.16 (6 workers), 29.30 (8) and 31.44 (10), against 12 workers' K 32.09-32.53: fewer workers saved 2-4 MB and cost 3-10 ms, so all available CPUs stayed.
+(a-2, a-7, a-8, a-14, a-15, a-16, a-18, a-22, a-23, a-25: in the notes above, with their numbers.)
 a-31 (OURS): the endpoint confirm by length and four 8-byte key words kept per id, and a hash from two independent multiplies; T level (30-31 ms), S +15: K 37.47-38.16 against a-29's 38.29-38.55. The lookup's hash and confirm are not what the scan waits on.
 a-32 (OURS): small groups ranked by counting with AVX2 compares in the percentile select; K 38.43 (official) / 38.52 (fresh), T 29-30 ms, S +36: inside a-29's spread.
 a-34 (KNOWN): a-34a found each 1 KiB's line ends from 64-byte LF bitmasks and walked the lines from that list; a-34b kept each hour's request and 5xx counts side by side; K 37.11-37.55 against a-29's 38.29-38.55 at S 367. T level, 46 more lines: the LF search is not what the scan waits on either.

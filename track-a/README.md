@@ -6,10 +6,16 @@ Reads 3,100,000 HTTP request log lines and, for every hour and endpoint that saw
 
 - **The code:** one file, [src/main.rs](src/main.rs), Rust with the standard library only: 397 code lines, 401 with the Dockerfile's 4 (S). Its top comment describes the pipeline, and each function's comment says why it is shaped the way it is.
 - **The result:** 32.05 s → 15.5 ms (about 2,050×), 228 MB → 15.1 MB. The best board run of this code, run-cf37373cc5d6: T 15.52 ms, M 15.10 MB (14.40 MiB), S 401, D 1, K 58.20. Its other board runs read T 15.65 to 18.17 ms.
-- **Box against board:** on our copy of the scoring box (same CPU, 12 workers, a fresh tmpfs /out per run, interleaved rounds) this code reads T 14.16 ms and a peak of 13.72 MiB on average, 14.54 MiB at most over 40 runs. Its fastest round reads 14.02 ms and its medians stay at 14.16 to 14.21 ms. We see nothing else on the board's machine, so we read the board's higher and wider T as other work there, without proof. What supports it: beside one busy process the box reads 15.95 ms.
-- **Other seeds:** seeds 52719364, 248057911 and 7 at full scale match the reference's hash on 9 of 9 runs each, at T 13.97 to 14.26 ms, with no redo. A shuffled full file, which forces the redo, takes 19.2 to 19.6 ms, hash 9 of 9.
+- **Box against board:** our copy of the scoring box (same CPU, 12 workers, a fresh tmpfs /out per run, interleaved rounds) reads lower and tighter than the board; its readings are in the table below. We see nothing else on the board's machine, so we read the board's higher and wider T as other work there, without proof. What supports it: beside one busy process the box itself slows down.
 - **Where each criterion's evidence is:** code quality in main.rs's comments; technique in the table below, each trick linked to its lines and its PERF step; the optimisation log in [PERF.md](PERF.md), with the board runs in its table and every failed experiment with its numbers.
 - **Terms:** T is the run time, M the peak memory (MB is 10^6 bytes, MiB 2^20), S the code lines after rustfmt, D 1 plus the declared dependencies (ours is 1: none); K, the speed score, grows as each falls against the reference. The board is the organisers' live leaderboard; the box is our bench machine. KNOWN marks a technique from published work or a public entry, written here as our own code; OURS marks one worked out here.
+
+| Box reading of this code | T | Peak | Hash against the reference |
+|---|---|---|---|
+| Seed 1, 21 interleaved rounds | 14.16 ms (fastest round 14.02) | mean 13.72 MiB, highest of 40 14.54 | ok on every round |
+| Seeds 52719364, 248057911, 7 at full scale, no redo | 13.97, 13.98, 14.26 ms | 13.00 to 14.20 MiB | 9 of 9 each |
+| Seed 1's lines shuffled, which forces the redo | 19.2 to 19.6 ms | - | 9 of 9 |
+| Seed 1 beside one busy process | 15.95 ms | - | ok on every round |
 
 Reproduce with seed 1's full data in `<data>`, then compare the hash with the full seed-1 output hash in the [spec](https://github.com/hackathon-raptors/speed-demon-2026/blob/main/specs/a-ingest.md):
 `docker build -t a track-a && docker run --rm --network=none -v <data>:/data:ro -v <out>:/out a && sha256sum <out>/summary.txt`
