@@ -10,7 +10,7 @@
 //     always followed by a lowercase letter or a quote, and a record's
 //     terminating LF by a digit, a BOM or the end of the file (spec 2.2).
 //     So pass 1, the only pass that reads every byte, lists every record's
-//     end with three AVX2 compares per byte, and a thread finds its piece's
+//     end with three AVX2 compares per 32 bytes, and a thread finds its piece's
 //     first record without reading anything before it.
 //  3. Pass 2 reads each record's fields from both ends. The region and the
 //     amount follow the last two commas, which the 32 bytes before the end
@@ -77,7 +77,7 @@ typedef struct { // a thread's part of records.csv, parsed in two passes
 } Scan;
 typedef struct { // one owner's names
   u64 *slot, mask, n; // 4-slot buckets (mask: their number - 1), see find()
-  uint16_t *lo;       // id -> its message's bits 8-23, to refile on grow
+  uint16_t *lo;       // id -> message bits 8-23 (grow needs 8-19)
   u64 (*row)[4];      // id -> a bit per country
 } Names;
 

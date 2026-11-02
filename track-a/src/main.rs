@@ -73,12 +73,12 @@ unsafe fn line(d: *const u8, p: usize) -> (usize, usize, u64, u32, usize) {
     let n = other.trailing_zeros() as usize / 8;
     let (latency, next) = if other == 0 {
         // 8 digits or more (spec 2: at most 10): the rest one by one.
-        let (mut latency, mut at) = (digits8(v), sp + 13);
-        while *d.add(at) != b'\n' {
-            latency = latency * 10 + (*d.add(at) - b'0') as u64;
-            at += 1;
+        let (mut latency, mut q) = (digits8(v), sp + 13);
+        while *d.add(q) != b'\n' {
+            latency = latency * 10 + (*d.add(q) - b'0') as u64;
+            q += 1;
         }
-        (latency, at + 1)
+        (latency, q + 1)
     } else {
         (digits8(v << (64 - 8 * n)), sp + 6 + n)
     };
@@ -89,7 +89,8 @@ unsafe fn line(d: *const u8, p: usize) -> (usize, usize, u64, u32, usize) {
 /// A 64-bit hash of the whole len-byte endpoint at p: its first and last 32 bytes, each cut to the endpoint, and from 65
 /// bytes on the two loads over its middle (spec 2: at most 125 bytes, so four loads cover it), mixed by AES rounds that
 /// work on both 16-byte halves at once, the length a round key. Two rounds follow the last input, which spreads every
-/// input bit over the whole half. Safety: p - 32..p + 128 must be readable.
+/// input bit over the whole half. Safety: p - 32..p + 128 must be readable. It is: an endpoint starts at byte 32 or later
+/// (a 27-byte timestamp, a method of 3 to 7 bytes, two spaces; spec 2), and the mapping has 4 KiB of zeros after the input.
 #[inline(always)]
 unsafe fn ep_hash(p: *const u8, len: usize) -> u64 {
     let load = |at: *const u8| _mm256_loadu_si256(at as _);
@@ -380,9 +381,8 @@ impl Job<'_> {
     fn finish(&self, h: usize) -> &'static [u8] {
         let (order, names) = self.order();
         let claimed = self.claimed[h].load(Relaxed);
-        // Safety: the region is stride rows; its rows are all written (their blocks are registered; a late line is the
-        // exception that makes main redo the run) and no other thread
-        // touches it until it goes to the pool.
+        // Safety: the region is stride rows; its rows are all written (their blocks are registered) and no other thread
+        // touches it until it goes to the pool. A late line is the exception, and main then redoes the run.
         let region = unsafe { from_raw_parts_mut(self.region(h), self.stride) };
         let (head, values) = region.split_at_mut(claimed.max(SPARE));
         let mut long = take(&mut *self.long[h].lock().unwrap());
@@ -547,7 +547,7 @@ fn main() {
     unsafe { madvise(room, len, 3) };
     let data: &'static [u8] = unsafe { from_raw_parts(room, len) };
 
-    // Worker count. SD_WORKERS is a test-only override (rule 30: the hash runs force 1, 4, 12 and 24);
+    // Worker count. SD_WORKERS is a test-only override (our hash checks run 1, 4, 12 and 24 workers);
     // the board never sets it, so the scored run sizes itself from the CPUs it may use.
     let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
     let var = std::env::var("SD_WORKERS").unwrap_or_default();

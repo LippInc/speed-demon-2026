@@ -157,7 +157,7 @@ static u32 intern(u64 k) {                     // called by all workers at once
 // ---------------------------------------------------------------- tokenizer
 #define LOADU(p) _mm256_loadu_si256((const __m256i *)(p))
 static inline u64 tm(const u8 *q) {            // token bytes of q[0..64): 0-9, a-z, A-Z
-    u64 m = 0;
+    u64 m = 0;   // unsigned range tests: x - '0' <= 9 is a digit, (x | 32) - 'a' <= 25 a letter
     for (int h = 0; h < 2; h++) {
         __m256i v = LOADU(q + 32 * h), d = _mm256_sub_epi8(v, _mm256_set1_epi8('0'));
         __m256i a = _mm256_sub_epi8(_mm256_or_si256(v, _mm256_set1_epi8(32)), _mm256_set1_epi8('a'));
@@ -196,6 +196,7 @@ static const u8 *tokenize(const u8 *q, u64 *keys, u32 *pn) {
         carry = mm >> 63; m = m2; lf = lf2;
     }
 }
+// A docs.txt line is its id, a TAB and the text; ids run 0 to N-1 in file order (spec).
 static inline const u8 *skip_id(const u8 *q) { while (*q != '\t') q++; return q + 1; }
 
 // ---------------------------------------------------------------- queries
@@ -207,7 +208,7 @@ static void parse(const u8 *p, const u8 *e, u32 q) {
         u32 k = 0;
         for (;;) {
             u32 L = (u32)_tzcnt_u64(~tm(p)), s = intern(key_at(p, L));
-            qterm[8 * q + k++] = s;
+            qterm[8 * q + k++] = s;            // the spec caps a query at 8 terms
             if (!ph) __atomic_store_n(&bflag[s], 1, __ATOMIC_RELAXED);
             p += L;
             if (*p != ' ') break;
