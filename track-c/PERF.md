@@ -8,7 +8,7 @@ The final code is v65. It reads records.csv once per record with no pass 1, keep
 
 ## Where it stands
 
-Rows v56 to v62 have no run ID at hand and are identified by their commit.
+The reads of v56 and v59 to v62 are listed under the table by commit: our saved board reads hold no run ID for them.
 
 | Version | Commit | Board run | T | M | S | K |
 |---|---|---|---|---|---|---|
@@ -16,15 +16,16 @@ Rows v56 to v62 have no run ID at hand and are identified by their commit.
 | join.c v49 | 4e793b1 | run-be7fc43b744a | 21.31 ms | 10.51 MB | 417 | 43.27 |
 | join.c v49 | 8442d94 | run-5e3b2bc95cec | 21.16 ms | 9.89 MB | 417 | 43.97 |
 | join.c v53 (v49's code, waits that sleep) | 55c6a91 | run-739c6cea137d (a busy board) | 27.31 ms | 10.27 MB | 418 | 38.39 |
-| v56 | db1bb02 | - | - | - | - | 47.82 |
-| v59 | - | - | 16.48 ms | 7.92 MB | 392 | 52.56 |
-| v60 | 78587c9 | - | 16.23 ms | 7.89 MB | 394 | 52.96 |
-| v61 | 73fcc4e | - | 16.17 ms | 10.24 MB (spike, section 6) | 369 | 50.88 |
-| v62 | 6ca940a | - | 15.53 ms | 8.01 MB | 371 | 54.48 |
 | v63 | a2b2bdd | run-a5c4d0536268 | 14.754 ms | 7.80 MB | 377 | 56.05 |
 | v63 (same code) | a9af0b7 | run-aeb5ee4b7a28 | 14.921 ms | 8.29 MB | 377 | 55.05 |
 | v65 | 6cafc7e | run-6d3cdfadd754 | 14.32 ms | 8.07 MB | 373 | 56.60 |
 | v65 (same code) | 3fa85cb | run-ec315dedca74 | 14.446 ms | 7.92 MB | 373 | 56.56 |
+
+- v56: commit db1bb02, K 47.82.
+- v59: T 16.48 ms, M 7.92 MB, S 392, K 52.56.
+- v60: commit 78587c9, T 16.23 ms, M 7.89 MB, S 394, K 52.96.
+- v61: commit 73fcc4e, T 16.17 ms, M 10.24 MB (spike, section 6), S 369, K 50.88.
+- v62: commit 6ca940a, T 15.53 ms, M 8.01 MB, S 371, K 54.48.
 
 The reference takes 14.44 s, K 1. M is the maximum of the board's 5 runs, which is why the same code reads 7.80 and 8.29 (section 6).
 
@@ -88,12 +89,10 @@ Today (box 1 unless a run ID is given):
 
 With a busy loop on one of CPUs 0-11 for 1 ms in every 5 (box 2, medians of 2 rounds):
 
-| Version and scheme | Quiet | With the noise |
-|---|---|---|
-| v24, fixed twelfths, a sender waits when the ring is full | 22.55 ms | 26.3 to 26.9 ms |
-| v26, pieces, unbounded per-owner queue on the hot path | 23.8 ms | 24.2 ms |
-| v27, pieces, overflow queue only when a ring is full | 22.66 ms | 24.0 ms |
-| v39, pieces, a sender that drains while it waits | 20.64 ms | 24.0 ms |
+- v24, fixed twelfths, a sender waits when the ring is full: quiet 22.55 ms, with the noise 26.3 to 26.9 ms.
+- v26, pieces, unbounded per-owner queue on the hot path: quiet 23.8 ms, with the noise 24.2 ms.
+- v27, pieces, overflow queue only when a ring is full: quiet 22.66 ms, with the noise 24.0 ms.
+- v39, pieces, a sender that drains while it waits: quiet 20.64 ms, with the noise 24.0 ms.
 
 A busy loop on one CPU for the whole run made v24 25 times slower (546 ms). v43's code: 331 ms with one such loop, 439 with two, against 23.3 quiet. v53's sleeping wait (10 us after 128 pauses) reads 30.0 and 32.9 ms in the same rounds, the same speed on a quiet box.
 
