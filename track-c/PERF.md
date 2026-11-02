@@ -10,11 +10,11 @@ The reference takes 14.44 s (K 1).
 |---|---|---|---|---|
 | Rust version, board run-fff3b356a7d3 (commit 2306aa9) | 28.1 ms | 9.6 MB | 585 | 36.48 |
 | join.c v21 on the board, run-fc3513efb0d2 (commit 816a29f) | 27.69 ms | 10.94 MB | 419 | 37.63 |
-| join.c v27, organisers' harness on box 2 (run-a61e717c2817, run-2668ae2f706a, run-bcf351d7d996, run-7032e46a98b9, run-a6d1b79f12a2) | 22.74 ms | 10.74 MB | 443 | 41.3 |
+| join.c v27, 5 runs of the organisers' harness on box 2 (local runs, no board run ID) | 22.74 ms | 10.74 MB | 443 | 41.3 |
 | join.c v27 on the board, run-ca7e7d104000 (commit ec1791c) | 26.56 ms | 10.65 MB | 443 | 38.31 |
-| join.c v39, organisers' harness on box 2 (run-79fdadd1aeb9, run-fcfa3f190b88, run-e74d4b5ca8fd, run-4e384d44fd78, run-46f27f0b1569) | 20.93 ms | 10.60 MB | 425 | 43.5 |
+| join.c v39, 5 runs of the organisers' harness on box 2 (local runs, no board run ID) | 20.93 ms | 10.60 MB | 425 | 43.5 |
 | join.c v39 on the board, run-cc3a05552f65 (commit c04e8b3) | 21.74 ms | 10.39 MB | 425 | 42.83 |
-| join.c v43, organisers' harness on box 2 (run-b4d9fd8e3054, run-6d81c0998c5b, run-86f619fede63, run-7fa4f90964b6, run-fc7e98fbc4ad) | 20.78 ms | 10.69 MB | 417 | 43.6 |
+| join.c v43, 5 runs of the organisers' harness on box 2 (local runs, no board run ID) | 20.78 ms | 10.69 MB | 417 | 43.6 |
 | join.c v43 on the board, run-a355185f438a (commit 09f081f) | 22.48 ms | 10.24 MB | 417 | 42.35 |
 | join.c v49 (v43's code, comments fixed) on the board, run-14a8fd87f9be (commit 6b75bfd) | 21.74 ms | 10.3 MB | 417 | 43.04 |
 | join.c v49 on the board, run-be7fc43b744a (commit 4e793b1) | 21.31 ms | 10.51 MB | 417 | 43.27 |
