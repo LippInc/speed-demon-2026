@@ -53,7 +53,7 @@ typedef u64 __attribute__((aligned(1), may_alias)) u64u;
 // BATCH: messages staged per owner; RING: the messages a ring holds (two
 // batches); PIECE: bytes per piece of records.csv; RUN: records per parse loop.
 enum { NT = 12, BATCH = 128, RING = 2 * BATCH, PIECE = 1 << 17, RUN = 64 };
-enum { BUCKETS = 1248, SLOTS = 8 * (BUCKETS + 8) };
+enum { BUCKETS = 624, SLOTS = 16 * (BUCKETS + 4) };
 
 // One country's running totals, kept per thread: records, id sum, amount
 // sum, min and max in cents, name and note bytes once unescaped, distinct names.
@@ -76,7 +76,7 @@ typedef struct { // a thread's outgoing messages, totals and parsed records
   Agg *agg;
 } Ctx;
 typedef struct { // one owner's names; slot i of tag and row i belong to one name
-  _Alignas(32) u32 tag[SLOTS]; // 0 = free
+  _Alignas(64) u32 tag[SLOTS]; // 0 = free; 16 per bucket, a cache line
   u64 row[SLOTS][4];           // a bit per country
 } Names;
 
@@ -142,31 +142,33 @@ static inline u64 quotes(V v, const u8 *p) {
 // rounds every name byte has reached all 128 bits of the state. One round is
 // a bijection, so names of up to 16 bytes cannot collide before the state is
 // cut to 64 bits.
-static inline __m128i step(__m128i h, V v) {
-  return _mm_aesenc_si128(_mm_xor_si128(h, _mm256_castsi256_si128(v)),
-                          _mm256_extracti128_si256(v, 1));
-}
-#define SEED _mm_set_epi64x(0x8EBC6AF09C88C6E3, 0xA0761D6478BD642F)
 #define K1 _mm_set_epi64x(0x589965CC75374CC3, 0xE7037ED1A0B428DB)
 #define K2 _mm_set_epi64x(0x1D8E4E27C47D124F, 0x9E3779B97F4A7C15)
-// v's first n bytes end the name
-static inline u64 last(__m128i h, V v, u64 n) {
-  h = step(h, _mm256_and_si256(v, load32(KEEP + 32 - n)));
+// v's first n bytes are the name
+static inline u64 name_hash(V v, u64 n) {
+  v = _mm256_and_si256(v, load32(KEEP + 32 - n));
+  __m128i h = _mm_aesenc_si128(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
   return _mm_cvtsi128_si64(_mm_aesenc_si128(_mm_aesenc_si128(h, K1), K2));
 }
 
+// A bit per tag of the 16 at p that equals x
+static inline u32 eq16(const u32 *p, u32 x) {
+  V w = _mm256_set1_epi32(x);
+  return _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(_mm256_load_si256((const V *)p), w))) |
+         _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(_mm256_load_si256((const V *)(p + 8)), w))) << 8;
+}
+
 // The slot of the name of message msg; a new name takes the first free slot
-// of the walk.
+// of the walk. A hit is what nearly all messages find (97%), in the first
+// bucket; only the rest pay for the search for a free slot.
 static inline u32 slot_of(Names *nm, u64 msg) {
-  u32 tag = msg >> 8 | 1; // bits 8-39
-  V want = _mm256_set1_epi32(tag), zero = _mm256_setzero_si256();
+  u32 tag = msg >> 8 | 1, m;
   for (u64 b = (msg >> 48) * BUCKETS >> 16;; b++) {
-    V v = _mm256_load_si256((const V *)(nm->tag + 8 * b));
-    u32 m = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_or_si256(_mm256_cmpeq_epi32(v, want), _mm256_cmpeq_epi32(v, zero))));
-    if (m) {
-      u32 s = 8 * b + _tzcnt_u32(m);
-      nm->tag[s] = tag;
-      return s;
+    if (__builtin_expect((m = eq16(nm->tag + 16 * b, tag)) != 0, 1))
+      return 16 * b + _tzcnt_u32(m);
+    if ((m = eq16(nm->tag + 16 * b, 0))) {
+      nm->tag[16 * b + _tzcnt_u32(m)] = tag;
+      return 16 * b + _tzcnt_u32(m);
     }
   }
 }
@@ -220,13 +222,14 @@ static u64 drain(int t, Agg *a) {
     for (u64 e; h < k; h = e) {
       e = k - h < 64 ? k : h + 64;
       u32 id[64];
-      for (u64 j = h; j < e; j++) {
-        id[j - h] = slot_of(nm, m[j % RING]);
-        _mm_prefetch((const char *)nm->row[id[j - h]], _MM_HINT_T0);
+      const u64 *ms = m + h % RING; // never wraps: batches are whole, and 64 divides them
+      for (u64 j = 0; j < e - h; j++) {
+        id[j] = slot_of(nm, ms[j]);
+        _mm_prefetch((const char *)nm->row[id[j]], _MM_HINT_T0);
       }
-      for (u64 j = h; j < e; j++) {
-        u64 c = m[j % RING] & 255, bit = 1ull << (c & 63);
-        u64 *w = &nm->row[id[j - h]][c >> 6];
+      for (u64 j = 0; j < e - h; j++) {
+        u64 c = ms[j] & 255, bit = 1ull << (c & 63);
+        u64 *w = &nm->row[id[j]][c >> 6];
         a[c].names += !(*w & bit);
         *w |= bit;
       }
@@ -267,17 +270,15 @@ static inline u64 odd_quotes(u64 q) {
   return _mm_cvtsi128_si64(_mm_clmulepi64_si128(_mm_cvtsi64_si128(q), _mm_set1_epi8(-1), 0));
 }
 
-// The offset of the comma after the note at b, of any length, or empty and
-// unquoted; adds the note's quotes to *qn.
-static u64 note_end(const u8 *b, u64 *qn) {
-  u64 p = 0;
+// The comma after the note at b, of any length, or empty and unquoted: its
+// offset in the low half, the note's quotes in the high half.
+static u64 note_end(const u8 *b) {
+  u64 p = 0, n = 0;
   for (u64 i = 0;; i += 64) {
     u64 q = quotes(load32(b + i), b + i + 32), odd = odd_quotes(q) ^ p, o = ~(odd | q);
-    if (o) {
-      *qn += _mm_popcnt_u64(_bzhi_u64(q, _tzcnt_u64(o)));
-      return i + _tzcnt_u64(o);
-    }
-    *qn += _mm_popcnt_u64(q);
+    if (o)
+      return i + _tzcnt_u64(o) | (n + _mm_popcnt_u64(_bzhi_u64(q, _tzcnt_u64(o)))) << 32;
+    n += _mm_popcnt_u64(q);
     p = -(odd >> 63);
   }
 }
@@ -285,45 +286,50 @@ static u64 note_end(const u8 *b, u64 *qn) {
 // Reads the record at b into *rc; returns the next record's start.
 static inline __attribute__((always_inline)) const u8 *parse(const u8 *b, const u8 *rt, Rec *rc) {
   V comma = _mm256_set1_epi8(',');
-  if (__builtin_expect(*b == 0xEF, 0)) { // a BOM at a record start: 777 among 3.32 M records
-    b += 3;
+  if (__builtin_expect(*b >= 0xBB, 0)) { // a BOM: 777 among 3.32 M records; see the end of parse
+    b += *b == 0xEF ? 3 : 2;
     __asm__(""); // stays a branch: a cmov would put this load on the way to the next record
   }
-  V head = load32(b);
   _mm_prefetch((const char *)b + 512, _MM_HINT_T0);
-  // A name is quoted unless empty, an id has 8 digits at most (spec 2.2).
-  u64 q = quotes(head, b + 32);
-  u64 t = _tzcnt_u64(q), a = t - 1, j, d, h, nl, qn = 0; // the opening quote, the id's digits
-  if (__builtin_expect(t > 9 || b[t - 2] == ',', 0)) { // empty, unquoted name: 0.5%
-    a = _tzcnt_u32(_mm256_movemask_epi8(_mm256_cmpeq_epi8(head, comma)));
-    j = a + 1, nl = 0, h = last(SEED, _mm256_setzero_si256(), 0);
-    d = j + 1 + note_end(b + j + 1, &qn);
+  _mm_prefetch((const char *)b + 576, _MM_HINT_T0);
+  u64 a = _tzcnt_u32(eq32(b, comma)), j, d, qn, o = 0, pq = 0; // a: the id's digits
+  // The quote mask starts at w, past most ids, so that for 97% of records it
+  // reaches the end of the note. j and d count from w.
+  const u8 *w = b + 6;
+  u64 q = quotes(load32(w), w + 32);
+  if (__builtin_expect(a < 5 || b[a + 1] == ',', 0)) { // a short id (0.6%) or an empty, unquoted name (0.5%)
+    u64 ne = note_end(b + a + 1), n = (u32)ne;
+    j = a + 1 - 6 + n, pq = ne >> 32;
+    rc->nl = n - pq / 2 - (n != 0);
+    rc->h = name_hash(load32(b + a + 2), n ? n - 2 : 0);
   } else {
     // Past the opening quote, the commas after the name and after the note
     // are the first two bytes that follow an odd number of quotes and are
     // not one. A "" flips the count twice.
-    u64 o = _andn_u64(q, odd_quotes(_blsr_u64(q)));
+    u64 t = a - 5; // the opening quote
+    o = _andn_u64(q, odd_quotes(_blsr_u64(q)));
     j = _tzcnt_u64(o), o = _blsr_u64(o);
-    u64 pq = _mm_popcnt_u64(_bzhi_u64(q, j));
-    nl = j - t - 1 - pq / 2;
+    pq = _mm_popcnt_u64(_bzhi_u64(q, j));
+    rc->nl = j - t - 1 - pq / 2;
     // A name of 31 raw bytes or more is not handled; spec 2.2 sets no bound,
     // but over 40 generated seeds the longest was 27 (base name at most 24 by
     // the generator's forms, plus runs of trailing spaces that get rarer
     // about 4 times per extra byte), so about 3e-4 per dataset.
-    h = last(SEED, load32(b + t + 1), j - t - 2);
-    if (__builtin_expect(o != 0, 1)) {
-      d = _tzcnt_u64(o);
-      qn = _mm_popcnt_u64(_bzhi_u64(q, d)) - pq;
-    } else { // the note runs past the 64 bytes: 4%
-      d = j + 1 + note_end(b + j + 1, &qn);
-    }
+    rc->h = name_hash(load32(b + a + 2), j - t - 2);
+  }
+  if (__builtin_expect(o != 0, 1)) {
+    d = _tzcnt_u64(o);
+    qn = _mm_popcnt_u64(_bzhi_u64(q, d)) - pq;
+  } else { // the note runs past the mask, or the name was read above
+    u64 ne = note_end(w + j + 1);
+    d = j + 1 + (u32)ne, qn = ne >> 32;
   }
   u64 idb = *(const u64u *)b << (64 - 8 * a);
-  // The region and the amount. The commas, CRs and LFs are the bytes up to ',';
-  // digits, '-', '.' and a BOM are above it.
-  const u8 *r = b + d + 1;
+  // The region and the amount. The commas, CRs and LFs are the bytes below '-';
+  // digits, '-' and '.' are not. A BOM's first byte is too, as a signed byte.
+  const u8 *r = w + d + 1;
   V tail = load32(r);
-  u64 m = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_min_epu8(tail, comma), tail));
+  u64 m = (u32)_mm256_movemask_epi8(_mm256_cmpgt_epi8(_mm256_set1_epi8('-'), tail));
   u64 c = _tzcnt_u64(m);
   m = _blsr_u64(m);
   u64 e = _tzcnt_u64(m); // the comma, the end of the amount
@@ -336,12 +342,13 @@ static inline __attribute__((always_inline)) const u8 *parse(const u8 *b, const 
   int32_t cents = _mm256_extract_epi64(num, 2);
   rid = rid < top ? rid : top;
   _mm_prefetch((const char *)rt + rid, _MM_HINT_T0);
+  rc->id = _mm256_cvtsi256_si32(num), rc->reg = rid, rc->cents = r[c + 1] == '-' ? -cents : cents;
   // A quoted note holds qn quotes, its two delimiters and two per "", and
   // loses qn / 2 + 1 bytes; an unquoted one is empty (1.5%).
   u64 len = d - j - 1;
-  *rc = (Rec){h, _mm256_cvtsi256_si32(num), rid, nl, len - qn / 2 - (len != 0),
-              r[c + 1] == '-' ? -cents : cents};
-  // The next record: past the LF; a CR is followed by it
+  rc->tb = len - qn / 2 - (len != 0);
+  // The next record: past the end and, if the next byte is a low one too, past
+  // that: an LF after a CR, or a BOM's first byte after an LF (parse's first test).
   return r + e + 1 + (m >> (e + 1) & 1);
 }
 
@@ -375,7 +382,7 @@ static void records(Ctx *x, const u8 *a, const u8 *m, const u8 *e) {
         g->max = cents;
       g->nb += rs[r].nl;
       g->tb += rs[r].tb;
-      u64 o = (h >> 40 & 255) * NT >> 8; // the name's owner: h's bits 40-47
+      u64 o = (h & 255) * NT >> 8; // the name's owner: the hash's low byte, which the message does not carry
       u32 w = x->fill[o];
       x->batch[w++] = (h & ~255ull) | co;
       x->fill[o] = w;
