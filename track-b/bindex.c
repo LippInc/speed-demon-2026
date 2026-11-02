@@ -138,9 +138,9 @@ static Bucket *tab;                            // on one huge page: lookups take
 static _Alignas(16) u8 LM[129][16]; // LM[L]: first L bytes 0xFF (a table, not a clamp: gcc makes the clamp a branch)
 static inline u64 hash_at(const u8 *p, u32 L) {
     __m128i x = _mm_and_si128(_mm_or_si128(ld128(p), _mm_set1_epi8(32)), _mm_load_si128((const __m128i *)LM[L]));
-    if (L > 16) x = _mm_xor_si128(x, _mm_slli_epi64(_mm_and_si128(_mm_or_si128(ld128(p + 16), _mm_set1_epi8(32)), _mm_load_si128((const __m128i *)LM[L - 16])), 3));
-    unsigned long long hi, lo = _mulx_u64((u64)_mm_cvtsi128_si64(x) ^ 0x9E3779B97F4A7C15ull, (u64)_mm_extract_epi64(x, 1) ^ 0xD6E8FEB86659FD93ull, &hi);
-    return (hi ^ lo) | 1;   // never 0: tag 0 is an empty slot
+    if (L > 16) x = _mm_xor_si128(x, _mm_aesenc_si128(_mm_and_si128(_mm_or_si128(ld128(p + 16), _mm_set1_epi8(32)), _mm_load_si128((const __m128i *)LM[L - 16])), _mm_set1_epi32(0x3C6EF372)));
+    const __m128i K = _mm_set_epi64x(0x9E3779B97F4A7C15ll, 0x243F6A8885A308D3ll);
+    return (u64)_mm_cvtsi128_si64(_mm_aesenc_si128(_mm_aesenc_si128(x, K), K)) | 1;   // never 0: tag 0 is an empty slot
 }
 
 static u32 probe(u64 h, u32 b) {               // the tag may sit in a later bucket
