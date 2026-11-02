@@ -74,7 +74,7 @@ How to read this, in plain words:
 
 Keeps are decided on the box (5 runs on each of two seeds), because one board run of unchanged code varies by about 4 % (steps 38-46: T 0.284-0.295 s), and once by 12 % (steps 50-55: T 0.230-0.258 s). Step 36 is the one step where the board moved the other way by more than that (0.310 → 0.345 s, then 0.32 s on a re-run); we kept it on the box's reading (0.302 → 0.295 s). A keep needs the box reading to move beyond the two seeds' spreads, as b-99a did, not inside them, as b-100 read at S +6; in the Rust era a candidate promised 10 ms or more per worker at 12 workers before it was built (b-47, b-48); and S costs 0.05 ms per line in the score (b-103).
 
-## The redesign: box 103 ms to 52 ms in one day (b-110 to b-126)
+## The last day's redesign (b-110 to b-126)
 
 All box readings here are medians in ms of alternating rounds on our i5-13500 with the official image's gcc 15, the output hash checked on seed 1 and a fresh seed. From b-122 on the output goes to tmpfs, as on the board. "Lost" means measured and not kept. Rows without an internal run ID: the feed keeps only a track's best and latest run, so the organisers' form, commit · Track B, is what we have; the T beside it was read from the board at the time.
 
