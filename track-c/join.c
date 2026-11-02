@@ -88,12 +88,16 @@ typedef struct { // the messages from one thread to one owner, RING at most
   _Alignas(64) _Atomic u64 head; // advanced by the owner
   _Alignas(64) u64 m[RING];      // message i is m[i % RING]
 } Ring;
+#define SET4(x) {x, x, x, x}
+V QUOTE = SET4(0x2222222222222222), DASH = SET4(0x2D2D2D2D2D2D2D2D), ZERO = SET4(0x3030303030303030);
 static const u8 KEEP[64] = {[0 ... 31] = 0xFF}; // KEEP + 32 - n: n bytes kept
 
 // All memory the threads use, on three transparent huge pages that main
 // faults in before any thread starts, so no thread ever page-faults on
 // anonymous memory. A fixed address: an aligned static object would put the
-// small variables around it on two more huge pages.
+// small variables around it on two more huge pages. It lies past the first GB
+// above the program, where the kernel starts the heap at random, and with it
+// main's thread pointer: at 1 << 30 this map erased those in 0.5 % of runs (PERF.md).
 typedef struct {
   Ring ring[NT][NT];
   _Alignas(64) Agg agg[NT][256];
@@ -109,7 +113,7 @@ typedef struct {
   Names names[NT]; // the rest of Mem fits the first huge page
 } Mem;
 _Static_assert(sizeof(Mem) <= 3 << 21, "three huge pages");
-#define mem (*(Mem *)(1ull << 30))
+#define mem (*(Mem *)(3ull << 29))
 
 static void die(const char *what) { perror(what), exit(1); }
 static inline V load32(const u8 *p) { return _mm256_loadu_si256((const void *)p); }
@@ -124,7 +128,7 @@ static inline u32 eq32(const u8 *p, V c) { // a bit per byte of p == c
 // pairs, then quads, then octets combine in one multiply each.
 static inline V fold3(u64 a, u64 b, u64 c) {
   V x = _mm256_set_epi64x(0, c, b, a);
-  x = _mm256_subs_epu8(x, _mm256_set1_epi8('0'));
+  x = _mm256_subs_epu8(x, ZERO);
   x = _mm256_maddubs_epi16(x, _mm256_set1_epi16(0x010A));    // 10a + b
   x = _mm256_madd_epi16(x, _mm256_set1_epi32(0x00010064));   // 100a + b
   return _mm256_add_epi64(_mm256_mul_epu32(x, _mm256_set1_epi64x(10000)),
@@ -133,7 +137,7 @@ static inline V fold3(u64 a, u64 b, u64 c) {
 
 // A bit per quote byte of 64 bytes: the first 32 in v, then those at p
 static inline u64 quotes(V v, const u8 *p) {
-  V q = _mm256_set1_epi8('"');
+  V q = QUOTE;
   return (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, q)) | (u64)eq32(p, q) << 32;
 }
 
@@ -292,7 +296,7 @@ static inline __attribute__((always_inline)) const u8 *parse(const u8 *b, const 
   }
   _mm_prefetch((const char *)b + 512, _MM_HINT_T0);
   _mm_prefetch((const char *)b + 576, _MM_HINT_T0);
-  u64 a = _tzcnt_u32(eq32(b, comma)), j, d, qn, o = 0, pq = 0; // a: the id's digits
+  u64 a = _tzcnt_u64(eq32(b, comma)), j, d, qn, o = 0, pq = 0; // a: the id's digits
   // The quote mask starts at w, past most ids, so that for 97% of records it
   // reaches the end of the note. j and d count from w.
   const u8 *w = b + 6;
@@ -324,12 +328,16 @@ static inline __attribute__((always_inline)) const u8 *parse(const u8 *b, const 
     u64 ne = note_end(w + j + 1);
     d = j + 1 + (u32)ne, qn = ne >> 32;
   }
+  // A quoted note holds qn quotes, its two delimiters and two per "", and
+  // loses qn / 2 + 1 bytes; an unquoted one is empty (1.5%).
+  u64 len = d - j - 1;
+  rc->tb = len - qn / 2 - (len != 0);
   u64 idb = *(const u64u *)b << (64 - 8 * a);
   // The region and the amount. The commas, CRs and LFs are the bytes below '-';
   // digits, '-' and '.' are not. A BOM's first byte is too, as a signed byte.
   const u8 *r = w + d + 1;
   V tail = load32(r);
-  u64 m = (u32)_mm256_movemask_epi8(_mm256_cmpgt_epi8(_mm256_set1_epi8('-'), tail));
+  u64 m = (u32)_mm256_movemask_epi8(_mm256_cmpgt_epi8(DASH, tail));
   u64 c = _tzcnt_u64(m);
   m = _blsr_u64(m);
   u64 e = _tzcnt_u64(m); // the comma, the end of the amount
@@ -343,10 +351,6 @@ static inline __attribute__((always_inline)) const u8 *parse(const u8 *b, const 
   rid = rid < top ? rid : top;
   _mm_prefetch((const char *)rt + rid, _MM_HINT_T0);
   rc->id = _mm256_cvtsi256_si32(num), rc->reg = rid, rc->cents = r[c + 1] == '-' ? -cents : cents;
-  // A quoted note holds qn quotes, its two delimiters and two per "", and
-  // loses qn / 2 + 1 bytes; an unquoted one is empty (1.5%).
-  u64 len = d - j - 1;
-  rc->tb = len - qn / 2 - (len != 0);
   // The next record: past the end and, if the next byte is a low one too, past
   // that: an LF after a CR, or a BOM's first byte after an LF (parse's first test).
   return r + e + 1 + (m >> (e + 1) & 1);
@@ -361,7 +365,7 @@ static void records(Ctx *x, const u8 *a, const u8 *m, const u8 *e) {
   Rec *rs = x->rec;
   u64 n;
   while (a < m || b < e) {
-    for (n = 0; n + 2 <= RUN && a < m && b < e; n += 2) {
+    for (n = 0; n < RUN && ((a - m) & (b - e)) < 0; n += 2) {
       a = parse(a, rt, rs + n);
       b = parse(b, rt, rs + n + 1);
     }
