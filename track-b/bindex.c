@@ -25,14 +25,18 @@
 
 typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t u64;
 
+static inline __m128i ld128(const void *p) { return _mm_loadu_si128((const __m128i *)p); }
+
 #define PHDOCS 63000      // docs per phase at most, so a phase-local doc number fits a u16 below the 0xFFFF sentinel
 #define SH 10             // term shards: 1 << SH terms each
 #define SCAP (1u << 20)   // entries per worker per shard, address space only
 #define PCAP (1u << 22)   // list entries per shard, address space only
 #define QB 64             // queries per claim
 #define MAXTOK 65536      // tokens per doc; the spec's longest doc (999 units) has ~10,000
-#define BBITS 15          // term table: 2^15 buckets of 5 keys
-#define NSLOT (5u << BBITS)
+#ifndef BBITS
+#define BBITS 15          // term table: 2^15 buckets of 7 tags
+#endif
+#define NSLOT (8u << BBITS)
 #define SAMPLE_DIV 48     // each worker samples the first 1/64 of its first part
 #define DENSE_DIV 32      // a BOOL term in over 1/32 of the sample gets a bitmap row
 #define MAXQ 10           // ids printed per query
@@ -112,66 +116,53 @@ static const u8 *map_file(const char *dir, const char *name, size_t *len) {
 }
 
 // ---------------------------------------------------------------- term table
-// A token's key is exact up to 8 bytes: the lowercased bytes as a little-endian
-// u64 (no token holds a NUL, so different lengths differ). Longer tokens XOR in
-// each further 8 bytes times an odd constant, so two tokens share a key only by
-// a 64-bit coincidence. A bucket holds 5 keys and their values in one cache
-// line, plus a sixth value that answers a miss: MISS, or PROBE once a key was
-// probed past the bucket. A lookup compares all five keys at once and reads
-// val[index of the match, or 5], so a hit and a miss take the same path. A
-// slot's value is its own index until the workers renumber the terms.
-typedef struct { _Alignas(64) u64 key[5]; u32 val[6]; } Bucket;
+// A token's key is an AES hash of its lowercased bytes: two AES rounds over up
+// to 32 bytes, never 0 (tag 0 marks an empty slot). Two tokens share a key
+// only by a 64-bit coincidence. A bucket holds 7 tags and their values in one
+// cache line, plus an eighth value that answers a miss: MISS, or PROBE once a
+// term was placed past the bucket. A lookup compares all eight tags at once
+// (tag[7] stays 0, so it never matches) and reads val[index of the match, or
+// 7], so a hit and a miss take the same path. A slot's value is its own index
+// until the workers renumber the terms.
+typedef struct { _Alignas(64) u32 tag[8], val[8]; } Bucket;
 static Bucket *tab;                            // on one huge page: lookups take no TLB misses
 #define BMASK ((1u << BBITS) - 1)
 
-static inline u32 bucket_of(u64 k) { return (u32)((k * 0x9E3779B97F4A7C15ull) >> (64 - BBITS)); }
-
-static inline u64 ld64(const u8 *p) { u64 x; memcpy(&x, p, 8); return x; }
-#define LOWER 0x2020202020202020ull            // on token bytes, | 0x20 lowercases A-Z and keeps 0-9, a-z
-
-// KM[L]: the masks of a token's first and second 8 bytes, for L <= 16: the
-// same key as key_at with two ANDs in place of the length arithmetic.
-static u64 KM[17][2];
-
-static inline u64 key_at(const u8 *p, u32 L) {
-    u32 a = L < 8 ? L : 8, b = L < 16 ? L - a : 8;
-    u64 k = _bzhi_u64(ld64(p) | LOWER, 8 * a) ^ _bzhi_u64(ld64(p + 8) | LOWER, 8 * b) * 0x9E3779B97F4A7C15ull;
-    if (L > 16) {                              // the generator's longest token has 17 bytes; keys cover 32
-        u32 c = L < 24 ? L - 16 : 8;
-        k ^= _bzhi_u64(ld64(p + 16) | LOWER, 8 * c) * 0xC2B2AE3D27D4EB4Full
-           ^ _bzhi_u64(ld64(p + 24) | LOWER, 8 * (L - 16 - c)) * 0x165667B19E3779F9ull;
-    }
-    return k;
+static _Alignas(16) u8 LM[17][16];       // LM[L]: the first L bytes 0xFF; filled in main
+static inline u64 hash_at(const u8 *p, u32 L) {
+    __m128i x = _mm_and_si128(_mm_or_si128(ld128(p), _mm_set1_epi8(32)), _mm_load_si128((const __m128i *)LM[L < 16 ? L : 16]));
+    if (L > 16) x = _mm_xor_si128(x, _mm_aesenc_si128(_mm_and_si128(_mm_or_si128(ld128(p + 16), _mm_set1_epi8(32)), _mm_load_si128((const __m128i *)LM[L - 16])), _mm_set1_epi32(0x3C6EF372)));
+    const __m128i K = _mm_set_epi64x(0x9E3779B97F4A7C15ll, 0x243F6A8885A308D3ll);
+    return (u64)_mm_cvtsi128_si64(_mm_aesenc_si128(_mm_aesenc_si128(x, K), K)) | 1;   // never 0: tag 0 is an empty slot
 }
 
-static u32 probe(u64 k, u32 b) {               // the key may sit in a later bucket
+static u32 probe(u64 h, u32 b) {               // the tag may sit in a later bucket
     for (;;) {
         b = (b + 1) & BMASK;
-        for (u32 i = 0; i < 5; i++) if (tab[b].key[i] == k) return tab[b].val[i];
-        if (tab[b].val[5] != PROBE) return MISS;
+        for (u32 i = 0; i < 7; i++) if (tab[b].tag[i] == (u32)h) return tab[b].val[i];
+        if (tab[b].val[7] != PROBE) return MISS;
     }
 }
 
-static inline u32 lookup(u64 k) {
-    const Bucket *t = &tab[bucket_of(k)];
-    u32 m = (u32)_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(_mm256_load_si256((const __m256i *)t->key), _mm256_set1_epi64x((long long)k))))
-          | (u32)(t->key[4] == k) << 4;
-    u32 v = t->val[_tzcnt_u32(m | 32)];
-    return v == PROBE ? probe(k, bucket_of(k)) : v;
+static inline u32 lookup(u64 h) {
+    const Bucket *t = &tab[h >> (64 - BBITS)];
+    u32 m = (u32)_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(_mm256_load_si256((const __m256i *)t->tag), _mm256_set1_epi32((int)h))));
+    u32 v = t->val[_tzcnt_u32(m | 128)];
+    return v == PROBE ? probe(h, (u32)(h >> (64 - BBITS))) : v;
 }
 
-// Called by all workers at once while they parse: a free key slot is claimed by
+// Called by all workers at once while they parse: a free tag slot is claimed by
 // compare-and-swap. Relaxed order is enough: no worker looks a term up before
 // the barrier after the parse.
-static u32 intern(u64 k) {
-    for (u32 b = bucket_of(k);; b = (b + 1) & BMASK) {
-        for (u32 i = 0; i < 5; i++) {
-            u64 cur = __atomic_load_n(&tab[b].key[i], __ATOMIC_RELAXED);
-            if (!cur && __atomic_compare_exchange_n(&tab[b].key[i], &cur, k, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
-                return tab[b].val[i] = b * 5 + i;
-            if (cur == k) return b * 5 + i;
+static u32 intern(u64 h) {
+    for (u32 b = (u32)(h >> (64 - BBITS));; b = (b + 1) & BMASK) {
+        for (u32 i = 0; i < 7; i++) {
+            u32 cur = __atomic_load_n(&tab[b].tag[i], __ATOMIC_RELAXED);
+            if (!cur && __atomic_compare_exchange_n(&tab[b].tag[i], &cur, (u32)h, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+                return tab[b].val[i] = b * 8 + i;
+            if (cur == (u32)h) return b * 8 + i;
         }
-        __atomic_store_n(&tab[b].val[5], PROBE, __ATOMIC_RELAXED);
+        __atomic_store_n(&tab[b].val[7], PROBE, __ATOMIC_RELAXED);
     }
 }
 
@@ -209,9 +200,7 @@ static const u8 *tokenize(const u8 *q, u64 *keys, u32 *pn) {
             u32 st = (u32)_tzcnt_u64(s), L = (u32)_tzcnt_u64(~(mm >> st));
             const u8 *t = q + st;
             L = st + L == 64 ? L + more : L;
-            u64 k = L <= 16 ? ((ld64(t) | LOWER) & KM[L][0]) ^ ((ld64(t + 8) | LOWER) & KM[L][1]) * 0x9E3779B97F4A7C15ull
-                            : key_at(t, L);
-            keys[n++] = k;
+            keys[n++] = hash_at(t, L);
         }
         if (lf) { *pn = n; return q + _tzcnt_u64(lf) + 1; }
         carry = mm >> 63; m = m2; lf = lf2;
@@ -229,7 +218,7 @@ static void parse(const u8 *p, const u8 *e, u32 q) {
         p += ph ? 8 : 5;                       // past `PHRASE "` or `BOOL `
         u32 k = 0;
         for (;;) {
-            u32 L = (u32)_tzcnt_u64(~tm(p)), s = intern(key_at(p, L));
+            u32 L = (u32)_tzcnt_u64(~tm(p)), s = intern(hash_at(p, L));
             qterm[8 * q + k++] = s;            // the spec caps a query at 8 terms
             if (!ph) __atomic_store_n(&bflag[s], 1, __ATOMIC_RELAXED);
             p += L;
@@ -318,20 +307,27 @@ static void transpose64(u64 *a) {
 // PACK[m]: the permute indexes that pack the 32-bit lanes set in m to the front
 static _Alignas(32) u32 PACK[256][8];
 
+#ifndef AHEAD
+#define AHEAD 12
+#endif
 static void scan_part(Worker *me, int p) {
     const u32 ND = ndense, NS = nsparse, DW = ND / 64 + 1, pf = pfirst[p / nw * nw], d0 = pfirst[p] - pf, de = pfirst[p + 1] - pf;
-    u64 *bt = me->bt, *cur = me->keys, *next = cur + MAXTOK, *tmp;
-    u32 *ids = me->ids, *aps = me->aps, *dl = me->dl, *rl = me->rl, **sp = me->sp, n = 0, nn = 0;
+    u64 *bt = me->bt, *K = me->keys;
+    u32 *ids = me->ids, *aps = me->aps, *dl = me->dl, *rl = me->rl, **sp = me->sp, n = 0, nn = 0, a = 0;
     u8 *db = me->db;
     const u8 *q = doc + pstart[p];
     const __m256i NDN = _mm256_set1_epi32((int)ND), NSN = _mm256_set1_epi32((int)NS);
     for (u32 c = 0; c < ((NS + (1u << SH) - 1) >> SH); c++) sp[c] = me->sbase + c * SCAP;
-    if (d0 < de) q = tokenize(skip_id(q), cur, &n);
+    if (d0 < de) q = tokenize(skip_id(q), K, &n);
     for (u32 d = d0; d < de; d++) {
-        if (d + 1 < de) q = tokenize(skip_id(q), next, &nn);
+        // the current doc's hashes sit at K + a, the next doc's right after them,
+        // so the prefetch ahead needs no choice of buffer
+        if (a > 8192) { memmove(K, K + a, (size_t)n * 8); a = 0; }   // keep the touched memory small
+        const u64 *cur = K + a;
+        if (d + 1 < de) q = tokenize(skip_id(q), K + a + n, &nn);
         u32 na = 0, ndh = 0, nr = 0;
         for (u32 i = 0; i < n; i++) {
-            _mm_prefetch((const char *)&tab[bucket_of(i + 8 < n ? cur[i + 8] : next[i + 8 - n])], _MM_HINT_T0);   // 8 tokens ahead, into the next doc
+            _mm_prefetch((const char *)&tab[cur[i + AHEAD] >> (64 - BBITS)], _MM_HINT_T0);   // AHEAD tokens ahead, into the next doc
             ids[i] = lookup(cur[i]);
         }
         _mm256_storeu_si256((__m256i *)(ids + n), _mm256_set1_epi32((int)MISS));   // the last block's padding lanes count as misses
@@ -364,7 +360,7 @@ static void scan_part(Worker *me, int p) {
             }
         }
         if (na) match_phrases(me, n, na, pf + d);
-        tmp = cur; cur = next; next = tmp; n = nn;
+        a += n; n = nn;
     }
     if (p % nw == nw - 1)                      // the phase's last stretch: rows past its last document stay empty
         for (u32 r = 0; r < ND; r++) memset(bm + (size_t)r * W64 + (de + 63) / 64, 0, (W64 - (de + 63) / 64) * 8);
@@ -400,7 +396,6 @@ static inline u32 lower(const u16 *p, u32 n, u16 x) {
 }
 // tbl[m]: the shuffle that packs the 16-bit lanes set in m to the front
 static u8 tbl[256][16];
-static inline __m128i ld128(const void *p) { return _mm_loadu_si128((const __m128i *)p); }
 
 // cnt and sum of the set bits' indexes of b[0..w), w a multiple of 4. Bit index =
 // 256 block + 8 byte + bit in byte: per byte a popcount and a sum of positions
@@ -556,8 +551,8 @@ static void finish(Worker *me, int c) {
 static void *worker(void *arg) {
     int w = (int)(long)arg;
     Worker *me = &wk[w];
-    me->keys = arena((size_t)MAXTOK * 16 + ((size_t)MAXTOK + 8) * 16);   // two key buffers, ids, anchor positions, dense and rare hits
-    me->ids = (u32 *)(me->keys + 2 * MAXTOK); me->aps = me->ids + MAXTOK + 8; me->dl = me->aps + MAXTOK + 8; me->rl = me->dl + MAXTOK + 8;
+    me->keys = arena((size_t)8192 * 8 + (size_t)MAXTOK * 16 + ((size_t)MAXTOK + 8) * 16);   // two key buffers, ids, anchor positions, dense and rare hits
+    me->ids = (u32 *)(me->keys + 8192 + 2 * MAXTOK); me->aps = me->ids + MAXTOK + 8; me->dl = me->aps + MAXTOK + 8; me->rl = me->dl + MAXTOK + 8;
     for (int k = 0; k < PH; k++) {             // this worker's stretch of each phase: starts at a line whose id is a multiple of 64
         int p = k * nw + w;
         size_t o = dlen * (size_t)p / (size_t)P;
@@ -589,13 +584,13 @@ static void *worker(void *arg) {
         u32 t = 0;
         for (int i = 0; i < nw; i++) t += wk[i].sdf[s] & 0xFFFF;
         sampdf[s] = t;
-        if (tab[s / 5].key[s % 5]) me->cnt[cls(s, thr)]++;
+        if (tab[s >> 3].tag[s & 7]) me->cnt[cls(s, thr)]++;
     }
     pthread_barrier_wait(&bar);
     for (int i = 0; i < nw; i++)
         for (int c = 0; c < 3; c++) { tot[c] += wk[i].cnt[c]; if (i < w) next[c] += wk[i].cnt[c]; }
     next[1] += tot[0]; next[2] += tot[0] + tot[1];
-    for (u32 s = lo; s < hi; s++) if (tab[s / 5].key[s % 5]) newid[s] = next[cls(s, thr)]++;
+    for (u32 s = lo; s < hi; s++) if (tab[s >> 3].tag[s & 7]) newid[s] = next[cls(s, thr)]++;
     if (!w) {
         ndense = tot[0]; nsparse = tot[1]; nterms = tot[0] + tot[1] + tot[2];
         if (nsparse > 65536) die("over 65,536 rare BOOL terms");
@@ -612,7 +607,7 @@ static void *worker(void *arg) {
         if (qkind[q]) { u32 e = __atomic_sub_fetch(&aoff[anchor_of(q, &pos)], 1, __ATOMIC_RELAXED); aq[e] = q; aj[e] = pos; }
     pthread_barrier_wait(&bar);
     for (u32 s = lo; s < hi; s++)
-        if (tab[s / 5].key[s % 5]) { u32 v = newid[s]; tab[s / 5].val[s % 5] = v | (aoff[v + 1] > aoff[v] ? ANCHOR : 0); }
+        if (tab[s >> 3].tag[s & 7]) { u32 v = newid[s]; tab[s >> 3].val[s & 7] = v | (aoff[v + 1] > aoff[v] ? ANCHOR : 0); }
     for (u32 q = base; q < base + n; q++) for (u32 j = 0; j < qk[q]; j++) qterm[8 * q + j] = newid[qterm[8 * q + j]];
     // 3. index and answer each part
     u32 maxnd = 1;
@@ -678,9 +673,8 @@ int main(int argc, char **argv) {
     }
     size_t maxq = qlen / 7 + 1;                // the shortest query line is `BOOL a` + LF
     tab = huge(sizeof(Bucket) << BBITS);
-    for (u32 b = 0; b <= BMASK; b++) tab[b].val[5] = MISS;
-    for (u32 L = 0, a; L <= 16; L++)
-        a = L < 8 ? L : 8, KM[L][0] = a == 8 ? ~0ull : (1ull << 8 * a) - 1, KM[L][1] = L - a == 8 ? ~0ull : (1ull << 8 * (L - a)) - 1;
+    for (u32 b = 0; b <= BMASK; b++) tab[b].val[7] = MISS;
+    for (u32 L = 0; L <= 16; L++) memset(LM[L], 0xFF, L);
     sdfs = huge(sdfsize = (size_t)(nw + 2) * NSLOT * 4);   // each worker's sample counts, their sums, the new ids
     sampdf = sdfs + (size_t)nw * NSLOT; newid = sampdf + NSLOT;
     aoff = arena((size_t)NSLOT * 4 + 4); aq = arena(maxq * 4); aj = arena(maxq * 4);
