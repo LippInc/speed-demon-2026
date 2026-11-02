@@ -31,8 +31,8 @@
 //     cost 1.5 ms more), and the owner keeps its names in a private table
 //     with one bit per country. One table shared by all threads took
 //     almost twice as long in the Rust version, and in C (v50) 23.00 ms
-//     against 20.35 (PERF.md): lookups missed the core's own cache. The
-//     owner's table needs no atomic instruction.
+//     against 20.35 (PERF.md): page faults on the shared table nearly
+//     doubled kernel cycles. The owner's table needs no atomic instruction.
 //  6. All thread memory lies on three huge pages at a fixed address (see Mem),
 //     faulted in by main and one helper before parsing starts. At the end
 //     each thread drops its share of the file's mapping, so exit has next to
@@ -113,7 +113,7 @@ static const u8 KEEP[64] = {[0 ... 31] = 0xFF}; // KEEP + 32 - n: n bytes kept
 // page-faults on anonymous memory. A fixed address: an aligned static object
 // would put the small variables around it on two more huge pages. It lies past
 // the first GB above the program, where the kernel starts the heap at random,
-// and with it main's thread pointer: at 1 << 30 this map erased those in 0.5 %
+// and with it main's thread pointer: at 1 << 30 this map erased those in 0.6 %
 // of runs (PERF.md).
 typedef struct {
   Ring ring[NT][NT];
@@ -136,7 +136,10 @@ typedef struct {
 _Static_assert(sizeof(Mem) <= 3 << 21, "three huge pages");
 #define mem (*(Mem *)(3ull << 29))
 
-static void die(const char *what) { perror(what), exit(1); }
+static void die(const char *what) {
+  perror(what);
+  exit(1);
+}
 static void *map(void *at, u64 n, int prot, int flags, int fd) {
   void *p = mmap(at, n, prot, flags, fd, 0);
   if (p == MAP_FAILED)
@@ -361,7 +364,8 @@ parse(const u8 *b, const u8 *rt, Rec *rc, u64 *open) {
     u64 a = _tzcnt_u64(eq32(load32(b), _mm256_set1_epi8(',')));
     t = *open = a - 5;
     u64 ne = note_end(b + a + 1), n = (u32)ne;
-    j = a + 1 - 6 + n, pq = ne >> 32;
+    j = a + 1 - 6 + n;
+    pq = ne >> 32;
     rc->name_bytes = n - pq / 2 - (n != 0);
     rc->h = name_hash(load32(b + a + 2), n ? n - 2 : 0);
   } else {
@@ -369,14 +373,16 @@ parse(const u8 *b, const u8 *rt, Rec *rc, u64 *open) {
     // are the first two bytes that follow an odd number of quotes and are
     // not one. A "" flips the count twice.
     o = _andn_u64(q, odd_quotes(_blsr_u64(q)));
-    j = _tzcnt_u64(o), o = _blsr_u64(o);
+    j = _tzcnt_u64(o);
+    o = _blsr_u64(o);
     pq = _mm_popcnt_u64(_bzhi_u64(q, j));
     u64 n = j - t - 2;
     rc->name_bytes = n + 1 - pq / 2;
-    // A name of 31 raw bytes or more is not handled; spec 2.2 sets no bound,
+    // The hash keeps a name's first 32 raw bytes, so two names that differ only
+    // past those merge (tested: 32 holds, 33 merges). Spec 2.2 sets no bound,
     // but over 40 generated seeds the longest was 27 (base name at most 24 by
     // the generator's forms, plus runs of trailing spaces that get rarer
-    // about 4 times per extra byte), so about 3e-4 per dataset.
+    // about 4 times per extra byte), so about 2e-5 per dataset.
     rc->h = name_hash(load32(w + t + 1), n);
   }
   if (__builtin_expect(o != 0, 1)) {
@@ -384,7 +390,8 @@ parse(const u8 *b, const u8 *rt, Rec *rc, u64 *open) {
     qn = _mm_popcnt_u64(_bzhi_u64(q, d)) - pq;
   } else { // the note runs past the mask, or the name was read above
     u64 ne = note_end(w + j + 1);
-    d = j + 1 + (u32)ne, qn = ne >> 32;
+    d = j + 1 + (u32)ne;
+    qn = ne >> 32;
   }
   // A quoted note holds qn quotes, its two delimiters and two per "", and
   // loses qn / 2 + 1 bytes; an unquoted one is empty (1.5%).
@@ -407,7 +414,8 @@ parse(const u8 *b, const u8 *rt, Rec *rc, u64 *open) {
   u64 rid = _mm256_extract_epi64(f, 1);
   int32_t cents = _mm256_extract_epi64(f, 2);
   _mm_prefetch((const char *)rt + rid, _MM_HINT_T0);
-  rc->reg = rid, rc->cents = r[c + 1] == '-' ? -cents : cents;
+  rc->reg = rid;
+  rc->cents = r[c + 1] == '-' ? -cents : cents;
   // The next record: past the whole run of low bytes, an LF after a CR and a
   // BOM's three bytes (777 among 3.32 M records) too. m's lowest bit is the
   // amount's end. Adding it to m carries through the run of set bits there and
@@ -428,8 +436,12 @@ static void records(Ctx *x, const u8 *a, const u8 *m, const u8 *e) {
       a = parse(a, rt, rs + n, &oa);
       b = parse(b, rt, rs + n + 1, &ob);
     }
-    if (a >= m) // the first half is done: the second's cursor goes on alone
-      a = b, m = e, oa = ob, b = e;
+    if (a >= m) { // the first half is done: the second's cursor goes on alone
+      a = b;
+      m = e;
+      oa = ob;
+      b = e;
+    }
     for (; n < RUN && a < m; n++)
       a = parse(a, rt, rs + n, &oa);
     for (u64 r = 0; r < n; r++) {
@@ -469,7 +481,8 @@ static void touch(const u8 *p, u64 n) {
 static int worker(void *arg) {
   int t = (int)(intptr_t)arg;
   Ctx *x = &mem.ctx[t];
-  x->agg = mem.agg[t], x->t = t;
+  x->agg = mem.agg[t];
+  x->t = t;
   for (int o = 0; o < NT; o++)
     x->fill[o] = o * BATCH;
   for (int c = 0; c < 256; c++)
@@ -529,7 +542,9 @@ static void report(FILE *o, const char *code, int c) {
   if (!g.n)
     return;
   fprintf(o, "%s %lld %lld", code, g.n, g.ids);
-  money(o, g.sum), money(o, g.min), money(o, g.max);
+  money(o, g.sum);
+  money(o, g.min);
+  money(o, g.max);
   fprintf(o, " %lld %lld %lld\n", g.names, g.text_bytes & UINT32_MAX,
           g.text_bytes >> 32);
 }
