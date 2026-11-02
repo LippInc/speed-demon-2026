@@ -554,8 +554,8 @@ static void scan_part(Worker *me, int p) {
       SU(rl + nr, PERM(s, rm));
       ndh += (u32)_mm_popcnt_u32(dm);
       nr += (u32)_mm_popcnt_u32(rm);
-      // anchor lanes, left-packed like the rest: a branch per anchor
-      // mispredicted
+      // anchor lanes, left-packed like the rest (the branch per anchor this
+      // replaced mispredicted)
       u32 am = MSK(v);
       SU(aps + na, PERM(pos, am));
       na += (u32)_mm_popcnt_u32(am);

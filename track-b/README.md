@@ -34,7 +34,7 @@ Reads `queries.txt` (50,000 BOOL and PHRASE queries) and `docs.txt` (254 MB, one
 
 ## The approach
 
-Twelve workers, one per hardware thread of the scoring box (the CPU count; `SD_WORKERS` overrides it for our hash tests at 1, 4 and 24 workers). `docs.txt` is mapped read-only, never copied. Times below are from a box timeline of about 54 ms.
+Twelve workers, one per hardware thread of the scoring box (the CPU count; `SD_WORKERS` overrides it for our hash tests at 1, 4 and 24 workers). `docs.txt` is mapped read-only, never copied. Times below are from a box timeline of an earlier build (b-122 and b-123), about 54 ms; the final build is about 2 ms faster.
 
 1. **Queries (setup, 4.3 ms with the steps below).** Each worker parses one slice of `queries.txt` into the shared term table. Every BOOL term is flagged; each phrase is a list of terms.
 2. **Sample and renumber.** Each worker counts tokens per term over a small part of the text. From the summed counts, terms in over 1/32 of the sampled documents are common (about 360), and every term gets a new id: common, then rare BOOL, then phrase-only. Each phrase is listed under its term with the lowest sampled count.
@@ -57,7 +57,7 @@ No locks: the steps meet at barriers, work goes out by atomic counters, and the 
 
 ## Limits
 
-- **A token is matched by its 32-bit tag, not its text.** A word that is no query term passes for one only if its tag equals one in its bucket: about 610,000 distinct tokens × 2.3 terms per bucket × 2^-32, so about 0.03 % per dataset of a wrong answer (counted on seed 1 and a fresh seed; the odds are derived, not measured). We checked the output hash on both seeds at every step.
+- **A token is matched by its 32-bit tag, not its text.** A word that is not a query term is mistaken for one only if its tag happens to equal a tag in its bucket. With about 610,000 distinct tokens, 2.3 terms per bucket and 32-bit tags, that is about a 0.03 % chance of a wrong answer per dataset (counted on seed 1 and a fresh seed; the odds are derived, not measured). We checked the output hash on both seeds at every step.
 - **The hash reads at most 32 bytes of a token.** Two tokens that agree on their first 32 bytes share a key. The longest token on both seeds is 17 bytes; the spec sets no bound.
 - **Three system-level facts the speed leans on:** transparent huge pages available through `madvise`, `/data` already in the page cache, and 12 hardware threads. Without them the program still gives the right answer, only slower (hash tests at 1, 4 and 24 workers).
 
