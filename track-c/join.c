@@ -88,6 +88,7 @@ typedef struct { // the messages from one thread to one owner, RING at most
 // per use, and the hot loop has no register free to keep one (2 % of all instructions).
 #define ALL(x) {x, x, x, x}
 V QUOTE = ALL(0x2222222222222222), DASH = ALL(0x2D2D2D2D2D2D2D2D), ZERO = ALL(0x3030303030303030);
+V CAP = {-1, 1000001, -1, -1}; // a region id above the table: its last entry, unmatched
 static const u8 KEEP[64] = {[0 ... 31] = 0xFF}; // KEEP + 32 - n: n bytes kept
 
 // All memory the threads use, on three transparent huge pages that main
@@ -151,9 +152,8 @@ static inline u64 name_hash(V v, u64 n) {
   return _mm_cvtsi128_si64(_mm_aesenc_si128(_mm_aesenc_si128(h, K1), K2));
 }
 
-// A bit per tag of the 16 at p that equals x
-static inline u32 eq16(const u32 *p, u32 x) {
-  V w = _mm256_set1_epi32(x);
+// A bit per tag of the 16 at p that equals w's
+static inline u32 eq16(const u32 *p, V w) {
   V d = _mm256_cmpeq_epi32(_mm256_load_si256((const V *)p), w);
   V e = _mm256_cmpeq_epi32(_mm256_load_si256((const V *)(p + 8)), w);
   return _mm256_movemask_ps(_mm256_castsi256_ps(d)) |
@@ -163,13 +163,16 @@ static inline u32 eq16(const u32 *p, u32 x) {
 // The slot of the name of message msg; a new name takes the first free slot
 // of the walk. A hit is what nearly all messages find (97%), in the first
 // bucket; only the rest pay for the search for a free slot.
-static inline u32 slot_of(Names *nm, u64 msg) {
-  u32 tag = msg >> 8 | 1, m;
-  for (u64 b = (msg >> 48) * BUCKETS >> 16;; b++) {
+static inline u32 slot_of(Names *nm, const u64 *msg) {
+  // The tag, bits 8 to 39 of the message. A name whose tag is 0 (2^-32) would
+  // share its row with the next name to take that slot.
+  V tag = _mm256_broadcastd_epi32(_mm_loadu_si32((const u8 *)msg + 1));
+  u32 m;
+  for (u64 b = (*msg >> 48) * BUCKETS >> 16;; b++) {
     if (__builtin_expect((m = eq16(nm->tag + 16 * b, tag)) != 0, 1))
       return 16 * b + _tzcnt_u32(m);
-    if ((m = eq16(nm->tag + 16 * b, 0))) {
-      nm->tag[16 * b + _tzcnt_u32(m)] = tag;
+    if ((m = eq16(nm->tag + 16 * b, _mm256_setzero_si256()))) {
+      nm->tag[16 * b + _tzcnt_u32(m)] = *msg >> 8;
       return 16 * b + _tzcnt_u32(m);
     }
   }
@@ -232,7 +235,7 @@ static u64 drain(int t, Agg *a) {
       u32 id[64];
       const u64 *ms = m + h % RING; // never wraps: batches are whole, and 64 divides them
       for (u64 j = 0; j < e - h; j++) {
-        id[j] = slot_of(nm, ms[j]);
+        id[j] = slot_of(nm, ms + j);
         _mm_prefetch((const char *)nm->row[id[j]], _MM_HINT_T0);
       }
       for (u64 j = 0; j < e - h; j++) {
@@ -299,9 +302,10 @@ static inline __attribute__((always_inline)) const u8 *parse(const u8 *b, const 
   // The quote mask starts at w, past most ids, so that for 97% of records it
   // reaches the end of the note. j and d count from w.
   const u8 *w = b + 6;
-  u64 q = quotes(load32(w), w + 32);
-  // A short id (0.6%) or an empty, unquoted name (0.5%)
-  if (__builtin_expect(a < 5 || b[a + 1] == ',', 0)) {
+  u64 q = quotes(load32(w), w + 32), t = _tzcnt_u64(q);
+  // A short id (0.6%) or an empty, unquoted name (0.5%): the mask's first quote
+  // is not the one that opens the name.
+  if (__builtin_expect(t != a - 5, 0)) {
     u64 ne = note_end(b + a + 1), n = (u32)ne;
     j = a + 1 - 6 + n, pq = ne >> 32;
     rc->nl = n - pq / 2 - (n != 0);
@@ -310,16 +314,15 @@ static inline __attribute__((always_inline)) const u8 *parse(const u8 *b, const 
     // Past the opening quote, the commas after the name and after the note
     // are the first two bytes that follow an odd number of quotes and are
     // not one. A "" flips the count twice.
-    // The opening quote is at a - 5.
     o = _andn_u64(q, odd_quotes(_blsr_u64(q)));
     j = _tzcnt_u64(o), o = _blsr_u64(o);
     pq = _mm_popcnt_u64(_bzhi_u64(q, j));
-    rc->nl = j - a + 4 - pq / 2;
+    rc->nl = j - t - 1 - pq / 2;
     // A name of 31 raw bytes or more is not handled; spec 2.2 sets no bound,
     // but over 40 generated seeds the longest was 27 (base name at most 24 by
     // the generator's forms, plus runs of trailing spaces that get rarer
     // about 4 times per extra byte), so about 3e-4 per dataset.
-    rc->h = name_hash(load32(b + a + 2), j - a + 3);
+    rc->h = name_hash(load32(b + a + 2), j - t - 2);
   }
   if (__builtin_expect(o != 0, 1)) {
     d = _tzcnt_u64(o);
@@ -344,12 +347,12 @@ static inline __attribute__((always_inline)) const u8 *parse(const u8 *b, const 
   // point at byte 5; pext drops the point and the shift closes the gap.
   u64 v = *(const u64u *)(r + c + 1) << (64 - 8 * (e - c - 1));
   v = _pext_u64(v, 0xFFFF00FFFFFFFFFF) << 8;
-  V num = fold3(idb, *(const u64u *)r << (64 - 8 * c), v);
-  u64 rid = _mm256_extract_epi64(num, 1), top = 1000001; // top: unmatched
+  V num = _mm256_min_epu32(fold3(idb, *(const u64u *)r << (64 - 8 * c), v), CAP);
+  rc->id = _mm256_cvtsi256_si32(num);
+  u64 rid = _mm256_extract_epi64(num, 1);
   int32_t cents = _mm256_extract_epi64(num, 2);
-  rid = rid < top ? rid : top;
   _mm_prefetch((const char *)rt + rid, _MM_HINT_T0);
-  rc->id = _mm256_cvtsi256_si32(num), rc->reg = rid, rc->cents = r[c + 1] == '-' ? -cents : cents;
+  rc->reg = rid, rc->cents = r[c + 1] == '-' ? -cents : cents;
   // The next record: past the end and, if the next byte is a low one too, past
   // that: an LF after a CR, or a BOM's first byte after an LF (parse's first test).
   return r + e + 1 + (m >> (e + 1) & 1);
