@@ -2,9 +2,10 @@
 //
 // Only the query terms are indexed. All workers parse queries.txt at once into
 // one shared term table, sample the corpus and renumber the terms by class.
-// Then the corpus goes through in phases of at most PHDOCS documents, so a
-// document's number within its phase fits a u16. Each phase has three steps,
-// each handing out its work by atomic counter:
+// Then the corpus goes through in phases of about PHDOCS documents, cut by
+// bytes; a check stops the program if one reaches 65,535, so a document's
+// number within its phase fits a u16. Each phase has three steps, each handing
+// out its work by atomic counter:
 //   scan    workers claim parts of the phase's text and look up every token. A
 //           common BOOL term (in over 1/32 of the sample, about 360 of them)
 //           sets a bit in its bitmap row, a rare one goes to a per-shard
@@ -16,8 +17,9 @@
 //           query's tally. Phases run in document order, so the first ten ids
 //           a tally collects are the query's ten smallest.
 // Last, each worker formats the lines of the queries it parsed and main writes
-// them in order. No locks: the steps meet at barriers, and the one write two
-// workers can race on, a new term in the table, is a compare-and-swap.
+// them in order. No locks: the steps meet at barriers, and what two workers can
+// write at once is atomic: a new term by compare-and-swap, flags and counters
+// by relaxed stores and fetch-adds.
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <immintrin.h>
@@ -127,7 +129,7 @@ static Worker wk[WMAX];
 static u8 *wmem;
 static size_t WS;
 // Parts per worker per phase: claiming small parts keeps one slowed worker from
-// holding up a phase (beside one busy process, 72.6 -> about 62 ms).
+// holding up a phase (beside one busy process, 72.6-79 -> 64-68 ms).
 #define CK 4
 // workers, parts, phases, parts per phase
 static int nw, P, PH, NC;
@@ -181,6 +183,8 @@ static void *arena(size_t n, int hp) {
   return p;
 }
 
+// dir/name mapped read-only, its size in *len; a failure stops the program with
+// the path.
 static const u8 *map_file(const char *dir, const char *name, size_t *len) {
   char path[4096];
   snprintf(path, sizeof path, "%s/%s", dir, name);
@@ -262,8 +266,9 @@ static u32 probe(u64 h, u32 b) {
 
 static inline u32 lookup(const u64 *ph) {
   const Bucket *t = BKT(*ph);
-  u32 m = MSK(_mm256_cmpeq_epi32(_mm256_load_si256((const V *)t->tag),
-                                 S32(((const int *)ph)[1])));
+  u32 m = MSK(
+      _mm256_cmpeq_epi32(_mm256_load_si256((const V *)t->tag),
+                         S32(((const int __attribute__((may_alias)) *)ph)[1])));
   return t->val[_tzcnt_u32(m | 128)];
 }
 // v, a lookup's answer, with a PROBE resolved
@@ -326,7 +331,8 @@ static const u8 *tokenize(const u8 *q, u64 *keys, u32 *pn, u32 *dk, u32 d) {
     u64 s0 = _bzhi_u64(mm & ~(mm << 1), (u32)cut), s = s0, *kp = keys + n;
     SU(dk + n, DV);
     for (u32 j = 0; j < TK; j++, s &= s - 1) {
-      u64 st = _tzcnt_u64(s), L = _tzcnt_u64(nm >> st);
+      // s empty: st is 64, and the mask keeps the shift defined
+      u64 st = _tzcnt_u64(s), L = _tzcnt_u64(nm >> (st & 63));
       kp[j] = hash_at(q + st, L);
     }
     n += (u32)_mm_popcnt_u64(s0 ^ s);
@@ -401,8 +407,8 @@ static void parse(const u8 *p, const u8 *e, u32 q) {
   }
 }
 
-// ---------------------------------------------------------------- sampling,
-// renumbering Token counts per term slot over the first 1/12 of part w * CK, so
+// ---------------------------------------------------- sampling, renumbering
+// Token counts per term slot over the first 1/12 of part w * CK, so
 // the workers' samples lie spread over the first phase. sdf[slot] stops at 255.
 // Repeats within a document count too: only a rough rate is needed, and no
 // dedupe is cheaper.
@@ -884,6 +890,9 @@ static void finish(Worker *me, int c) {
 
 // ---------------------------------------------------------------- worker
 static pthread_t th[WMAX];
+// One worker's whole run, in order: parse its share of the queries, sample,
+// renumber, then scan, build and answer each phase, and format its results.
+// Every step that needs the others waits at a barrier. Worker 0 is main itself.
 static void *worker(void *arg) {
   int w = (int)(long)arg;
   // the threads start each other, a binary tree
@@ -1056,6 +1065,8 @@ static void *worker(void *arg) {
   return NULL;
 }
 
+// Maps the inputs, sets up the shared tables and the phases' parts, runs worker
+// 0 (which starts the others), then writes each worker's lines in query order.
 int main(int argc, char **argv) {
   const char *in = argc > 1 ? argv[1] : "/data",
              *out = argc > 2 ? argv[2] : "/out";
@@ -1078,6 +1089,7 @@ int main(int argc, char **argv) {
   for (u32 L = 0; L < 129; L++)
     memset(LM[L], 0xFF, L < 16 ? L : 16);
   // on the huge region: each worker's sample counts, their sums, the new ids
+  // sdfsize: the part of it faulted ahead at thread start (b-121), 12 MB here
   sdfs = arena(HPV, 1), sdfsize = dlen / 21;
   sampdf = (u32 *)(sdfs + (size_t)nw * NSLOT), newid = sampdf + NSLOT;
   // one arena block: aoff, qterm, qop, aq, aj, an, qk, qkind

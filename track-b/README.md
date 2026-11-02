@@ -4,56 +4,56 @@ Reads `queries.txt` (50,000 BOOL and PHRASE queries) and `docs.txt` (254 MB, one
 
 ## For the judges, in one minute
 
-- **The code:** one file, [bindex.c](bindex.c), C17 with no dependencies, formatted with clang-format's defaults, so the lines you read are the lines S counts. Its top comment gives the design, and each function's comment says why it is shaped the way it is. Errors on open, map, allocation and write stop the program with the path or call that failed.
+- **The code:** one file, [bindex.c](bindex.c), C17 with no dependencies, formatted with clang-format's defaults, so the lines you read are the lines S counts. Its top comment gives the design, and the comments on the fast paths say why they are shaped the way they are. Errors on open, map, allocation and write stop the program with the path or call that failed.
 - **The result:** 56.35 s → 53.8 ms (about 1,050×), 2.2 GB → 43 MB. The best board run, run-9066adc75374 (commit c8dd92c, whose Track B code is d25bbb9): T 53.82 ms, M 43.27 MB, S 805, D 1, K 51.02. That code's other board runs read T 54.10 to 58.31 ms, since the board is noisy while its queue is busy. Our copy of the scoring machine reads it at 52.2 ms.
-- **This tip:** the same hot loops, with one small speed-up (box about 52 ms), the comments rewritten for the final design and the setup code unfolded so it reads plainly: S 845, about 0.7 % of K given back for that on purpose ([PERF.md](PERF.md), b-126).
+- **This tip:** the same hot loops, with one small speed-up (box about 52 ms), the comments rewritten for the final design and the setup code unfolded so it reads plainly: S 845, about 0.7 % of K given back for that on purpose ([PERF.md](PERF.md), b-126 and b-127).
 - **Reproduce:** from the repository root, `python3 check.py b --data data/b --expected f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`.
 - **The honest limit:** a token is matched by a hash, not its text. About 1 dataset in 3,200 would get a wrong answer; neither of ours does (counted, see [Limits](#limits)). Three system facts carry the speed: huge pages through `madvise`, the data already in the page cache, and 12 hardware threads.
 - **S** is the board's count of code lines after clang-format, plus 6 for the Dockerfile; comments and blank lines do not count.
 - **Where each criterion's evidence is:**
   - Code quality: bindex.c's header and function comments.
   - Technique: the table below, each trick linked to its line.
-  - Optimisation log: [PERF.md](PERF.md), every step with its board run, failed experiments included. The last redesign, 103 ms to 52 ms, has its own section near the top, with the measurement errors we made and caught.
+  - Optimisation log: [PERF.md](PERF.md), every step, with its board run wherever we hold the ID (a row without one gives its commit), failed experiments included. The last redesign, 103 ms to 52 ms, has its own section near the top, with the measurement errors we made and caught.
 
 | Trick | Where |
 |---|---|
-| Only the query terms are indexed. All workers parse the queries at once into one shared table; a new term is claimed with a compare-and-swap, no lock | [`intern`](bindex.c#L277), [`parse`](bindex.c#L376) |
-| A token's key is two AES rounds over its lowercased bytes, cut to length by a mask table indexed by the length (gcc made the obvious `L < 16 ? L : 16` a branch that mispredicted: 3 ms on the box, about 12 ms on the board). The key's low bits are its bucket's byte offset and its high half a 32-bit tag | [`hash_at`](bindex.c#L234) |
-| A bucket is one cache line: 7 tags, their values and an eighth value that answers a miss. A lookup compares all the tags at once and reads the value at the match's index, or at 7, so a hit and a miss take the same path. The table sits on one 2 MB page and is addressed directly, without a pointer load | [`lookup`](bindex.c#L263) |
-| Tokens cut 64 bytes at a time from AVX2 class masks. Each round always hashes 8 tokens and moves to the first token it did not take, so no loop exit per window can mispredict | [`tokenize`](bindex.c#L319) |
-| Whole documents go through in batches, a sentinel key after each document. The sentinel answers as a miss, so no phrase crosses a document's edge and no bound is checked per token. A lookup prefetches the bucket 12 tokens ahead, into the next batch, which is tokenized first | [`batch`](bindex.c#L488), [`scan_part`](bindex.c#L510) |
-| One loop only looks up. A second takes the ids 8 at a time: common hits, rare hits and anchors fall out as masks and are left-packed with an AVX2 permute, so no branch depends on a token's class | [`scan_part`](bindex.c#L510) |
-| A common term's hit is one OR into that term's word for the current 64 documents, stored to its bitmap row at each row's end. It replaced 64×64 bit transposes | [`scan_part`](bindex.c#L510) |
-| A rare term's hit goes to a per-worker stream for its shard of 2,048 terms. Lists are built per shard by claim: counted, placed at a shared cursor, filled in document order, 16-bit ids after a sentinel that drops repeats | [`build`](bindex.c#L606) |
-| Term ids renumbered by class: common (over 1/32 of a sample), rare BOOL, phrase-only. Each worker counts one slot range, and the counts' prefix sums give each range its first ids | [`cls`](bindex.c#L438), [`worker`](bindex.c#L887) |
-| A phrase is checked during the scan at each occurrence of its rarest term. The anchor's entry holds the neighbouring term's id, so most candidates are rejected without touching the query | [`match_phrases`](bindex.c#L448) |
-| One index per phase, answered by claim into a running tally per query: phases run in document order, so there are no per-part records and no merge. Results stay lists while small and become bitmaps once a common term joins by OR | [`eval_range`](bindex.c#L790), [`emit`](bindex.c#L757) |
-| AND and NOT compare 8-value blocks with SSE4.2, with no branch on which side advances; a short list against a long one binary-searches it in constant steps. A long OR goes through a bitmap. A query's last OR, once it holds its ten ids, takes count and sum as a + b - (a AND b), with no merge | [`filt`](bindex.c#L689), [`lower`](bindex.c#L636), [`eval_range`](bindex.c#L790) |
-| A bitmap's count and id sum from AVX2 nibble tables, 256 bits per step | [`bsum`](bindex.c#L651) |
-| Parts of the text are claimed, four per worker per phase, so a worker slowed by a neighbour no longer holds up a phase | [`worker`](bindex.c#L887) |
-| Rows, tallies and lists share one huge-page region, each page faulted once by one thread. It removed a page-table lock fight: 4 KB first touches by 12 threads took 20 % of all kernel cycles | [`arena`](bindex.c#L174), [`worker`](bindex.c#L887) |
-| Each worker drops its share of the text's page-table entries with `MADV_DONTNEED` during the run, in parallel, so exit does not tear them all down on one thread | [`worker`](bindex.c#L887) |
+| Only the query terms are indexed. All workers parse the queries at once into one shared table; a new term is claimed with a compare-and-swap, no lock | [`intern`](bindex.c#L282), [`parse`](bindex.c#L382) |
+| A token's key is two AES rounds over its lowercased bytes, cut to length by a mask table indexed by the length (gcc made the obvious `L < 16 ? L : 16` a branch that mispredicted: 3 ms on the box, 5 to 12 ms in single board runs). The key's low bits are its bucket's byte offset and its high half a 32-bit tag | [`hash_at`](bindex.c#L238) |
+| A bucket is one cache line: 7 tags, their values and an eighth value that answers a miss. A lookup compares all the tags at once and reads the value at the match's index, or at 7, so a hit and a miss take the same path. The table sits on one 2 MB page and is addressed directly, without a pointer load | [`lookup`](bindex.c#L267) |
+| Tokens cut 64 bytes at a time from AVX2 class masks. Each round always hashes 8 tokens and moves to the first token it did not take, so no loop exit per window can mispredict | [`tokenize`](bindex.c#L324) |
+| Whole documents go through in batches, a sentinel key after each document. The sentinel answers as a miss, so no phrase crosses a document's edge and no bound is checked per token. A lookup prefetches the bucket 12 tokens ahead, into the next batch, which is tokenized first | [`batch`](bindex.c#L494), [`scan_part`](bindex.c#L516) |
+| One loop only looks up. A second takes the ids 8 at a time: common hits, rare hits and anchors fall out as masks and are left-packed with an AVX2 permute, so no branch depends on a token's class | [`scan_part`](bindex.c#L516) |
+| A common term's hit is one OR into that term's word for the current 64 documents, stored to its bitmap row at each row's end. It replaced 64×64 bit transposes | [`scan_part`](bindex.c#L516) |
+| A rare term's hit goes to a per-worker stream for its shard of 2,048 terms. Lists are built per shard by claim: counted, placed at a shared cursor, filled in document order, 16-bit ids after a sentinel that drops repeats | [`build`](bindex.c#L612) |
+| Term ids renumbered by class: common (over 1/32 of a sample), rare BOOL, phrase-only. Each worker counts one slot range, and the counts' prefix sums give each range its first ids | [`cls`](bindex.c#L444), [`worker`](bindex.c#L896) |
+| A phrase is checked during the scan at each occurrence of its rarest term. The anchor's entry holds the neighbouring term's id, so most candidates are rejected without touching the query | [`match_phrases`](bindex.c#L454) |
+| One index per phase, answered by claim into a running tally per query: phases run in document order, so there are no per-part records and no merge. Results stay lists while small and become bitmaps once a common term joins by OR | [`eval_range`](bindex.c#L796), [`emit`](bindex.c#L763) |
+| AND and NOT compare 8-value blocks with SSE4.2, with no branch on which side advances; a short list against a long one binary-searches it in constant steps. A long OR goes through a bitmap. A query's last OR, once it holds its ten ids, takes count and sum as a + b - (a AND b), with no merge | [`filt`](bindex.c#L695), [`lower`](bindex.c#L642), [`eval_range`](bindex.c#L796) |
+| A bitmap's count and id sum from AVX2 nibble tables, 256 bits per step | [`bsum`](bindex.c#L657) |
+| Parts of the text are claimed, four per worker per phase, so a worker slowed by a neighbour no longer holds up a phase | [`worker`](bindex.c#L896) |
+| Rows, tallies and lists share one huge-page region, each page faulted once by one thread. It removed a page-table lock fight: 4 KB first touches by 12 threads took 20 % of all kernel cycles | [`arena`](bindex.c#L176), [`worker`](bindex.c#L896) |
+| Each worker drops its share of the text's page-table entries with `MADV_DONTNEED` during the run, in parallel, so exit does not tear them all down on one thread | [`worker`](bindex.c#L896) |
 
 ## The approach
 
 Twelve workers, one per hardware thread of the scoring box (the CPU count; `SD_WORKERS` overrides it for our hash tests at 1, 4 and 24 workers). `docs.txt` is mapped read-only, never copied. Times below are from a box timeline of an earlier build (b-122 and b-123), about 54 ms; the final build is about 2 ms faster.
 
 1. **Queries (setup, 4.3 ms with the steps below).** Each worker parses one slice of `queries.txt` into the shared term table. Every BOOL term is flagged; each phrase is a list of terms.
-2. **Sample and renumber.** Each worker counts tokens per term over a small part of the text. From the summed counts, terms in over 1/32 of the sampled documents are common (about 360), and every term gets a new id: common, then rare BOOL, then phrase-only. Each phrase is listed under its term with the lowest sampled count.
-3. **Four phases of at most 63,000 documents**, so a document's number fits 16 bits, each with three steps at a barrier:
+2. **Sample and renumber.** Each worker counts tokens per term over a small part of the text. From the summed counts, terms whose sampled token count is over 1/32 of the sampled documents are common (about 360), and every term gets a new id: common, then rare BOOL, then phrase-only. Each phrase is listed under its term with the lowest sampled count.
+3. **Four phases of about 62,500 documents**, cut by bytes, with a check that stops the program if one reaches 65,535, so a document's number fits 16 bits, each with three steps at a barrier:
    - **Scan (8.7 ms, then 8.05 ms).** Workers claim parts of the phase's text and run the two loops above. Phrases are checked here.
    - **Build (1.1 ms).** Workers claim term shards and turn the streams into sorted lists.
    - **Answer (2.8 ms, then 2.3 ms).** Workers claim blocks of 64 queries and fold each BOOL query left to right over its lists and rows, adding the result to its tally.
 4. **Format (0.55 ms).** Each worker formats the lines of the queries it parsed. The main thread writes the slices in order (0.65 ms).
 5. **Exit (1.2 ms).** About 1.2 ms goes to freeing the remaining 4 KB pages at exit, and 0.5 ms to process start. Both are inside T.
 
-No locks: the steps meet at barriers, work goes out by atomic counters, and the one write two workers can race on, a new term in the table, is a compare-and-swap.
+No locks: the steps meet at barriers, work goes out by atomic counters, and what two workers can write at once is atomic: a new term by compare-and-swap, flags and counters by relaxed stores and fetch-adds.
 
 ## Why it is shaped this way
 
 - **One index per phase, one tally per query.** The earlier design answered every query per part and merged the records at the end. Sharing one index across all workers per phase took the box from 103 to 84 ms at a lower peak (39 MB), and dropped the merge.
 - **Memory is spent up to the cap, not below it.** K's memory factor stops paying at 50× the reference, about 44 MB on this track, so every M under that scores the same, and we buy time with what is left (M 43 MB).
-- **Branches over instructions.** The biggest single wins were mispredicts, and the board pays much more for them than our box does (the same branch: 12 ms there, 3 ms here). So the token path has no branch on a token's class, a hit or miss, or a loop exit per window.
+- **Branches over instructions.** The redesigns gave the biggest wins. Among the smaller ones mispredicts stood out, because the board pays more for them than our box does (the same branch: 5 to 12 ms in single board runs, 3 ms here). So the token path has no branch on a token's class, a hit or miss, or a loop exit per window.
 - **Exact bytes are never compared.** Comparing text would mean a second load per token. A 32-bit tag in a 15-bit bucket is enough at this scale; the odds are under "Limits".
 - **Rows only for common terms.** A row costs one bit per document whether the term occurs there or not; for the rare terms, about 53,000 of them, a sorted list is smaller and folds faster.
 
