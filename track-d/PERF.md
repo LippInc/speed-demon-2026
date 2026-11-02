@@ -68,10 +68,13 @@ Every step from the reference to our final version, with every live-board run th
 | 61 | d-27: bucket queue, 256-settle forward probe, drop build buffers, 4-byte packed edges (commits 8ea91ed, e43fdf4, 8d7ddd4, a1f9f32, f91ea98) | run-90db6f3cc3ba | 0.19 | 110 | 64.6 |
 | 62 | D unchanged (code of row 61); re-scored by a track C push | run-8469ea648aca | 0.20 | 108 | 64.4 |
 | 63 | d-27 r1 + d-28: work-balanced search, early probe return, reverse CSR atomic placement (commits 864d392, af13865, cc8abd2, 7e2c03d) | run-e22137237ce5 | 0.19 | 111 | 64.8 |
+| 64 | d-29 and later Rust lifts (tip 172a905); scored by a track C push | run-d24d95933e61 | 0.17 | 107 | 66.1 |
+| 65 | D unchanged (code of row 64 plus comments and text, 59cfb26); re-scored by a track A push | run-69e6fabffb63 | 0.18 | 110 | 65.3 |
+| 66 | d-40: rewrite in C, all phases redesigned (commits 3973446, 54d3dd5, scored at tip 3a2e0c6) | run-d88f87a079dc | 0.07 | 60 | 76.9 |
 
 ## How to read the table
 
-Every push to the repository re-evaluates all four competition tracks on the official leaderboard. Because multiple tracks share one repository, 51 out of the 63 rows represent re-measurements of unchanged Track D binaries triggered by changes to tracks A, B, C, or root configuration. These repeated runs document real-world host measurement variance on unchanged code. Across 11 consecutive runs of the row 31 code (rows 31 to 41), wall time spans from 0.23 s to 0.25 s. Across 14 runs of the row 42 code (rows 42 to 55), wall time spans from 0.23 s to 0.31 s, with transient host-load spikes reaching 0.31 s (row 47) and 0.48 s (row 13).
+Every push to the repository re-evaluates all four competition tracks on the official leaderboard. Because multiple tracks share one repository, 51 of the first 63 rows represent re-measurements of unchanged Track D binaries triggered by changes to tracks A, B, C, or root configuration. These repeated runs document real-world host measurement variance on unchanged code. Across 11 consecutive runs of the row 31 code (rows 31 to 41), wall time spans from 0.23 s to 0.25 s. Across 14 runs of the row 42 code (rows 42 to 55), wall time spans from 0.23 s to 0.31 s, with transient host-load spikes reaching 0.31 s (row 47) and 0.48 s (row 13).
 
 ## From the reference to step 1
 
@@ -166,3 +169,25 @@ Failed tries in this rewrite:
 - 6, 8 and 10 query workers against 12: queries 50, 44 and 38 ms against 35 at that point. 12 stays.
 
 Official harness on box 1 for this code: D T 0.0706 s, M 60.49 MB, S 884, K 34.94 against the board's calibration; D-fresh T 0.0728 s, M 60.3 MB, K 34.43.
+
+## d-41: fewer loads per edge, fewer lines
+
+The numbers are box medians on D from interleaved rounds of two builds, each run's output hash checked. The profile said a third of the search went on the queue: the push ran for every scanned edge, written without a branch, though only 7.1 M of 17.5 M scanned edges improve a label.
+
+- Three node flags merged into one byte array, prefetched with the row: zones 17.15 -> 14.91 ms, rows 5.45 -> 5.06 ms.
+- A popped node whose distance plus the other side's floor already reaches the best meeting is skipped (KNOWN): queries 27.6 -> 27.0 ms.
+- A pass over a bucket only writes what improved to a list, one store and one counter per edge, and the pushes run after the pass. The occupancy bitmap went too, since finding the next bucket from the counts costs next to nothing: queries 27.06 -> 24.24 ms.
+- The other side's label is read only for an improved label: an edge that improves nothing cannot make a new meeting, because the later of the two label writes already saw the pair. Queries 24.21 -> 21.16 ms, and 17.5 M pairs of loads become 7.1 M.
+- Lines, S 884 -> 781: no query sort (queries +0.45 ms, sort -0.32 ms, so level, and 10 lines less), zones as the rename's work units instead of spans, a 128-bit heap key in the 64-bit search, its memory released after each use instead of a list of touched nodes. Phase sum +0.2 ms.
+
+Failed tries:
+
+- The state array on a huge page: phase sum 67.36 -> 67.63 ms. Dropped.
+- Buckets 64 wide (1,024 of them): 67.48 -> 67.57 ms, fresh seed 69.71 -> 70.06 ms. Stays 128.
+- Skipping the push as well as the pop against the other side's floor: no better than the pop alone (27.28 against 27.02 ms, same baseline). The label write it saves is cheap.
+- Dropping entries beaten within the same pass before queueing them: queries -1.5 ms against -3.05 ms without the check. Dropped.
+- Local copies of the label pointers: within noise. Dropped.
+- Expanding the side with the smaller current bucket instead of fewer queued entries: queries 21.19 -> 21.74 ms. Dropped.
+- One reserved stretch per bucket, no growing and no free list: queries -0.44 ms and about 30 lines less, but the query phase's memory rose 6.4 MB and became the run's peak, with a page-table page per touched bucket on top. Recycled arrays stay.
+
+Official harness on box 1 for this code: D T 0.0627 s, M 60.31 MB, S 781, K 37.78; D-fresh T 0.0643 s, M 60.56 MB, K 37.27. Correct on D, D-fresh, 1, 4, 12 and 24 workers, the worked example, and generator seeds 11-15 at two scales.
