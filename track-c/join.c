@@ -3,12 +3,12 @@
 //
 // How it works, and why it is fast:
 //  1. Twelve threads, one per hardware thread of the scoring box's six
-//     P-cores. They take 256 KB pieces of the file from a shared counter, so
+//     P-cores. They take 128 KB pieces of the file from a shared counter, so
 //     a thread that another process slows down takes fewer. A thread owns
 //     the records that start in its piece.
-//  2. Each record is read once, front to back, from one quote mask of its
-//     first 64 bytes. The first quote ends the id. A carry-less multiply turns
-//     the mask into "follows an odd number of quotes", which picks out the
+//  2. Each record is read once, front to back, from one quote mask of 64 bytes
+//     starting past most ids. A carry-less multiply turns the mask into
+//     "follows an odd number of quotes", which picks out the
 //     commas after the name and the note, however many "" they hold. The region
 //     and the amount follow, 19 bytes at most. Only the first record of a piece
 //     needs another rule: an LF inside a quoted note is always followed by a
@@ -90,12 +90,13 @@ typedef struct { // the messages from one thread to one owner, RING at most
 // per use, and the hot loop has no register free to keep one (2 % of all instructions).
 #define ALL(x) {x, x, x, x}
 V QUOTE = ALL(0x2222222222222222), DASH = ALL(0x2D2D2D2D2D2D2D2D), ZERO = ALL(0x3030303030303030);
-V CAP = {-1, 1000001, -1, -1}; // a region id above the table: its last entry, unmatched
+// A region id above the table: its last entry, unmatched
+V CAP = {-1, 1000001, -1, -1};
 static const u8 KEEP[64] = {[0 ... 31] = 0xFF}; // KEEP + 32 - n: n bytes kept
 
-// All memory the threads use, on three transparent huge pages that main
-// faults in before any thread starts, so no thread ever page-faults on
-// anonymous memory. A fixed address: an aligned static object would put the
+// All memory the threads use, on three transparent huge pages that main and
+// one helper fault in before parsing starts, so no other thread ever page-faults
+// on anonymous memory. A fixed address: an aligned static object would put the
 // small variables around it on two more huge pages. It lies past the first GB
 // above the program, where the kernel starts the heap at random, and with it
 // main's thread pointer: at 1 << 30 this map erased those in 0.5 % of runs (PERF.md).
@@ -130,10 +131,11 @@ static inline u32 eq32(V a, V b) { // a bit per byte of a == b
 static inline V fold3(u64 a, u64 b, u64 c) {
   V x = _mm256_set_epi64x(0, c, b, a);
   x = _mm256_subs_epu8(x, ZERO);
-  x = _mm256_maddubs_epi16(x, _mm256_set_epi64x(0, 0x010A0001010A010A, 0x010A010A010A010A, 0x010A010A010A010A)); // 10a + b
+  long long d = 0x010A010A010A010A;
+  x = _mm256_maddubs_epi16(x, _mm256_set_epi64x(0, 0x010A0001010A010A, d, d)); // 10a + b
   x = _mm256_madd_epi16(x, _mm256_set1_epi32(0x00010064));   // 100a + b
-  return _mm256_add_epi64(_mm256_mul_epu32(x, _mm256_set_epi64x(0, 1000, 10000, 10000)),
-                          _mm256_srli_epi64(x, 32));         // 10000a + b
+  V y = _mm256_mul_epu32(x, _mm256_set_epi64x(0, 1000, 10000, 10000));
+  return _mm256_add_epi64(y, _mm256_srli_epi64(x, 32));      // 10000a + b
 }
 
 // A bit per quote byte of 64 bytes: the first 32 in v, then those at p
@@ -141,11 +143,10 @@ static inline u64 quotes(V v, const u8 *p) {
   return eq32(v, QUOTE) | (u64)eq32(load32(p), QUOTE) << 32;
 }
 
-// Name hashing: 32 bytes v at a time go into the 128-bit state h, the first
-// 16 by XOR and the last 16 as the key of one AES round. After two more
-// rounds every name byte has reached all 128 bits of the state. One round is
-// a bijection, so names of up to 16 bytes cannot collide before the state is
-// cut to 64 bits.
+// Name hashing: of the 32 bytes v, the first 16 are the 128-bit state and the
+// last 16 the key of one AES round. After two more rounds every name byte has
+// reached all 128 bits of the state. One round is a bijection, so names of up
+// to 16 bytes cannot collide before the state is cut to 64 bits.
 #define K1 _mm_set_epi64x(0x589965CC75374CC3, 0xE7037ED1A0B428DB)
 #define K2 _mm_set_epi64x(0x1D8E4E27C47D124F, 0x9E3779B97F4A7C15)
 // v's first n bytes are the name
@@ -198,11 +199,11 @@ static int country(const u8 *p) { // numbers countries in order of first sight
   return c;
 }
 
-// The lines that start in this thread's eleventh of regions.csv (thread 1's
-// first line, the header, starts at 0 and is skipped). Thread 0, main, has none:
-// it is still faulting memory in.
+// The lines that start in this thread's tenth of regions.csv (thread 1's first
+// line, the header, starts at 0 and is skipped). Threads 0, main, and 11 have
+// none: they are still faulting memory in.
 static void regions(int t) {
-  u64 p = t > 1 ? regsize * (t - 1) / (NT - 1) : 1, e = regsize * t / (NT - 1);
+  u64 p = t > 1 ? regsize * (t - 1) / (NT - 2) : 1, e = regsize * t / (NT - 2);
   while (p < e && reg[p - 1] != '\n')
     p++;
   while (p < e) { // "id,CCC\n": plain ASCII, spec 2.3
@@ -236,7 +237,8 @@ static u64 drain(int t, Agg *a) {
     for (u64 e; h < k; h = e) {
       e = k - h < 64 ? k : h + 64;
       u32 id[64];
-      const u64 *ms = m + h % RING; // never wraps: batches are whole, and 64 divides them
+      // Never wraps: batches are whole, and 64 divides them
+      const u64 *ms = m + h % RING;
       for (u64 j = 0; j < e - h; j++) {
         id[j] = slot_of(nm, ms + j);
         _mm_prefetch((const char *)nm->row[id[j]], _MM_HINT_T0);
@@ -339,7 +341,8 @@ static inline __attribute__((always_inline)) const u8 *parse(const u8 *b, const 
   // loses qn / 2 + 1 bytes; an unquoted one is empty (1.5%).
   u64 len = d - j - 1;
   rc->tb = len - qn / 2 - (len != 0);
-  u64 idb = *(const u64u *)b << (24 - 8 * t & 63); // the id in the top of the lane; it has t + 5 digits
+  // The id in the top of the lane; it has t + 5 digits
+  u64 idb = *(const u64u *)b << (24 - 8 * t & 63);
   // The region and the amount. The commas, CRs and LFs are the bytes below '-';
   // digits, '-' and '.' are not. A BOM's first byte is too, as a signed byte.
   const u8 *r = w + d + 1;
@@ -347,11 +350,12 @@ static inline __attribute__((always_inline)) const u8 *parse(const u8 *b, const 
   u64 c = _tzcnt_u64(m);
   m = _blsr_u64(m);
   u64 e = _tzcnt_u64(m); // the comma, the end of the amount
-  u64 v = *(const u64u *)(r + c + 1) << (64 - 8 * (e - c - 1)); // the amount, up in the top of the lane
-  V num = _mm256_min_epu32(fold3(idb, *(const u64u *)r << (64 - 8 * c), v), CAP);
-  rc->id = _mm256_cvtsi256_si32(num);
-  u64 rid = _mm256_extract_epi64(num, 1);
-  int32_t cents = _mm256_extract_epi64(num, 2);
+  // The amount, up in the top of the lane
+  u64 v = *(const u64u *)(r + c + 1) << (64 - 8 * (e - c - 1));
+  V f = _mm256_min_epu32(fold3(idb, *(const u64u *)r << (64 - 8 * c), v), CAP);
+  rc->id = _mm256_cvtsi256_si32(f);
+  u64 rid = _mm256_extract_epi64(f, 1);
+  int32_t cents = _mm256_extract_epi64(f, 2);
   _mm_prefetch((const char *)rt + rid, _MM_HINT_T0);
   rc->reg = rid, rc->cents = r[c + 1] == '-' ? -cents : cents;
   // The next record: past the whole run of low bytes, an LF after a CR and a
@@ -372,10 +376,10 @@ static void records(Ctx *x, const u8 *a, const u8 *m, const u8 *e) {
       a = parse(a, rt, rs + n, &oa);
       b = parse(b, rt, rs + n + 1, &ob);
     }
+    if (a >= m) // the first half is done: the second's cursor goes on alone
+      a = b, m = e, oa = ob, b = e;
     for (; n < RUN && a < m; n++)
       a = parse(a, rt, rs + n, &oa);
-    for (; n < RUN && b < e; n++)
-      b = parse(b, rt, rs + n, &ob);
     for (u64 r = 0; r < n; r++) {
       u64 co = rt[rs[r].reg], h = rs[r].h;
       Agg *g = ag + co;
@@ -398,6 +402,12 @@ static void records(Ctx *x, const u8 *a, const u8 *m, const u8 *e) {
   }
 }
 
+// Reads one byte per 2 MB up to the last byte, to fault the page-table pages in.
+static void touch(const u8 *p, u64 n) {
+  for (u64 i = 0; i < n + (1 << 21) - 1; i += 1 << 21)
+    (void)((volatile const u8 *)p)[i < n ? i : n - 1];
+}
+
 static int worker(void *arg) {
   int t = (int)(intptr_t)arg;
   Ctx *x = &mem.ctx[t];
@@ -406,7 +416,11 @@ static int worker(void *arg) {
     x->fill[o] = o * BATCH;
   for (int c = 0; c < 256; c++)
     mem.agg[t][c] = (Agg){.min = INT64_MAX, .max = INT64_MIN};
-  regions(t);
+  if (t == NT - 1) { // the helper; main does the same with the other huge page and half
+    ((volatile u8 *)&mem)[2 << 21] = 0;
+    touch(rec + rsize / 2, rsize - rsize / 2);
+  } else
+    regions(t);
   meet(NT); // the region table is complete
   // Piece i is the (i / n)th of the 2 MB stretch i % n: threads working at
   // once never share a stretch's page-table lock when they fault pages in.
@@ -437,14 +451,15 @@ static int worker(void *arg) {
 }
 
 static void money(FILE *o, long long v) { // cents as -?D+.DD
-  fprintf(o, " %s%lld.%02lld", v < 0 ? "-" : "", llabs(v) / 100, llabs(v) % 100);
+  fprintf(o, " %s%lld.%02lld", "-" + (v >= 0), llabs(v) / 100, llabs(v) % 100);
 }
 
 // Country c's line: the threads' totals added up
 static void report(FILE *o, const char *code, int c) {
   Agg g = mem.agg[0][c];
   for (int t = 1; t < NT; t++) {
-    const long long *a = (long long *)&mem.agg[t][c]; // the five additive fields
+    // The five additive fields
+    const long long *a = (long long *)&mem.agg[t][c];
     for (int i = 0; i < 5; i++)
       ((long long *)&g)[i] += a[i];
     g.min = a[5] < g.min ? a[5] : g.min;
@@ -456,28 +471,24 @@ static void report(FILE *o, const char *code, int c) {
   fprintf(o, " %lld %lld %lld\n", g.names, g.nt & UINT32_MAX, g.nt >> 32);
 }
 
-// Reads one byte per 2 MB up to the last byte, to fault the page-table pages in.
-static void touch(const u8 *p, u64 n) {
-  for (u64 i = 0; i < n + (1 << 21) - 1; i += 1 << 21)
-    (void)((volatile const u8 *)p)[i < n ? i : n - 1];
-}
-
 int main(void) {
   int rfd = open("/data/records.csv", O_RDONLY);
   int gfd = open("/data/regions.csv", O_RDONLY);
+  if (rfd < 0 || gfd < 0) die("/data");
   rsize = lseek(rfd, 0, SEEK_END), regsize = lseek(gfd, 0, SEEK_END);
   // records.csv is mapped over the start of a zeroed reservation one page
   // longer, so the vector loads that run past its end read zeros.
-  // A failed open or map crashes at the first touch, which fails the run just as loudly.
+  // A failed map crashes at the first touch, which fails the run just as loudly.
   int anon = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
   rec = mmap(0, rsize + 4096, PROT_READ, anon, -1, 0);
   mmap((u8 *)rec, rsize, PROT_READ, MAP_PRIVATE | MAP_FIXED, rfd, 0);
   reg = mmap(0, regsize, PROT_READ, MAP_PRIVATE, gfd, 0);
   mmap(&mem, 3 << 21, PROT_READ | PROT_WRITE, anon | MAP_FIXED, -1, 0);
   madvise(&mem, 3 << 21, MADV_HUGEPAGE);
-  // Fault the huge pages in here, and one page per 2 MB of each file (its
-  // page-table page): a thread on another CPU that charges even one page to
-  // the cgroup counts 256 KB against the peak (a per-CPU charge batch).
+  // Only main and one helper fault memory in, here and at the top of worker: a
+  // thread on another CPU that charges even one page to the cgroup counts 256 KB
+  // against the peak (a per-CPU charge batch). Reading one byte per 2 MB of each
+  // file faults its page-table pages in, and those use up the helper's batch.
   *(volatile u8 *)&mem = 0;
   touch(reg, regsize);
   // Plain threads: they share main's thread-local block and use nothing of it
@@ -486,18 +497,18 @@ int main(void) {
   for (long t = 1; t < NT; t++)
     if (clone(worker, mem.stack[t + 1], fl, (void *)t) < 0)
       die("clone");
-  // The threads fill the region table meanwhile: all they touch before the
-  // barrier lies on the first huge page.
-  for (u64 i = 1 << 21; i < 3 << 21; i += 1 << 21) ((volatile u8 *)&mem)[i] = 0;
-  touch(rec, rsize);
+  // The other threads fill the region table meanwhile: all they touch before
+  // the barrier lies on the first huge page.
+  ((volatile u8 *)&mem)[1 << 21] = 0;
+  touch(rec, rsize / 2);
   worker(0);
   FILE *o = fopen("/out/aggregates.txt", "w");
   if (!o) die("/out/aggregates.txt");
-  for (int k = 0; k < 26 * 26 * 26; k++) // in code order
-    if (mem.cidx[k])
-      report(o, (char[]){'A' + k / 676, 'A' + k / 26 % 26, 'A' + k % 26, 0}, mem.cidx[k]);
+  for (int k = 0, c; k < 26 * 26 * 26; k++) // in code order
+    if ((c = mem.cidx[k]))
+      report(o, (char[]){'A' + k / 676, 'A' + k / 26 % 26, 'A' + k % 26, 0}, c);
   report(o, "_UNMATCHED", 0); // "_" sorts after every code
-  fclose(o);
+  if (fclose(o)) die("/out/aggregates.txt");
   meet(3 * NT); // every other thread is done with its part of the mapping
   return 0;
 }
