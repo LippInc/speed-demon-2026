@@ -1,125 +1,157 @@
 # Track C: performance log
 
-How join.c got to its speed, with the measurement behind each step. Board runs are named by their run ID; everything else was measured on our test machine (box 2) and says so.
+How join.c got to its speed, with the measurement behind each step. Rows named by a run ID are board runs. Local rows from before 2026-11-02 say "box 2"; today's local rows are box 1 (i5-13500, 6 P-cores with HT at a fixed 2.5 GHz, the same machine type as the board).
 
 ## Where it ended
 
-The final code is v53: v43's code (its comments fixed as v49) with waits that sleep after 128 pauses (Steps, v53), so a stray process on the scoring box costs it about 7 ms instead of 300. Best board run of this code: run-5e3b2bc95cec (commit 8442d94, v49's code), T 21.16 ms, M 9.89 MB, S 417, K 43.97; its other runs run-be7fc43b744a 21.31 ms (K 43.27) and run-14a8fd87f9be 21.74 ms (K 43.04). v53's first board run, run-739c6cea137d, read 27.3 ms on a busy board: our A and D runs in the same batch were 7 and 10 % slower than their best. The start: the reference, T 14.44 s, K 1. The steps that cut T most (box 2, fast loop): v19 -2.2 ms (pass 1 without quote counts), v24 -1.55 (messages staged 128 per owner), v21 -1.45 (AES-NI name hash), v20 -1.1 (4-slot SIMD buckets), v31 -0.63 (region table prefetch). Evidence: board runs in the table under "Where it stands", per-step numbers under "Steps", failures under "What did not work (box 2)".
+The final code is v65. It reads records.csv once per record with no pass 1, keeps each thread's state on three huge pages faulted in by main and one helper, and identifies distinct names by owner threads exchanging 8-byte messages (join.c's header walks the design). The board run run-6d3cdfadd754 measured T 14.32 ms, M 8.07 MB, S 373, K 56.60; the reference takes 14.44 s, K 1. That run is the submission named in both this file and README.md. A quiet box reads lower than a busy board: until the final runs the board shares its machine, T moves with the load and M with what ran in the cgroup before us (section 6).
 
 ## Where it stands
 
-The reference takes 14.44 s (K 1).
+Rows v56 to v62 have no run ID at hand and are identified by their commit.
 
-| Run | T | M | S | K |
-|---|---|---|---|---|
-| Rust version, board run-fff3b356a7d3 (commit 2306aa9) | 28.1 ms | 9.6 MB | 585 | 36.48 |
-| join.c v21 on the board, run-fc3513efb0d2 (commit 816a29f) | 27.69 ms | 10.94 MB | 419 | 37.63 |
-| join.c v27 on the board, run-ca7e7d104000 (commit ec1791c) | 26.56 ms | 10.65 MB | 443 | 38.31 |
-| join.c v39 on the board, run-cc3a05552f65 (commit c04e8b3) | 21.74 ms | 10.39 MB | 425 | 42.83 |
-| join.c v43 on the board, run-a355185f438a (commit 09f081f) | 22.48 ms | 10.24 MB | 417 | 42.35 |
-| join.c v49 (v43's code, comments fixed) on the board, run-14a8fd87f9be (commit 6b75bfd) | 21.74 ms | 10.3 MB | 417 | 43.04 |
-| join.c v49 on the board, run-be7fc43b744a (commit 4e793b1) | 21.31 ms | 10.51 MB | 417 | 43.27 |
-| join.c v49 on the board, run-5e3b2bc95cec (commit 8442d94, best run) | 21.16 ms | 9.89 MB | 417 | 43.97 |
-| join.c v53 on the board, run-739c6cea137d (commit 55c6a91, a busy board) | 27.31 ms | 10.27 MB | 418 | 38.39 |
+| Version | Commit | Board run | T | M | S | K |
+|---|---|---|---|---|---|---|
+| join.c v49 (v43's code, comments fixed) | 6b75bfd | run-14a8fd87f9be | 21.74 ms | 10.3 MB | 417 | 43.04 |
+| join.c v49 | 4e793b1 | run-be7fc43b744a | 21.31 ms | 10.51 MB | 417 | 43.27 |
+| join.c v49 | 8442d94 | run-5e3b2bc95cec | 21.16 ms | 9.89 MB | 417 | 43.97 |
+| join.c v53 (v49's code, waits that sleep) | 55c6a91 | run-739c6cea137d (a busy board) | 27.31 ms | 10.27 MB | 418 | 38.39 |
+| v56 | db1bb02 | - | - | - | - | 47.82 |
+| v59 | - | - | 16.48 ms | 7.92 MB | 392 | 52.56 |
+| v60 | 78587c9 | - | 16.23 ms | 7.89 MB | 394 | 52.96 |
+| v61 | 73fcc4e | - | 16.17 ms | 10.24 MB (spike, section 6) | 369 | 50.88 |
+| v62 | 6ca940a | - | 15.53 ms | 8.01 MB | 371 | 54.48 |
+| v63 | a2b2bdd | run-a5c4d0536268 | 14.754 ms | 7.80 MB | 377 | 56.05 |
+| v63 (same code) | a9af0b7 | run-aeb5ee4b7a28 | 14.921 ms | 8.29 MB | 377 | 55.05 |
+| v65 | 6cafc7e | run-6d3cdfadd754 | 14.32 ms | 8.07 MB | 373 | 56.60 |
+| v65 (same code) | 3fa85cb | run-ec315dedca74 | 14.446 ms | 7.92 MB | 373 | 56.56 |
 
-The table holds each version's first board run; "Steps" below cites the re-push of 2026-11-01 (v21 24.9 ms, v27 24.6 ms), the same code 2 to 3 ms faster on another run of the shared board. The same code on box 2, 5 local runs of the organisers' harness each (no board run): v27 22.74 ms, M 10.74 MB, K 41.3; v39 20.93 ms, 10.60 MB, K 43.5; v43 20.78 ms, 10.69 MB, K 43.6. Box 2 is a rented i5-13500 like the scoring box, turbo off, running the organisers' harness. The board ran v21 and v27 3.3 to 3.8 ms slower than box 2, v39 0.8 ms slower, v43 1.7 ms and v49 0.5 to 1.0 ms slower (each a single board run against the harness's middle three of five); "Other processes on the scoring box" below has what we know about why. The two v49 rows are the same code, v43's with its comments fixed, under two commits (6b75bfd, 4e793b1); the submitted result is run-be7fc43b744a (README, "The result"). What changed between the commits is not recorded here.
-
-Every board run named in this file, in one place. First runs (the table above): Rust run-fff3b356a7d3 28.1 ms; v21 run-fc3513efb0d2 27.69; v27 run-ca7e7d104000 26.56; v39 run-cc3a05552f65 21.74; v43 run-a355185f438a 22.48; v49 run-14a8fd87f9be 21.74 and run-be7fc43b744a 21.31. Re-push of 2026-11-01 (Steps): v10 run-34ea5e6b408e 33.6; v18 run-66e847fccb66 30.1; v19 run-f963f4408506 27.8; v20 run-b49c7f2b2d8c 26.4; v21 run-9767cb14f1a6 24.9; v24 run-b39ff361cb97 23.3; v27 run-709c5622f461 24.6; v31 run-5d3de098bf35 22.9; v32 run-fc8350371cd8 84.6, the slow shared-board run; v39 run-33798317abda 21.6; v43 as v49 run-be7fc43b744a 21.31. Cited in "What did not work": v22 run-a4105d07d7e5 25.8; v44 run-1cee055fcf78 22.8; v48 run-9937f1928cb0 22.8; v50 run-a727cc41ae99 108.9, a slow run; v51 run-5c0282f45652 24.0.
+The reference takes 14.44 s, K 1. M is the maximum of the board's 5 runs, which is why the same code reads 7.80 and 8.29 (section 6).
 
 ## Measuring
 
-- **The harness.** The organisers' run_submission.py (5 runs: T is the mean of the middle three, M the peak) and static_axes.py (S) run on box 2 against the full seed-1 data.
-- **Fast loop.** A static build timed under `taskset 0-11`, 20 runs per round, median; A/B comparisons alternate the variants over 3 rounds. Validated against the harness: the Rust binary measured 27.4 ms this way against 28.1 ms on the board. The same triangle at the final code: 20.31 ms on the fast loop, 20.78 on the harness, 21.31 on the board (v43, whose code v49 is). Variants that came out the same speed measured 24.05-24.13 against 24.1 ms, and 20.62-20.67 against 20.64, which is the spread a kept delta must clear; v37's 0.3, v38's 0.13 and v42's 0.17 ms do.
-- **Correctness.** Every variant is checked against 8 generated seeds (tiny, sample and full sizes) and the two published data sets before it is timed.
-- **Where the time goes.** `perf stat` instruction and cycle counts per variant; `perf record` on user and kernel code; variants with parts of the program switched off (the "split" rows below); a per-thread timeline from timestamps written into a copy of the program; and the cgroup's memory statistics sampled during a run, to split M into our pages and the kernel's.
+- **abn.sh**, the local A/B runner: alternates the binaries over 15 to 31 rounds, deletes the output file before each run and checks its SHA, so a crash or a wrong output leaves no number (a bad run is logged with its exit code). Its wall time includes loop overhead: an empty static binary reads 2.93 ms in the same loop, and the program's own timeline accounts for all but 0.33 ms of the rest. Noise about +-0.1 ms at 15 to 31 rounds; code-layout luck up to 0.2 ms.
+- **icount.sh**: user instructions and cycles (perf), stable to 0.1 %.
+- **Board figures**: T is the mean of the middle three of 5 runs (fastest and slowest dropped), M the maximum of the 5.
+- **K** = (Tref/T)^.5 (Mref/M)^.2 (Sref/S)^.15; M stops paying at 7.35 MB, so there is no reward below that.
+- **S** is code lines counted after clang-format LLVM (merging lines does nothing; wraps caused by trailing comments do count).
 
 ## The design and why
 
-v-numbers name the versions listed under Steps below.
-
-The comment at the top of join.c describes the program. The measurements behind its main choices:
-
-- **Floor.** Reading and scanning all 202 MB with 12 threads and nothing else: 5.6 ms with pread in 64 KB blocks, 7.6 ms mapped. Carry-less-multiply quote masks on top cost nothing (still 7.6 ms): the scan is memory-bound, so the parse can afford SIMD work per byte.
-- **Twelve threads taking 256 KB pieces from a shared counter.** On a quiet box a fixed twelfth per thread was as fast (24.05-24.13 against 24.1 ms at v21); the pieces are for a box that is not quiet. Consecutive pieces are 2 MB apart (piece i is the (i / n)th piece of 2 MB stretch i % n): with neighbouring pieces, threads that faulted in the mapping at the same time took the same page-table page's lock, and a kernel profile of v37 had 24 % of kernel cycles spinning on that lock and 13 % in `filemap_map_pages`. Spread out, kernel cycles per run went from ~70 M to ~60 M and T down 0.13 ms (v38).
-- **Pass 1 finds record ends only.** Spec 2.2 makes an LF inside a quoted note always followed by a lowercase letter or a quote, and a record's own LF by a digit, a BOM or the end of the file. So pass 1 lists the LFs not followed by `[a-z"]`, three AVX2 compares per 32 bytes with no quote state, and a thread finds its piece's first record without reading anything before it. Against v27's pass 1, which listed every separator outside quotes: 43 instead of 79 instructions per record (v28).
-- **Pass 2 reads fields from both ends.** The region and the amount follow the record's last two commas, which its last 32 bytes always hold; the id runs to the first comma; the name is quoted, and the note is what lies between. 12.2 % of names contain a `""`: a cold path for them cost 8 % of cycles, so the name's end is found branch-free instead, as the first non-quote byte after an odd number of quotes (a carry-less multiply turns the quote mask into running parity).
-- **Region lookups first, prefetched.** Pass 2's first loop reads the three numbers (in one AVX2 multiply chain), computes each record's region table index and prefetches that byte; the second loop does the rest. In v30 the table load was 17.5 % of all cycles; the prefetch took T from 22.30 to 21.67 ms (v31).
-- **Names go to an owner thread.** A name's hash picks its owner; the reader sends an 8-byte message through a ring, 128 messages at a time (8 at a time: 1.5 ms slower; 16: 0.9; 32: 0.6; drain every 8 passes instead of 4: 0.2 ms faster). One table shared by all threads with an atomic OR per bit (measured in the Rust version) took 58.2 ms against 31.5 ms, with 3.03 M cross-core snoop loads against 0.23 M.
-- **A sender whose ring is full files its own inbox while it waits.** So two threads that wait on each other both advance, and no batch needs a second home. This replaced v27's per-owner overflow queue (v32: 21.70 to 21.16 ms, together with rings in static memory and the output in code order without a sort; 53 fewer lines).
-- **A name is 56 bits of its hash, not its bytes.** So a message is one 8-byte word, the hash with the country in its low byte, and an owner compares four stored names at once with one AVX2 compare (`find`) without reading any name's bytes, which sit in another core's part of the file. The price is a 1-in-10-million chance per run that two names merge (join.c's header).
-- **AES-NI name hash.** Three AES rounds over 32 bytes at a time, cut to 64 bits: fewer instructions than the multiply hash it replaced (v21: 1.54 G to 1.17 G per run).
-- **Memory.** 4 KB pages only (`MADV_NOHUGEPAGE`): with transparent huge pages on, first touches zeroed 2 MB pages, 5.4 ms. One malloc arena (`M_ARENA_MAX` 1): with one per thread, each thread's first allocation mapped and trimmed its own arena and the threads queued on the process's mapping lock (`osq_lock` 6.6 % of kernel cycles): 0.17 ms (v39). Peak M is our 7.2 MB of pages, 1.0 MB of the kernel's (page tables 0.65) and 1.5 to 2 MB that the cgroup charges in per-CPU batches.
-- **The end.** Once every total is final, main writes the output while the other 11 threads each drop an eleventh of the mapping; otherwise exit tears down 49,000 page-table entries on one CPU (2 ms). Overlapping the two: 0.3 ms (v37).
+- **One read per record, no pass 1.** Earlier versions ran a pass 1 that listed record ends with three AVX2 compares per 32 bytes; it was 13 % of all instructions. Now each record is read once, front to back, from one quote mask of 64 bytes starting at b + 6, past most ids: for 97 % of records the mask reaches past the note. A carry-less multiply turns the mask into "follows an odd number of quotes", which picks the commas after the name and the note however many "" they hold. Only the first record of a piece needs the LF rule (spec 2.2: a record's own LF is followed by a digit, a BOM or the end of the file), and that test stays a branch: a cmov here cost 0.68 ms, because the chain from one record to the next binds.
+- **Two cursors per piece.** One record's start depends on the last one's end, a wait of about 50 cycles, so each piece is read from two places in turn and the two waits overlap. A run of 64 records is parsed first, staged in Rec; a second loop then does the lookups, totals and messages, each record's region-table entry prefetched (at v31 the prefetch took T from 22.30 to 21.67 ms). One pass with no staging was 2.2 ms slower (the extra cycles were load stalls hitting L3 on the 1 MB region table); the two-cursor shape was 0.8 ms faster than v56. The id's length is kept per cursor because spec 2.2 says ids only grow.
+- **Owner threads for names.** The name's hash low byte picks its owner; the reader sends an 8-byte message (the hash, with the country in the low byte) through a lock-free ring, 128 at a time (8 at a time: 1.5 ms slower). The owner keeps a private table: 16 tags per bucket on one cache line (BUCKETS 652; 97 % of messages hit in the first bucket), and one bit per country in the row, set and counted at once by bts and sbb. One table shared by all threads took almost twice as long (58.2 against 31.5 ms in the Rust version; 23.00 against 20.35 in C, v50). The 16-tag bucket was -0.22 ms; the owner from the hash's low byte, -0.17.
+- **Three huge pages at a fixed address (3 << 29).** All memory the threads use is one mapping, so nothing else lands on extra huge pages. Only main and one helper thread fault memory in: a thread on another CPU that charges even one page costs the cgroup a 256 KB per-CPU charge batch. The other threads fill the region table meanwhile (all of it before the barrier lies on the first huge page): -0.35 ms together with the spin barrier. The fixed address must lie above the program end plus 1 GB (section 7); the low address itself was -0.15 ms, and starting the mask at b + 6 another -0.15, two prefetches (b + 512 and b + 576) -0.08.
+- **Plain clone threads on 4 KB stacks.** They share main's thread-local block and use nothing of it but errno: no memory for a TLS block or a thread descriptor, and the stacks use at most 640 bytes. Earlier pthread version, same design: no gain from the extra memory.
+- **128 KB pieces from a shared counter**, piece i spread across 2 MB stretches, so threads that fault pages at the same time never share a stretch's page-table lock (a kernel profile of v37 had 24 % of kernel cycles spinning on that lock; spreading pieces out cut kernel cycles from ~70 M to ~60 M). 256 KB pieces: +0.8 ms, the rings fill (293 context switches against 40).
+- **The end.** Once every total is final, main writes the output while the other 11 threads each drop an eleventh of the mapping; otherwise exit tears down 49,000 page-table entries on one CPU (2 ms).
 
 ## Steps
 
-Box 2, fast loop, median T, then the live board's T for the same code. On 2026-11-01 we pushed the main steps to the board again, in order, one run each: each step below with a run ID has that board measurement, and the steps without one were measured on box 2 only. Until the freeze the board shares its machine with other teams' runs, so a single run can be slow: v32's 84.6 ms is one such run, and v39, with the same sending scheme, measured 21.6 ms 6 minutes later.
+Board rows carry their run ID; rows without one are local. Rows marked "box 2 only" never had a board run (box 2, fast loop, median).
 
-- v10, 31.6 ms (harness), board 33.6 ms (run-34ea5e6b408e): an early C version of the owner design.
-- v18, 29.4 ms, board 30.1 ms (run-66e847fccb66): hot-loop state in locals (aliasing stores to struct fields had cost ~10 % of instructions), 8-slot SIMD buckets.
-- v19, 27.2 ms, board 27.8 ms (run-f963f4408506): pass 1 without quote counts; pass 2 split into a region loop and the rest; quotes counted from field bytes; branch-free name hash.
-- v20, 26.1 ms, board 26.4 ms (run-b49c7f2b2d8c): 4-slot SIMD buckets, 56-bit name identity, the owner stores 16 bits per name instead of the key.
-- v20b, 25.55 ms: name hash fast path without a loop: stack spills in the record loop 47 to 2.
-- v21, 24.1 ms, board 24.9 ms (run-9767cb14f1a6): AES-NI name hash.
-- v24, 22.55 ms, board 23.3 ms (run-b39ff361cb97): messages staged 128 per owner (was 8), rings of 256, owners drain every 8 passes.
-- v27, 22.63 ms, board 24.6 ms (run-709c5622f461): 256 KB pieces from a shared counter, and sends that never wait. No faster on a quiet box; kept because it holds up when another process takes a CPU (below).
-- v28, 22.7 ms: pass 1 lists record ends only, pass 2 reads fields from both ends. The same 1.14 G instructions as v27: pass 1 lost 36 per record, pass 2 gained 25. Kept because pass 2's new shape is what v30 and v31 cut down.
-- v29, 23.2 ms: the three numbers in one AVX2 chain. 1.10 G instructions but slower: GCC spilled the bases of the per-record arrays and rebuilt 64-bit constants inside the loop.
-- v30, 22.30 ms: the per-record array inside the thread's context (one base register), the id's comma by a vector compare: 1.04 G instructions, 581 M cycles (v27: 614 M).
-- v31, 21.67 ms, board 22.9 ms (run-5d3de098bf35): region table prefetch.
-- v32, 21.16 ms, board 84.6 ms (run-fc8350371cd8, the slow run above): senders drain while their ring is full, no overflow queue (below).
-- v33, same speed, 409 code lines.
-- v37, -0.3 ms: main writes the output while the other threads unmap.
-- v38, -0.13 ms: pieces 2 MB apart.
-- v39, 20.64 ms, board 21.6 ms (run-33798317abda): one malloc arena.
-- v42, 20.45 ms: a new minimum or maximum amount is a branch, not a compare and store per record (a thread sees ~900 amounts per country, so the branch is almost never taken): -0.17 ms. `pthread_barrier_wait` instead of a spinning barrier: same speed, 7 fewer lines.
-- v43, 20.31 ms: each record's region table index lives in its record entry, not in an array of its own: one base register fewer in the first loop, which had kept 5 values on the stack (now 2). 1.02 G instructions. Board: its first run, run-a355185f438a, 22.48 ms (v39's first run, run-cc3a05552f65, 21.74 on the shared board); v49, the same code with its comments fixed, 21.74 (run-14a8fd87f9be) and 21.31 (run-be7fc43b744a), and v49's code again at 21.16 (run-5e3b2bc95cec, the best).
-- v53, the same speed on a quiet box: every wait spins 128 pauses, then sleeps 10 us. On 2026-11-02 the board ran v43's unchanged code at 326.8 ms (run-2a0d82be6829), 15 times its usual 21 ms, while the teams' runs just before and after ours were normal. One busy loop on a CPU in 0-11 reproduces it (below).
+- v10, 31.6 ms (harness), board 33.6 (run-34ea5e6b408e): an early C version of the owner design.
+- v18, 29.4 ms, board 30.1 (run-66e847fccb66): hot-loop state in locals, 8-slot SIMD buckets.
+- v19, 27.2 ms, board 27.8 (run-f963f4408506): pass 1 without quote counts; pass 2 split into a region loop and the rest.
+- v20, 26.1 ms, board 26.4 (run-b49c7f2b2d8c): 4-slot SIMD buckets, 56-bit name identity.
+- v20b, 25.55 ms (box 2 only): name hash fast path without a loop.
+- v21, 24.1 ms, board 24.9 (run-9767cb14f1a6): AES-NI name hash (1.54 G to 1.17 G instructions).
+- v24, 22.55 ms, board 23.3 (run-b39ff361cb97): messages staged 128 per owner.
+- v27, 22.63 ms, board 24.6 (run-709c5622f461): 256 KB pieces from a shared counter, sends that never wait.
+- v28, 22.7 ms (box 2 only): pass 1 lists record ends only; pass 2 reads fields from both ends.
+- v30, 22.30 ms (box 2 only): per-record array in the thread's context, id's comma by a vector compare.
+- v31, 21.67 ms, board 22.9 (run-5d3de098bf35): region table prefetch.
+- v32, 21.16 ms, board 84.6 (run-fc8350371cd8, one slow shared-board run): senders drain while their ring is full.
+- v37, -0.3 ms (box 2 only): main writes the output while the others unmap.
+- v38, -0.13 ms (box 2 only): pieces 2 MB apart.
+- v39, 20.64 ms, board 21.6 (run-33798317abda): one malloc arena.
+- v42, -0.17 ms (box 2 only): min and max as a branch, not a compare and store per record.
+- v43, 20.31 ms, board 22.48 (run-a355185f438a): the region index in the record entry.
+- v49 (v43's code, comments fixed): board 21.74, 21.31 and 21.16 ms (the table above).
+- v53, the same speed on a quiet box: every wait spins 128 pauses, then sleeps 10 us (section 6).
 
-Wall time with parts switched off (v39): pass 1 alone 6.4 ms; then the numbers and region index +3.5, per-country totals +1.6, name hash +1.55, note lengths +1.55, sending names +1.5 (owners that take messages off the ring without filing them: 16.15 ms), owners filing them +4.5. Filing costs 59 instructions and 37 cycles per message. The same at v21: pass 1 alone 7.25 ms, the same as reading and scanning the file with nothing else (7.6 ms); then parsing and per-country sums +7.7, note lengths +0.8, name hash +0.85, sending names +3.0, owners filing them +4.5.
+Today (box 1 unless a run ID is given):
 
-The timeline of v33, from timestamps the threads record: the region table is complete at 0.48 ms, parsing ends at 19.4 to 19.7 ms, then unmapping takes 0.4 ms and the output 0.3 (overlapped since v37), and the exit 0.6. A static binary that does nothing takes 0.16 ms; creating and joining 12 threads 0.41 ms.
+- v54 (4ba13ab): built with gcc 16, -0.3 ms on the local loop. Board: T 21.19 ms, M 7.91, S 389, K 46.42.
+- v56 (db1bb02), the redesign: no pass 1, one read per record from a 64-byte quote mask, two cursors per piece, 16-tag buckets, threads fill the region table while main faults the huge pages. 865 M instructions, abn 21.3 against v53's 23.5. In order of what moved T (each an A/B): the BOM test as a branch, not cmov, -0.68; pointers instead of offsets, -0.5; threads fill the region table while main faults, with a spin barrier, -0.35; two cursors with Rec staging and region prefetch, -0.8 against v56; 16-tag buckets, -0.22; owner from the hash's low byte, -0.17; the mask window at b + 6, -0.15; the low fixed address, -0.15; two prefetches, -0.08.
+- v57 (61a43ce): abn 20.8.
+- v58 (fd2350d): abn 18.91.
+- v59: abn 18.43; board T 16.48 ms, M 7.92, S 392, K 52.56.
+- v60 (78587c9): the crash fix (section 7, map moved to 3 << 29), memory constants, build flags. Board T 16.23 ms, M 7.89, S 394, K 52.96.
+- v61 (73fcc4e): plain clone threads on 4 KB stacks, BUCKETS 652, an atomic_flag lock that uses the sleeping wait, meet() replaces join, no -pthread. abn 17.99; board T 16.17 ms, M 10.24 (the spike, section 6), S 369, K 50.88.
+- v62 (6ca940a): the cold test from the mask, a vector min for the amount cap, the id stored first, the tag read straight from the message. 680 M instructions, abn 17.49; board T 15.53 ms, M 8.01, S 371, K 54.48.
+- v63 (a2b2bdd), instructions 680.0 M to 614.0 M, abn 17.45 to 16.55, in order: the amount's decimal point skipped by per-lane multipliers instead of pext (666.6 M, 17.41 to 17.16); the next record found by a carry through the run of low bytes, so no BOM test in parse (653.3 M, 16.88); the id's length kept per cursor, because spec 2.2 says ids only grow (643.7 M); bit test and count with bts and sbb (634.2 M, 16.65); the bucket from the message's top two bytes (cycles 340.2 M to 336.1 M); name and note bytes added as one 64-bit field (616.3 M with the rest). Board run-a5c4d0536268: T 14.754 ms, M 7.80, S 377, K 56.05; the same code again as a9af0b7, run-aeb5ee4b7a28: T 14.921 ms, M 8.29, K 55.05.
+- v64: the timeline of v63 (timestamps in a copy of the program) showed 11 threads idle for 0.75 ms while main alone faulted memory in: main's first huge page 0.24 ms, the clones 0.11, huge pages 2 and 3 0.55, the page-table pages 0.30; regions done at 0.49; parse ends 13.0, drained 13.09, report 13.39, all done 13.54. One helper thread (thread 11) now faults the third huge page and half the file's page-table pages. abn 16.66 to 16.34 (31 rounds). Memory: another CPU that charges a page costs a 256 KB batch, and the page-table pages use that batch up: median of 15 runs 7.57 to 7.67 MB. Error checks are back on open, clone and close.
+- v65: start-up balance. The helper is now cloned first, so it starts ahead of main, which still has the other clones to do, and it takes 5/8 of the file's page-table pages: 61 of 98, inside its 64-page charge batch, so little of the batch is left over. abn 16.29 to 16.23 (25 rounds), memory peak 7.50 to 7.40 MB, no lines added. Board run-6d3cdfadd754: T 14.32 ms, M 8.07, S 373, K 56.60; the same code again as 3fa85cb, run-ec315dedca74: T 14.446 ms, M 7.92, K 56.56.
 
 ## Other processes on the scoring box
 
-With a busy loop on one of CPUs 0-11 for 1 ms in every 5 (box 2, fast loop, medians of 2 rounds):
+With a busy loop on one of CPUs 0-11 for 1 ms in every 5 (box 2, medians of 2 rounds):
 
-- v24, fixed twelfths, a sender waits while its owner's ring is full: 22.55 ms quiet, 26.3 to 26.9 ms with the noise. One thread kept off its CPU stalls every thread that sends to it.
-- v26, pieces and an unbounded per-owner queue on the hot path: 23.8 quiet, 24.2 with noise.
-- v27, pieces, fixed batches, and an overflow queue used only when a ring is full: 22.66 quiet, 24.0 with noise.
-- v39, pieces, and a sender that drains while it waits: 20.64 quiet, 24.0 with noise.
+| Version and scheme | Quiet | With the noise |
+|---|---|---|
+| v24, fixed twelfths, a sender waits when the ring is full | 22.55 ms | 26.3 to 26.9 ms |
+| v26, pieces, unbounded per-owner queue on the hot path | 23.8 ms | 24.2 ms |
+| v27, pieces, overflow queue only when a ring is full | 22.66 ms | 24.0 ms |
+| v39, pieces, a sender that drains while it waits | 20.64 ms | 24.0 ms |
 
-A busy loop on one CPU for the whole run made v24 25 times slower (546 ms) and v26 8 times (172 to 192 ms).
+A busy loop on one CPU for the whole run made v24 25 times slower (546 ms). v43's code: 331 ms with one such loop, 439 with two, against 23.3 quiet. v53's sleeping wait (10 us after 128 pauses) reads 30.0 and 32.9 ms in the same rounds, the same speed on a quiet box.
 
-v43's code does the same: 331 ms with a busy loop on CPU 3 for the whole run, 439 ms with two loops anywhere in 0-11, against 23.3 ms quiet (our i5-13500 bench machine, static build under `taskset 0-11`, 40 interleaved rounds, medians). The board met it once, run-2a0d82be6829 at 326.8 ms. Every thread waits on every other, so the threads that only spin keep all twelve CPUs busy, and the thread that shares a CPU with the loop runs only in its turns of a few milliseconds while the rest wait for it. v53 sleeps 10 us after every 128 pauses of a wait: the freed CPU takes the stalled thread. Same rounds, quiet / one busy loop / two: spin only (v43) 23.3 / 331 / 439 ms; 128 pauses, then 10 us (v53) 23.3 / 30.0 / 32.9 ms; 256 pauses, then 20 us 23.3 / 31.0 / 34.2 ms; 512 pauses, then 20 us 23.4 / 32.3 / 36.3 ms. Two longer settings, 20 rounds: 1,024 pauses then 50 us, 35.8 and 41.4 ms; 4,096 then 100 us, 58.0 and 70.7 ms. The output matched on seed 1 and a fresh seed, and with the program held to 1, 4 and 12 CPUs.
+- Board reads vary with load: while the board was busy, other teams' latest runs read 2 to 4 ms over their best. The final runs have the machine to themselves.
+- M spikes on the same code with T unaffected: 7.80 and 8.29 MB for v63, 10.24 for v61. Our hypothesis, not proven: per-CPU 256 KB charge batches left by processes that ran in the cgroup before the program; only main and the helper charge in our design, so nothing consumes them. A quiet box stays at 7.8 to 8.05.
+- Stress test of the final code (box 1, medians of 15): quiet 16.7 ms, one hog on a CPU 22.4, two hogs 24.6.
 
-On a quiet box, v27 and v39 each had 9 slow runs in 800 (more than 1.2 times the median), 4 or 5 of them between 60 and 180 ms: a thread that loses its CPU holds up the threads that send to it, with or without the overflow queue. The harness drops the slowest of 5 runs and repeats a batch whose middle three differ by more than 50 ms.
+## A crash found and fixed
 
-v27 did not close the board gap: 3.8 ms slower on the board than on box 2, against 3.3 ms for v21, which had no defence against this noise. What matches the gap is another process using the shared L3: a cache-bound loop on the E-cores (CPUs 12-19) made v27 and the Rust version 3.3 to 3.8 ms slower alike, while a memory-bandwidth loop there cost nothing. Until the freeze the board's runs share the scoring machine; the final runs have it to themselves (organisers' FAQ), so v39 keeps the 2 ms it wins on a quiet box. v53 is for a stray process during the final runs: one would cost it 7 ms, not 300.
+Symptom: one bad run in about 900 in the A/B loop (0.6 % of runs), a segfault at thread start, only on some starts. It passed every 13-run check, the official harness and the board. Cause: the program's memory was mapped MAP_FIXED at 1 << 30, and x86-64 kernels start a static binary's heap at a random page within 1 GB above the program; on 24 of 4000 measured starts the mapping landed on the heap and zeroed main's thread pointer. Found by making the A/B loop log every bad run's exit code and reading one core (the thread pointer and the fault address pointed there); 800 runs after the fix, none. Fixed in v60 by moving the mapping to 3 << 29, above the heap's range. Since then crash.sh runs each variant 100 times, and any bad run stops the work.
 
-## What did not work (box 2)
+## What did not work
 
-- `-march=alderlake` or `native` instead of x86-64-v3: 0.4 ms slower. Profile-guided optimisation (`-fprofile-use`, at v27): 22.68 against 22.69 ms.
-- Reading with pread instead of mapping: 34.8 against 33.3 ms in the full program, although pread wins the bare scan; again at v21 (v22): 25.0 against 24.1 ms, and on the board 25.8 ms (run-a4105d07d7e5) against v21's 24.9. The kernel's copy took 80 M cycles against 53 M for mapping and unmapping.
-- Each thread populating its part of the mapping up front (`MADV_POPULATE_READ`): 28 ms, the threads queue on the mapping's lock.
-- Main touching all memory before starting the threads, which avoids the cgroup's per-CPU batches (~2 MB of M): 1.6 to 2.8 ms slower, all of it serial. Main allocating the owners' tables (+0.55 ms) or touching the rings and totals (+0.15 ms) before the threads start: slower too.
-- Winning back the per-CPU batches after v43 (v44 to v48). The kernel charges a CPU's first 4 KB page fault to the cgroup 64 pages ahead, so twelve threads that each fault a little count up to 3 MB they never use; a 2 MB page is charged exactly. M below is measured the board's way (Docker, the parent cgroup's peak), where v43 has 10.3 to 10.7 MB.
-  - v44, main faults in every page the threads write before starting them: M 9.17 MB, T 1.3 ms slower (6.8 MB faulted in on one CPU). Board: 22.8 ms, M 9.74 MB, K 42.11 (run-1cee055fcf78).
-  - v45, the tables the threads share (name tables, rings, totals, and the region table compressed to a bit per id plus a country per line) in three 2 MB pages, one faulted in by each of three threads: M about 9.1 MB, T 20.79 against 20.31 ms. The threads cannot fill the region table until its 2 MB page is in, which takes 0.2 to 0.35 ms. v47 got main to the barrier 0.27 ms sooner and changed nothing (20.73 ms): the region table was still the last thing done. On the organisers' harness v47 measured T 20.99 ms, M 9.29 MB, S 495: the 78 extra lines and the slower start cost more than the 1.4 MB saved, K about 0.3 % below v43.
-  - v48, the shared tables in 4 KB pages, faulted in 256 KB (one CPU's batch) at a time by whichever thread is free: the lowest M of all (7.9 to 8.2 MB in a bare cgroup, against 9.6 to 9.9 for v43) but T 22.15 ms. Twelve threads faulting in fresh pages at once went no faster than one, about 0.12 ms per MB. Board: 22.8 ms, M 8.83 MB, K 42.15 (run-9937f1928cb0), below v49's 43.27.
-  - v46, records.csv read with pread in 32 KB pieces instead of mapped (no page tables to charge): M about 9.0 MB, T 22.2 ms.
-- The owners' tables mapped with `mmap` instead of `aligned_alloc`: 0.7 ms slower, 13 % more user cycles. Letting GCC inline the cold path for long names: 29 M more instructions, 0.8 ms slower.
-- `_Alignas(64)` on the first field of the per-country totals: it aligns every field of the declaration, making the struct 512 bytes: 1.2 ms slower.
-- Name rows zeroed up front instead of when first used: no faster, M +0.4 MB. The threads adding up the per-country totals in parallel: no faster.
-- The output formatted by hand instead of with fprintf: 0.15 ms faster for 8 more lines, which is about even in K.
-- Counting each record's quotes in pass 1, so that pass 2 gets a note's unescaped length by arithmetic instead of reading the note (v40): 35 M more instructions, 0.27 ms slower.
-- Region ids read 8 digits at a time: 0.4 ms slower. Each line's start then waits on a vector compare, where the byte loop ran ahead. Threads that start each other in a tree instead of main starting all eleven: no faster, and more slow runs.
-- Pieces of 128 or 64 KB instead of 256 KB: no change at v39 (20.62-20.67 against its 20.64 ms); when a thread runs out of pieces, its core's other thread speeds up. Mapping each piece in one call (`MADV_POPULATE_READ`): +0.05 ms. Prefetching the owners' buckets a loop ahead: no change.
-- Region table misses, before the prefetch: a probe without the lookup (wrong output) was 1.6 ms faster, but the same lookup into a 256 KB table recovered only 0.55 ms, so a compact table was not built.
-- Rings of 128 messages: 0.2 ms slower than 256. Pass 1 over 4 KB instead of 16 KB: 0.2 ms slower.
-- Without 64-byte message lines (one 8-byte store per message): 7 ms slower. Non-temporal stores for the lines: no change.
-- Two interleaved input streams per thread: slower. Deferring the per-country updates through a record array: slower.
-- Two redesigns on the last day, both slower than v43 (box 2, 3 alternating rounds, all 10 data sets correct), each pushed once to the board for this log:
-  - v50, shared name ids: one 1 MB intern table shared by all threads (insert by compare-and-swap; the inserting thread owns the name), 4-byte messages, owners only set a country bit. 23.00 against 20.35 ms in these alternating rounds; v43's own step runs measured 20.31 ms and 1.02 G instructions. User instructions went up (1,081 M against 1,048 M in the same rounds) and kernel cycles nearly doubled (91 M against 49 M, page faults on the shared table and the bit rows), although L2 misses fell from 0.86 M to 0.15 M. Board: 108.9 ms (run-a727cc41ae99), a slow run of the kind described above.
-  - v51, one pass: no record-end pass; each record is read from its start, and the note's end found with the same quote-parity multiply as the name's. 22.95 ms with 14 % fewer instructions (905 M) but more cycles (608 M against 557 M): each record's start waits on the previous record's end, and top-down counts show fetch latency at 429 M slots against 251 M. Moving the name hash back into the second loop (v51b) gave 24.8 ms; two to eight interleaved streams per thread (v52), 23.8 to 25.7 ms. Board: 24.0 ms (run-5c0282f45652).
-- Branch misses: about 4 % of cycles at v18, so branch-free rewrites were not the lever; the program is bound by instruction count (about 60 % of slots retiring, about 2 instructions per cycle per thread).
+Rows without a note are box 1. "Older" rows are box 2, kept short.
+
+| What | Result | Why dropped |
+|---|---|---|
+| Hand-written report with no stdio | 16.74 vs 16.68 ms, S +8 | the report is 0.3 ms of a phase the unmapping sets anyway |
+| Free-slot test moved out of line | 2.2 fewer instructions per record, no time, S +11 | not worth the lines |
+| AES keys as memory operands | +3.2 M instructions | the compiler uses the freed registers worse |
+| Two plain bound tests instead of one | +8.4 M instructions | slower |
+| Shift counts mod 64 | +6.5 M instructions | slower |
+| Rows by pointer in drain | no gain | kept the index form |
+| Dropping the agg field from Ctx | S -1, +0.07 ms | not worth it |
+| Plain pieces in file order, not stretch order | S -2, +0.03 ms | kept the stretch order |
+| 18 compiler flag sets (live-range shrinkage, IRA regions, scheduling, alignments and more) | cycles 337 to 342 M against 339.6 M | none clear of noise |
+| PGO trained on the full data | 16.92 vs 16.72 ms | no gain now (it gave -0.24 at v53) |
+| RUN 32, 48, 96, 128 | 16.82, 16.81, 16.86, 16.95 vs 16.72 at 64 | 64 stays |
+| Prefetch distance 384, 640, 768; one prefetch | 16.76, 16.82, 16.82, 16.84 vs 16.72 at 512 | 512 and two prefetches stay |
+| BATCH 64 | 24.45 ms | the rings fill |
+| RING 3 batches, 630 buckets to fit | 16.43 vs 16.27 ms | the ring was not the limit |
+| Senders write straight into the ring, no batch and no memcpy (RING 3 batches, same memory) | 16.38 vs 16.27 ms, 2.6 M fewer instructions, 1.1 M more cycles | the copy was only 1 % |
+| The same with RING 2 batches, 672 buckets | 21.25 ms | the rings fill |
+| Clone order reversed, page-table split unchanged | 16.29 vs 16.29 ms, M unchanged | only with the new split (v65) |
+| One pass with no Rec staging | +2.2 ms | load stalls hitting L3 on the region table |
+| Cursors kept in arrays | +0.7 ms | memory-carried positions |
+| Three cursors per piece | no gain | complexity for nothing |
+| PIECE 256 KB | +0.8 ms, fewer cycles | rings fill: 293 context switches vs 40 |
+| -mtune=alderlake/znver4, -march=alderlake | +0.3 to +0.45 ms | kept x86-64-v3 |
+| MADV_POPULATE_READ per piece | +0.2 ms | |
+| -fno-tree-slp-vectorize | +0.25 ms | |
+| Drain in one loop without its prefetch | +0.2 ms, S -4 | not taken |
+| BUCKETS 590 | +0.38 ms | |
+| Pinning main after thread start | M unchanged | |
+| Threads parsing while main faults, drains gated (v29) | 17.99 vs 18.01 ms, +5 lines | dropped |
+| -O2, -fno-gcse, -fsched-pressure, -fira-loop-pressure, -fno-ivopts | 18.26 to 18.35 vs 18.24 | no gain over -frename-registers |
+| Prefetch in the old pass 1 | -0.2 to 0 ms, cycles flat | unclear, dropped |
+| Pinning threads | +0.2 ms | worse |
+| Merging the scan state into Ctx | +0.3 ms | rejected, though it saves 6 lines |
+| Vector per-country totals | no gain | |
+| Shared already-sent cache | dead: 90 % of messages are new | |
+| Older: pread instead of mapping (v22) | 25.0 vs 24.1 ms, board 25.8 | the kernel's copy cost 80 M cycles vs 53 M |
+| Older: MADV_POPULATE_READ up front | 28 ms | threads queue on the mapping lock |
+| Older: v44 to v48, winning back the per-CPU charge batches | best M 7.9 to 8.2 MB, T 20.8 to 22.2 | M saved cost more T than it paid in K |
+| Older: counting quotes in pass 1 (v40) | +35 M instructions, +0.27 ms | |
+| Older: region ids read 8 digits at a time | +0.4 ms | each line's start waits on a vector compare |
+| Older: v50, shared name ids, one intern table | 23.00 vs 20.35 ms | kernel cycles nearly doubled |
+| Older: v51, one pass, records read from their start | 22.95 ms, 14 % fewer instructions, more cycles | each record's start waits on the last one's end |
+| Older: v52, two to eight interleaved streams | 23.8 to 25.7 ms | did not recover v51 |
+
+Branch misses stayed near 4 % of cycles at v18 and lower since: branch-free rewrites were never the lever; the program is bound by instruction count.

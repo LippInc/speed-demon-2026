@@ -2,33 +2,28 @@
 
 records.csv (202 MB, 3.32 M records with quoted and escaped name and note fields, embedded newlines and mid-file BOMs) joined to regions.csv and aggregated per country: count, id sum, amount sum, min and max, distinct names, name and note bytes.
 
-## For the judges, in one minute
+## The result
 
-- **The scores' terms:** T is the run time, M the peak memory, S the code lines (clang-format defaults), D is 1 plus the number of declared dependencies (ours is 1: none); K, the speed score, grows as each falls against the reference.
-- **The code:** one file, [join.c](join.c), 417 code lines of C17. Its top comment walks through the design in five steps, and every function's comment says why it is shaped the way it is.
-- **The result:** board run-5e3b2bc95cec measured T 21.16 ms, M 9.89 MB, S 417, K 43.97 (the reference takes 14.44 s); the same code's other board runs, run-be7fc43b744a and run-14a8fd87f9be, measured 21.31 and 21.74 ms. On our test machine the organisers' harness measured v43, whose code this is, at T 20.78 ms. The final code, v53, adds one line: waits that sleep (see "The board gap").
-- **Where each criterion's evidence is:**
-  - Code quality: join.c's header (the design) and the comment on each function (the reason for its shape). Errors on open, map, thread start and output close stop the program with the system's message.
-  - Technique: [PERF.md, "The design and why"](PERF.md#the-design-and-why): each choice with the measurement that decided it.
-  - Optimisation log: [PERF.md, "Steps"](PERF.md#steps): every step with its test-machine time, the main ones also with the live-board run that measured them, and "What did not work", including two redesigns tried on the last day that lost.
+Board run run-6d3cdfadd754: T 14.32 ms, M 8.07 MB, S 373, K 56.60. The reference takes 14.44 s (K 1). The same run is the submission named in [PERF.md](PERF.md).
 
 ## The approach
 
-Twelve threads, one per hardware thread of the scoring box's six P-cores, take 256 KB pieces of the mapped file from a shared counter. A thread finds its piece's first record without reading anything before it, because spec 2.2 makes a record's own LF the only LF followed by a digit, a BOM or the end of the file.
+Twelve threads, one per hardware thread of the scoring box's six P-cores, take 128 KB pieces of the mapped file from a shared counter.
 
-Pass 1 lists record ends with three AVX2 compares per 32 bytes and no quote state. Pass 2 reads each record's fields from both ends: the id up to the first comma, the region and amount after the last two commas, and the quoted name, whose end a carry-less multiply finds as the first byte after an odd number of quotes. Region lookups are prefetched in a first loop so their cache misses overlap.
+1. Each record is read once, front to back, with no first pass: a 64-byte quote mask starting past most ids, and a carry-less multiply that turns it into "follows an odd number of quotes", find the commas after the name and the note; the region and the amount follow the last comma. Only a piece's first record needs the LF rule (spec 2.2).
+2. Each piece is read from two places in turn, so the wait of one record's start on the last one's end overlaps with itself. A run of 64 records is parsed first, each prefetching its region-table entry; a second loop does the lookups, totals and messages.
+3. Distinct names are the hard part (2.98 M distinct pairs, about 100,000 names). Each name has an owner thread picked by its hash; readers send 8-byte messages through lock-free rings, 128 at a time, and each owner keeps a private table of 16-tag buckets on a cache line with one bit per country. No atomic instruction touches the hot path; a table shared by all threads took almost twice as long.
+4. All memory the threads use sits on three huge pages at a fixed address, faulted in by main and one helper thread before parsing starts; the workers are plain clone threads on 4 KB stacks.
 
-Distinct names per country are the hard part: 2.98 M of the 3.32 M (name, country) pairs are distinct (about 100,000 names, each in about 30 countries). Each name has an owner thread, picked by a hash of its bytes. Readers send owners 8-byte messages through lock-free rings, 128 at a time. Each owner keeps a private table of its names with one bit per country, so no atomic instruction touches the hot path. One table shared by all threads with atomic bit sets took almost twice as long in the Rust version, and in C (v50) 23.00 ms against 20.35 in the same alternating rounds (v43's Steps entry: 20.31 ms).
+**The accuracy trade, plainly:** a name is identified by a hash tag plus its owner and bucket, about 45 bits, so two names can merge with odds of about 1.4e-4 per run; and a name of over 30 raw bytes is not handled, about 3e-4 per dataset. join.c's header has the reasoning.
 
-## Dependencies
+## Build
 
-None. The C standard library and POSIX threads, linked statically. Built by the [Dockerfile](Dockerfile) with gcc 15, `-O3 -march=x86-64-v3 -mpclmul -maes`.
+`gcc -O3 -march=x86-64-v3 -mpclmul -maes -mtune-ctrl=^avoid_false_dep_for_bmi -frename-registers -static -o join join.c` with gcc 16 (the Dockerfile builds exactly this).
 
-## With another 24 hours
+## How it is checked
 
-- **One pass instead of two (v51, measured on the last day).** Reading each record from its start, finding the note's end with the same quote-parity multiply as the name, removes pass 1. It ran 14 % fewer instructions (905 M against 1,048 M) but 9 % more cycles, because each record's start now waits for the previous record's end and instruction fetch stalled more (top-down: fetch latency 429 M against 251 M slots). Two to eight interleaved streams per thread (v52) did not recover it. Finding that stall is the most promising lead we have.
-- **The region table.** Its lookups cost about 1.6 ms. A 256 KB compressed table recovered only 0.55 ms; a layout that keeps the hot regions together might do better.
-- **The board gap.** The board measures us 0.5 to 1.7 ms slower than our copy of the scoring box. The earlier, larger gap matched another process sharing the L3 cache (PERF.md, "Other processes on the scoring box"). The final runs have the machine to themselves. One board run of unchanged code took 326.8 ms, 15 times the usual: a process holding one CPU stalls threads that only spin. Since v53 a waiting thread sleeps 10 us after every 128 pauses: 30.0 ms instead of 331 ms beside a busy loop, the same speed on a quiet box (PERF.md, "Other processes on the scoring box").
+Every local timing run deletes the output and checks its SHA, so a crash or wrong output leaves no number. Correctness runs over 6 seeds at 12 and at 1 CPU, plus a 100-run crash check on each variant ([PERF.md](PERF.md), "Measuring" and "A crash found and fixed").
 
 ## Reproduce
 
