@@ -20,7 +20,7 @@ How to read this, in plain words:
 
 | Steps | Change | Run IDs (every board run of this code) | T (s) | M (MB) | Points | KNOWN/OURS | Spread (box T) | Kept/reverted |
 |---|---|---|---|---|---|---|---|---|
-| 0 | The reference, unchanged (the organisers' board figure; our box probe of the same code read T 55.320-55.763 s, M 2098.1 MB, b-0) | | 56.35 | 2,200 | 0 | - | - | - |
+| 0 | The reference, unchanged (the organisers' figure; b-0 has our box probe of it) | | 56.35 | 2,200 | 0 | - | - | - |
 | 1-4 | b-1: the first Rust build, one pass over the memory-mapped corpus, indexing only the query terms | ea8def9 · Track B (run-852d4ff6be85); b17571d · Track B (run-e068b34d67dc); f15421b · Track B (run-13acc1fdc031); 1d0fa92 · Track B (run-bfe55557d5da) | 0.63-0.70 | 126 | 53.5-54.7 | KNOWN | - | kept, part replaced (b-3, b-8) |
 | 5-7 | b-2: posting-store memory, block chains that double with a back link | dea7a01 · Track B (run-45b8a072e380); 98a661e · Track B (run-5ae62ba09b77); 5ecc03f · Track B (run-bf51284d401c) | 0.61-0.70 | 93 | 54.8-56.3 | KNOWN | - | replaced (b-3) |
 | 8 | b-3: BOOL decided inside the pass, no posting store; T level, M 93 → 36 MB | dbc91d1 · Track B (run-d71935c4c4c4) | 0.66 | 36 | 58.6 | OURS | - | kept, part replaced (b-28) |
