@@ -384,11 +384,11 @@ impl Job<'_> {
         let mut long = take(&mut *self.long[h].lock().unwrap());
         let rows = &mut head[..claimed];
         let mut count = [0u32; 2 * IDS]; // by (id + 1) << 1 | 5xx; a free slot counts at 0
-        let mut hist = [[0u32; 1024]; 2]; // by latency bits 0-9, 10-19
+        let (mut low, mut high) = ([0u32; 512], [0u32; 2048]); // by latency bits 0-8, 9-19
         for &r in rows.iter() {
             count[(r >> 20) as usize] += 1;
-            hist[0][(r & 1023) as usize] += 1;
-            hist[1][(r >> 10 & 1023) as usize] += 1;
+            low[(r & 511) as usize] += 1;
+            high[(r >> 9 & 2047) as usize] += 1;
         }
         long.iter().for_each(|&p| count[(p as u32 >> 20) as usize] += 1);
         // By id + 1; start[0] is a trash slot past every span, where the free slots go.
@@ -401,8 +401,8 @@ impl Job<'_> {
         let mut next = start;
         // Sorted by latency (values is scratch here), then dealt to the spans in that order: each span is sorted, the
         // long latencies (all ESCAPE or more) last, sorted among themselves.
-        deal(rows, values, &mut hist[0], 0);
-        deal(&values[..claimed], rows, &mut hist[1], 10);
+        deal(rows, values, &mut low, 0);
+        deal(&values[..claimed], rows, &mut high, 9);
         for &r in rows.iter() {
             let k = (r >> 21) as usize;
             // Safety: an endpoint's slots run from its start to its start plus its count, all below sum, and the trash
@@ -518,14 +518,14 @@ unsafe fn put(w: *mut u8, v: u32) -> *mut u8 {
     w.add(17 - lead as usize)
 }
 
-/// One stable counting pass: src to dst in the order of the 10 bits at `shift`, whose counts are in hist.
-fn deal(src: &[u32], dst: &mut [u32], hist: &mut [u32; 1024], shift: u32) {
+/// One stable counting pass: src to dst in the order of the log2(N) bits at `shift`, whose counts are in hist.
+fn deal<const N: usize>(src: &[u32], dst: &mut [u32], hist: &mut [u32; N], shift: u32) {
     let mut at = 0;
     for c in hist.iter_mut() {
         (*c, at) = (at, at + *c);
     }
     for &r in src {
-        let b = &mut hist[(r >> shift & 1023) as usize];
+        let b = &mut hist[(r >> shift) as usize & (N - 1)];
         // Safety: the counts add up to src.len(), which dst holds.
         unsafe { *dst.get_unchecked_mut(*b as usize) = r };
         *b += 1;

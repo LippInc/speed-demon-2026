@@ -334,6 +334,18 @@ Experiments measured on our bench box only, with no board run (their box status 
   15.8-16.4). Expected K: T +2.4 %, M -0.5 %, S +1.9 % (+3.8 %). Hash checked: rule 30 kit, 24/24 runs on seeds 1,
   52719364 and 248057911 at 1, 4, 12, 13 and 24 workers under four busy loops; full local kit 423/481, the same
   out-of-spec failures as a-62.
+- a-64 board: `bc73e3c run-760e0ef7d853 | K 55.02 | T 16.06 ms | M 17.4 MB | S 430` (A rank 5).
+- a-65 (OURS), kept: the latency radix split 9 / 11 bits instead of 10 / 10. A timeline of a-64 (per-phase TSC sums
+  over the run's 72 hours, box) put the finish at ~45 ms of the run's ~165 ms of CPU: count 7.5, first deal 13.3,
+  second deal 6.0, endpoint deal 6.9, long 0.8, text 9.1. The first deal cost twice the second: latencies are skewed
+  (median 8.9K, p90 115K), so the high 10 bits hit ~64 hot buckets while the low 10 bits scatter every row over all
+  1,024. A smaller first pass keeps its write streams in L1. Box, 15 interleaved rounds: `a-64 15.43 | 8/12 15.19 |
+  9/11 15.07 | 7/13 15.09` (median ms); 21 rounds `a-64 15.16`-class runs again: 9/11 kept (smaller histograms than
+  7/13). LOST alongside: a prefetch-for-write of the first deal's lines during the count pass (the deal stayed at 13.3
+  ms: not a cold-write cost) and the names prefetched 8 endpoints ahead in the text loop (9.1 -> 8.6 ms of CPU, T level);
+  workers spinning until all are up, so no page fault meets a spawn (15.67 against 15.16 ms). Hash checked: rule 30 kit, 24/24 runs on seeds 1,
+  52719364 and 248057911 at 1, 4, 12, 13 and 24 workers under four busy loops; full local kit 423/481, the same
+  out-of-spec failures (more than 2,048 endpoints).
 
 ## Decisions
 
