@@ -27,6 +27,8 @@ The table holds each version's first board run; "Steps" below cites the re-push 
 
 ## The design and why
 
+v-numbers name the versions listed under Steps below.
+
 The comment at the top of join.c describes the program. The measurements behind its main choices:
 
 - **Floor.** Reading and scanning all 202 MB with 12 threads and nothing else: 5.6 ms with pread in 64 KB blocks, 7.6 ms mapped. Carry-less-multiply quote masks on top cost nothing (still 7.6 ms): the scan is memory-bound, so the parse can afford SIMD work per byte.

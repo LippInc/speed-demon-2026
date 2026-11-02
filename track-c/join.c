@@ -28,8 +28,9 @@
 //     byte) through a lock-free ring, 128 messages at a time (8 at a time
 //     cost 1.5 ms more), and the owner keeps its names in a private table
 //     with one bit per country. One table shared by all threads took
-//     almost twice as long in the Rust version (PERF.md): lookups missed the
-//     core's own cache. The owner's table needs no atomic instruction.
+//     almost twice as long in the Rust version, and in C (v50) 23.00 ms
+//     against 20.35 (PERF.md): lookups missed the core's own cache. The
+//     owner's table needs no atomic instruction.
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <malloc.h>
@@ -46,8 +47,9 @@
 typedef uint64_t u64;
 typedef uint32_t u32;
 typedef uint8_t u8;
-// CHB: 64-byte blocks per pass 1; BATCH: messages staged per owner.
-// MAXREC: records per pass 1, each 11 bytes or more.
+// CHB: 64-byte blocks per pass 1; BATCH: messages staged per owner; RING:
+// the messages a ring holds (two batches); PIECE: bytes per piece of
+// records.csv (256 KB). MAXREC: records per pass 1, each 11 bytes or more.
 enum { NT = 12, CHB = 256, BATCH = 128, RING = 2 * BATCH, PIECE = 1 << 18 };
 enum { MAXREC = 64 * CHB / 8 + 2 };
 
