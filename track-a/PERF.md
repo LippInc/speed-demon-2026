@@ -320,6 +320,20 @@ Experiments measured on our bench box only, with no board run (their box status 
   52719364 and 248057911 at 1, 4, 12, 13 and 24 workers under four busy loops.
   - first cut (4,096 slots, the whole sorted (id, name) list rebuilt when new names came): 16.70 ms against 16.47,
     branch misses 0.59 -> 0.79 M from longer probes.
+- a-63 board: `f173813 run-e1ffe83193a9 | K 52.24 | T 17.16 ms | M 17.5 MB | S 486`.
+- a-64 (OURS), kept: 1 MiB blocks and a shorter program, on a-63. A kernel profile of a-63 (perf, cycles:k with call
+  graphs) put 16-18 % of the kernel's cycles in native_queued_spin_lock_slowpath under filemap_map_pages: the input's
+  fault-around takes the lock of the 2 MiB page table it fills, and with 256 KiB blocks claimed in file order eight
+  threads parse inside one page table. Box, 9 interleaved rounds per probe: 256 KiB 16.29, 512 KiB 15.89, 768 KiB
+  15.77, 1 MiB 15.42, 2 MiB 15.69 ms; 1 MiB with the mapping placed at a 2 MiB boundary 15.44 (level, not kept).
+  Size: a GLM-5.3 pass on a written list (Rows and the endpoint table merged into Job, parse a method, Out into State,
+  unsafe_op_in_unsafe_fn allowed, short imports), then calls and chains kept under rustfmt's 60-column widths so they
+  stay on one line: S 486 -> 430. GLM's first cut counted the leading zeros in put after adding the '0's; the hash
+  check caught it. Box, 15 interleaved rounds: `a-63 med 16.24 | a-64 15.49`; perf stat (10 runs, twice): user
+  instructions 520 -> 504 M, user cycles 321 -> 309 M, kernel cycles 102 -> 89 M; peak over 3 runs 16.5-17.0 MB (a-63
+  15.8-16.4). Expected K: T +2.4 %, M -0.5 %, S +1.9 % (+3.8 %). Hash checked: rule 30 kit, 24/24 runs on seeds 1,
+  52719364 and 248057911 at 1, 4, 12, 13 and 24 workers under four busy loops; full local kit 423/481, the same
+  out-of-spec failures as a-62.
 
 ## Decisions
 
