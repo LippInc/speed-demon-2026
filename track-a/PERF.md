@@ -81,7 +81,7 @@ Terms used below: the board is the organisers' live leaderboard, one run per pus
 | 106 | a-64: 1 MiB blocks, at most two threads faulting the input under one lock | bc73e3c · Track A (run-760e0ef7d853) | 16.1 | 17.4 | 87.0 | OURS | - | kept |
 | 107-109 | a-65: the finish's radix split 9 / 11 bits | 0ca2530 · Track A (board run of 11-02 02:26Z; ID not saved); 8875804 · Track A (run-8cffec26c59b); 846449f · Track A (run-ffd993386390) | 15.6-18.9 | 17.1-17.4 | 85.3-87.4 | OURS | - | kept |
 | 110 | a-66: a shorter program with the same work (S 430 → 393) | a517db7 · Track A (run-0814c130face) | 18.8 | 18.9 | 85.3 | OURS | - | kept |
-| 111 | a-66 with the input mapping's result checked (S 393 → 394) | 43bc63a · Track A (run-09f11a65e004) | 15.8 | 17.4 | 87.5 | OURS | - | kept |
+| 111-112 | a-66 with the input mapping's result checked (S 393 → 394) | 43bc63a · Track A (run-09f11a65e004); 70462d0 · Track A (run-f1787b62faff) | 15.8 | 17.4 | 87.5 | OURS | - | kept |
 
 ## What each push carried
 
