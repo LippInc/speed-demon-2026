@@ -308,13 +308,25 @@ Experiments measured on our bench box only, with no board run (their box status 
     4 streams 18.47 ms with the prefetches, 18.78 without, 8 streams 19.02, 2 streams 17.72; one stream with its state
     in locals (a-62) 16.41. Prefetch distance: 640, 1,280 and 2,048 bytes level (17.64-17.71 in that probe), one
     prefetch 17.90, 4,096 bytes 17.91.
+- a-62 board: `3a37de8 run-987479ba190c | K 51.16 | T 17.32 ms | M 17.1 MB | S 557`.
+- a-63 (KNOWN shape, OURS code), kept: one shared endpoint table, on a-62. KNOWN (AVENGERS' public track A): one table
+  for all threads, filled under a lock and then only read, a 64-bit hash of the whole name as its identity (53 bits
+  compared, the id in the slot's low bits), AES rounds as the mixer. OURS: the hash's masks (a compare against the lane
+  numbers), its rounds and key, 8,192 slots, the ids sorted in place by a stable sort, the long latencies in a Vec per
+  hour. a-62's per-thread tables, the masked byte compare and the 128-byte name images in a published array go.
+  Box, 11 interleaved rounds: `a-62 med 16.47 | a-63 16.27`; perf stat (10 runs, twice): user instructions 579 -> 520 M,
+  user cycles 331 -> 321 M, L1 misses 4.3 -> 2.5 M, kernel cycles 97 -> 103 M; peak over 4 runs 16.0-16.5 MB (a-62
+  16.5-16.9); S 557 -> 486. Expected K: T +0.6 %, M +0.5 %, S +2.1 % (+3.3 %). Hash checked: rule 30 kit, 24/24 runs on seeds 1,
+  52719364 and 248057911 at 1, 4, 12, 13 and 24 workers under four busy loops.
+  - first cut (4,096 slots, the whole sorted (id, name) list rebuilt when new names came): 16.70 ms against 16.47,
+    branch misses 0.59 -> 0.79 M from longer probes.
 
 ## Decisions
 
 The plan's core choices (KNOWN = the known-best technique's version, OURS = our own design), each held or traded with the measurement that decided it:
 
 - 1, a two-pass counting sort into one flat latency array (OURS): traded back to one pass at a-2, which read K 14.63 against the floor's one pass. The counting sort came back in the tail, per hour, over one 4-byte record per line (a-29).
-- 2, a private open-addressing endpoint table per thread with a full byte compare (KNOWN): held, as a two-level key with one global rank (a-10, a-17). Cheaper hashes and confirms read level or slower (a-8, a-22, a-31).
+- 2, a private open-addressing endpoint table per thread with a full byte compare (KNOWN): held, as a two-level key with one global rank (a-10, a-17). Cheaper hashes and confirms read level or slower (a-8, a-22, a-31). Traded at a-63 for one shared table keyed by a hash of the whole name, no byte compare: 59 M fewer user instructions and 71 fewer lines.
 - 3, free the latencies before the output and never hold a full copy of `summary.txt` (OURS): held in aim, but the in-place mapped writer was never built. Each hour's records are freed as soon as they are placed, and its lines go out in output order as the hour finishes; a-55 pipeline finishes hours early behind a 2-hour watermark of the registered prefix (a-3, a-4, a-29, a-55).
 
 Rejected:
