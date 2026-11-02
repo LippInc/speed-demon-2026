@@ -1,5 +1,7 @@
 # Track B: performance log
 
+For the first two days we tuned a Rust program and took it from 56 s to about 0.2 s, in steps that kept getting smaller. What moved it after that was throwing the design away: a C rewrite on the evening of November 1, then one shared index per phase the next morning, which went from 103 ms to 52 ms in a day. We also got things wrong along the way. The board read our AES hash 12 ms slower than our own machine did, so we tried six other hashes before a per-line profile showed the cause: gcc had turned `L < 16 ? L : 16` into a branch (b-114 to b-116). The failed tries are in here too, next to the ones we kept.
+
 Every step from the reference to our final version, with every live-board run we hold an ID for; a row without one gives its commit. The numbers b-14, b-43, b-49, b-61, b-62, b-90, b-96, b-97 have no entry: they left no reading in this log.
 
 ## Where it ended

@@ -17,22 +17,22 @@ Reads `queries.txt` (50,000 BOOL and PHRASE queries) and `docs.txt` (254 MB, one
 
 | Trick | Where |
 |---|---|
-| Only the query terms are indexed. All workers parse the queries at once into one shared table; a new term is claimed with a compare-and-swap, no lock | [`intern`](bindex.c#L282), [`parse`](bindex.c#L382) |
+| Only the query terms are indexed. All workers parse the queries at once into one shared table; a new term is claimed with a compare-and-swap, no lock | [`intern`](bindex.c#L281), [`parse`](bindex.c#L381) |
 | A token's key is two AES rounds over its lowercased bytes, cut to length by a mask table indexed by the length (gcc made the obvious `L < 16 ? L : 16` a branch that mispredicted: 3 ms on the box, 5 to 12 ms in single board runs). The key's low bits are its bucket's byte offset and its high half a 32-bit tag | [`hash_at`](bindex.c#L238) |
 | A bucket is one cache line: 7 tags, their values and an eighth value that answers a miss. A lookup compares all the tags at once and reads the value at the match's index, or at 7, so a hit and a miss take the same path. The table sits on one 2 MB page and is addressed directly, without a pointer load | [`lookup`](bindex.c#L267) |
-| Tokens cut 64 bytes at a time from AVX2 class masks. Each round always hashes 8 tokens and moves to the first token it did not take, so no loop exit per window can mispredict | [`tokenize`](bindex.c#L324) |
-| Whole documents go through in batches, a sentinel key after each document. The sentinel answers as a miss, so no phrase crosses a document's edge and no bound is checked per token. A lookup prefetches the bucket 12 tokens ahead, into the next batch, which is tokenized first | [`batch`](bindex.c#L494), [`scan_part`](bindex.c#L516) |
-| One loop only looks up. A second takes the ids 8 at a time: common hits, rare hits and anchors fall out as masks and are left-packed with an AVX2 permute, so no branch depends on a token's class | [`scan_part`](bindex.c#L516) |
-| A common term's hit is one OR into that term's word for the current 64 documents, stored to its bitmap row at each row's end. It replaced 64×64 bit transposes | [`scan_part`](bindex.c#L516) |
-| A rare term's hit goes to a per-worker stream for its shard of 2,048 terms. Lists are built per shard by claim: counted, placed at a shared cursor, filled in document order, 16-bit ids after a sentinel that drops repeats | [`build`](bindex.c#L612) |
-| Term ids renumbered by class: common (over 1/32 of a sample), rare BOOL, phrase-only. Each worker counts one slot range, and the counts' prefix sums give each range its first ids | [`cls`](bindex.c#L444), [`worker`](bindex.c#L896) |
-| A phrase is checked during the scan at each occurrence of its rarest term. The anchor's entry holds the neighbouring term's id, so most candidates are rejected without touching the query | [`match_phrases`](bindex.c#L454) |
-| One index per phase, answered by claim into a running tally per query: phases run in document order, so there are no per-part records and no merge. Results stay lists while small and become bitmaps once a common term joins by OR | [`eval_range`](bindex.c#L796), [`emit`](bindex.c#L763) |
-| AND and NOT compare 8-value blocks with SSE4.2, with no branch on which side advances; a short list against a long one binary-searches it in constant steps. A long OR goes through a bitmap. A query's last OR, once it holds its ten ids, takes count and sum as a + b - (a AND b), with no merge | [`filt`](bindex.c#L695), [`lower`](bindex.c#L642), [`eval_range`](bindex.c#L796) |
-| A bitmap's count and id sum from AVX2 nibble tables, 256 bits per step | [`bsum`](bindex.c#L657) |
-| Parts of the text are claimed, four per worker per phase, so a worker slowed by a neighbour no longer holds up a phase | [`worker`](bindex.c#L896) |
-| Rows, tallies and lists share one huge-page region, each page faulted once by one thread. It removed a page-table lock fight: 4 KB first touches by 12 threads took 20 % of all kernel cycles | [`arena`](bindex.c#L176), [`worker`](bindex.c#L896) |
-| Each worker drops its share of the text's page-table entries with `MADV_DONTNEED` during the run, in parallel, so exit does not tear them all down on one thread | [`worker`](bindex.c#L896) |
+| Tokens cut 64 bytes at a time from AVX2 class masks. Each round always hashes 8 tokens and moves to the first token it did not take, so no loop exit per window can mispredict | [`tokenize`](bindex.c#L323) |
+| Whole documents go through in batches, a sentinel key after each document. The sentinel answers as a miss, so no phrase crosses a document's edge and no bound is checked per token. A lookup prefetches the bucket 12 tokens ahead, into the next batch, which is tokenized first | [`batch`](bindex.c#L493), [`scan_part`](bindex.c#L515) |
+| One loop only looks up. A second takes the ids 8 at a time: common hits, rare hits and anchors fall out as masks and are left-packed with an AVX2 permute, so no branch depends on a token's class | [`scan_part`](bindex.c#L515) |
+| A common term's hit is one OR into that term's word for the current 64 documents, stored to its bitmap row at each row's end. It replaced 64×64 bit transposes | [`scan_part`](bindex.c#L515) |
+| A rare term's hit goes to a per-worker stream for its shard of 2,048 terms. Lists are built per shard by claim: counted, placed at a shared cursor, filled in document order, 16-bit ids after a sentinel that drops repeats | [`build`](bindex.c#L611) |
+| Term ids renumbered by class: common (over 1/32 of a sample), rare BOOL, phrase-only. Each worker counts one slot range, and the counts' prefix sums give each range its first ids | [`cls`](bindex.c#L443), [`worker`](bindex.c#L895) |
+| A phrase is checked during the scan at each occurrence of its rarest term. The anchor's entry holds the neighbouring term's id, so most candidates are rejected without touching the query | [`match_phrases`](bindex.c#L453) |
+| One index per phase, answered by claim into a running tally per query: phases run in document order, so there are no per-part records and no merge. Results stay lists while small and become bitmaps once a common term joins by OR | [`eval_range`](bindex.c#L795), [`emit`](bindex.c#L762) |
+| AND and NOT compare 8-value blocks with SSE4.2, with no branch on which side advances; a short list against a long one binary-searches it in constant steps. A long OR goes through a bitmap. A query's last OR, once it holds its ten ids, takes count and sum as a + b - (a AND b), with no merge | [`filt`](bindex.c#L694), [`lower`](bindex.c#L641), [`eval_range`](bindex.c#L795) |
+| A bitmap's count and id sum from AVX2 nibble tables, 256 bits per step | [`bsum`](bindex.c#L656) |
+| Parts of the text are claimed, four per worker per phase, so a worker slowed by a neighbour no longer holds up a phase | [`worker`](bindex.c#L895) |
+| Rows, tallies and lists share one huge-page region, each page faulted once by one thread. It removed a page-table lock fight: 4 KB first touches by 12 threads took 20 % of all kernel cycles | [`arena`](bindex.c#L176), [`worker`](bindex.c#L895) |
+| Each worker drops its share of the text's page-table entries with `MADV_DONTNEED` during the run, in parallel, so exit does not tear them all down on one thread | [`worker`](bindex.c#L895) |
 
 ## The approach
 

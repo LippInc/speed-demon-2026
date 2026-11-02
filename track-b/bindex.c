@@ -265,11 +265,10 @@ static u32 probe(u64 h, u32 b) {
 }
 
 static inline u32 lookup(const u64 *ph) {
-  const Bucket *t = BKT(*ph);
   u32 m = MSK(
-      _mm256_cmpeq_epi32(_mm256_load_si256((const V *)t->tag),
+      _mm256_cmpeq_epi32(_mm256_load_si256((const V *)BKT(*ph)->tag),
                          S32(((const int __attribute__((may_alias)) *)ph)[1])));
-  return t->val[_tzcnt_u32(m | 128)];
+  return BKT(*ph)->val[_tzcnt_u32(m | 128)];
 }
 // v, a lookup's answer, with a PROBE resolved
 #define LOOK(ph, v)                                                            \
