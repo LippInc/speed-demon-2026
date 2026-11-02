@@ -69,14 +69,14 @@ unsafe fn digits8(v: u64) -> u64 {
     (r & 0xffff_ffff) * 10_000 + (r >> 32)
 }
 
-/// The endpoint's start and length, the 5xx flag and the latency of the line at p, and the next line's start (spec 2:
+/// The endpoint's start and length and the latency of the line at p, and the next line's start (spec 2:
 /// "<timestamp> <method> <endpoint> <status> <latency>", the timestamp always 27 bytes). A 64-byte space mask from
 /// the method on holds the space after the method (at most 7 bytes) and, unless the endpoint is long, the one after it;
 /// the 3-digit status follows, its first digit '5' exactly for a 5xx, then the latency, whose digits one 8-byte load
 /// finds up to its LF. Read forward, the next line's start comes out of the latency's length: no LF search first.
 /// Safety: d + p..d + p + 128 must be readable, and so must the line's end + 32.
 #[inline(always)]
-unsafe fn line(d: *const u8, p: usize) -> (usize, usize, u64, u32, usize) {
+unsafe fn line(d: *const u8, p: usize) -> (usize, usize, u32, usize) {
     let mut at = p + 28;
     let m = mask32(d.add(at), b' ') as u64 | (mask32(d.add(at + 32), b' ') as u64) << 32;
     let ep = at + 1 + m.trailing_zeros() as usize;
@@ -104,8 +104,7 @@ unsafe fn line(d: *const u8, p: usize) -> (usize, usize, u64, u32, usize) {
         // n digits from sp + 5, then the LF: the next line starts at sp + 6 + n.
         (digits8(v << (64 - 8 * n)), sp + 6 + n)
     };
-    let error = (*d.add(sp + 1) == b'5') as u64;
-    (ep, sp - ep, error, latency as u32, next)
+    (ep, sp - ep, latency as u32, next)
 }
 
 /// A 64-bit hash of the whole len-byte endpoint at p: its first and last 32 bytes, each cut to the endpoint, and from 65
@@ -118,19 +117,19 @@ unsafe fn ep_hash(p: *const u8, len: usize) -> u64 {
     let load = |at: *const u8| _mm256_loadu_si256(at as _);
     // The lane numbers 0 to 31 (a constant once compiled) and the length, to cut a load to the endpoint's bytes.
     let iota = load(std::array::from_fn::<u8, 32, _>(|i| i as u8).as_ptr());
-    let n = _mm256_set1_epi8(len.min(32) as i8);
-    // Byte i of the first load is the endpoint's when i < n, of the last load when i + n > 31.
+    let n = _mm256_set1_epi8(len as i8);
+    // Byte i of the first load is the endpoint's when i < n, of the last load when 31 - i < n.
     let first = _mm256_and_si256(load(p), _mm256_cmpgt_epi8(n, iota));
-    let last_in = _mm256_cmpgt_epi8(_mm256_add_epi8(iota, n), _mm256_set1_epi8(31));
+    let last_in = _mm256_cmpgt_epi8(n, _mm256_sub_epi8(_mm256_set1_epi8(31), iota));
     let mut x = _mm256_aesenc_epi128(first, _mm256_and_si256(load(p.add(len).sub(32)), last_in));
     if len > 64 {
         x = _mm256_aesenc_epi128(x, load(p.add(32)));
         x = _mm256_aesenc_epi128(x, load(p.add(len - 64)));
     }
-    x = _mm256_aesenc_epi128(x, _mm256_set1_epi64x(len as i64));
+    x = _mm256_aesenc_epi128(x, _mm256_zextsi128_si256(_mm_cvtsi64_si128(len as i64)));
     x = _mm256_aesenc_epi128(x, _mm256_set1_epi64x(0x5851_f42d_4c95_7f2d));
     let x = _mm_xor_si128(_mm256_castsi256_si128(x), _mm256_extracti128_si256::<1>(x));
-    (_mm_cvtsi128_si64(x) ^ _mm_extract_epi64::<1>(x)) as u64
+    _mm_cvtsi128_si64(x) as u64
 }
 
 /// An endpoint's bytes, where the line that first had it lies in the input's mapping: 128 bytes can be read from its start.
@@ -176,6 +175,18 @@ static TABLE: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
 /// pushed, is never written again: readers keep a pointer to them. Then the ids in byte order, as last asked for.
 static NAMES: Mutex<(Vec<Name>, Vec<u16>)> = Mutex::new((Vec::new(), Vec::new()));
 
+/// A new endpoint for slot i, unless another thread just filled it.
+#[cold]
+#[inline(never)]
+fn insert(i: usize, h: u64, p: *const u8, len: usize) {
+    let mut names = NAMES.lock().unwrap();
+    if TABLE[i].load(Relaxed) == 0 {
+        // Safety: the endpoint is the len bytes at p, in the input's mapping, which is never unmapped.
+        names.0.push(unsafe { from_raw_parts(p, len) });
+        TABLE[i].store(h >> 11 << 11 | names.0.len() as u64, Relaxed);
+    }
+}
+
 /// The id of the len-byte endpoint at p, a new one the first time it is met; p - 32..p + 128 must be readable.
 #[inline(always)]
 fn id(p: *const u8, len: usize) -> u32 {
@@ -185,14 +196,7 @@ fn id(p: *const u8, len: usize) -> u32 {
     loop {
         match TABLE[i].load(Relaxed) {
             s if s >> 11 == h >> 11 => return (s & 2047) as u32 - 1,
-            0 => {
-                let mut names = NAMES.lock().unwrap();
-                if TABLE[i].load(Relaxed) == 0 {
-                    // Safety: the endpoint is the len bytes at p, in the input's mapping, which is never unmapped.
-                    names.0.push(unsafe { from_raw_parts(p, len) });
-                    TABLE[i].store(h >> 11 << 11 | names.0.len() as u64, Relaxed);
-                }
-            }
+            0 => insert(i, h, p, len),
             _ => i = (i + 1) % SLOTS,
         }
     }
@@ -252,8 +256,10 @@ fn parse(data: &[u8], (start, end): (usize, usize), cur: &mut [Chunk; HOURS]) ->
             (c, low, prev_prefix) = (cur[h], low.min(h), prefix);
         }
         // Safety: the line and the 128 bytes after its start are inside the input or its zero tail.
-        let (ep, len, error, latency, next) = unsafe { line(d, p) };
-        let row = (id(d.wrapping_add(ep), len) + 1) << 21 | (error as u32) << 20;
+        let (ep, len, latency, next) = unsafe { line(d, p) };
+        let row = (id(d.wrapping_add(ep), len) + 1) << 21;
+        // Safety: the status follows the endpoint, its first digit '5' exactly for a 5xx.
+        let row = row | ((unsafe { *d.add(ep + len + 1) } == b'5') as u32) << 20;
         if latency >= ESCAPE {
             let i = LONG[h].fetch_add(1, Relaxed);
             let top = region(h).wrapping_add(STRIDE / 4) as *mut u64;
