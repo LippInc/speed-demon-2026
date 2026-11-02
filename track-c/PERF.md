@@ -83,16 +83,7 @@ With a busy loop on one of CPUs 0-11 for 1 ms in every 5 (box 2, fast loop, medi
 
 A busy loop on one CPU for the whole run made v24 25 times slower (546 ms) and v26 8 times (172 to 192 ms).
 
-v43's code does the same: 331 ms with a busy loop on CPU 3 for the whole run, 439 ms with two loops anywhere in 0-11, against 23.3 ms quiet (our i5-13500 bench machine, static build under `taskset 0-11`, 40 interleaved rounds, medians). The board met it once, run-2a0d82be6829 at 326.8 ms. Every thread waits on every other, so the threads that only spin keep all twelve CPUs busy, and the thread that shares a CPU with the loop runs only in its turns of a few milliseconds while the rest wait for it. v53 sleeps 10 us after every 128 pauses of a wait: the freed CPU takes the stalled thread. Same rounds:
-
-| Wait | Quiet | 1 busy loop | 2 busy loops |
-|---|---|---|---|
-| spin only (v43) | 23.3 ms | 331 ms | 439 ms |
-| 128 pauses, then 10 us (v53) | 23.3 ms | 30.0 ms | 32.9 ms |
-| 256 pauses, then 20 us | 23.3 ms | 31.0 ms | 34.2 ms |
-| 512 pauses, then 20 us | 23.4 ms | 32.3 ms | 36.3 ms |
-
-Two longer settings, 20 rounds: 1,024 pauses then 50 us, 35.8 and 41.4 ms; 4,096 then 100 us, 58.0 and 70.7 ms. The output matched on seed 1 and a fresh seed, and with the program held to 1, 4 and 12 CPUs.
+v43's code does the same: 331 ms with a busy loop on CPU 3 for the whole run, 439 ms with two loops anywhere in 0-11, against 23.3 ms quiet (our i5-13500 bench machine, static build under `taskset 0-11`, 40 interleaved rounds, medians). The board met it once, run-2a0d82be6829 at 326.8 ms. Every thread waits on every other, so the threads that only spin keep all twelve CPUs busy, and the thread that shares a CPU with the loop runs only in its turns of a few milliseconds while the rest wait for it. v53 sleeps 10 us after every 128 pauses of a wait: the freed CPU takes the stalled thread. Same rounds, quiet / one busy loop / two: spin only (v43) 23.3 / 331 / 439 ms; 128 pauses, then 10 us (v53) 23.3 / 30.0 / 32.9 ms; 256 pauses, then 20 us 23.3 / 31.0 / 34.2 ms; 512 pauses, then 20 us 23.4 / 32.3 / 36.3 ms. Two longer settings, 20 rounds: 1,024 pauses then 50 us, 35.8 and 41.4 ms; 4,096 then 100 us, 58.0 and 70.7 ms. The output matched on seed 1 and a fresh seed, and with the program held to 1, 4 and 12 CPUs.
 
 On a quiet box, v27 and v39 each had 9 slow runs in 800 (more than 1.2 times the median), 4 or 5 of them between 60 and 180 ms: a thread that loses its CPU holds up the threads that send to it, with or without the overflow queue. The harness drops the slowest of 5 runs and repeats a batch whose middle three differ by more than 50 ms.
 
