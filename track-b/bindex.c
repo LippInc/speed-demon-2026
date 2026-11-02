@@ -191,26 +191,33 @@ static inline u64 lfm(const u8 *q) {
          | (u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(LOADU(q + 32), _mm256_set1_epi8('\n'))) << 32;
 }
 
-// Tokenizes the text from q to its LF into keys[]; returns the byte after the LF. 64-byte
-// windows: a token starts at a token byte whose predecessor is not one (carry:
-// the previous window's last byte); its length comes from the mask, plus the
-// next window's leading run when it reaches the window's end. The per-token
-// work is scalar: the vector units are shared with the core's other thread.
+// Tokenizes the text from q to its LF into keys[]; returns the byte after the LF. Each
+// round reads the 64 bytes at q, always hashes TK tokens (past the last real one it hashes
+// garbage that n never counts) and moves q to the first token it did not take, so q never
+// sits inside a token and no per-window loop exit can mispredict. A run reaching the
+// window's end waits for the next round; only a token of 64 bytes or more needs a branch.
 // Loads may run past the LF and the file end.
+#define TK 8
 static const u8 *tokenize(const u8 *q, u64 *keys, u32 *pn) {
     u32 n = 0;
-    u64 m = tm(q), lf = lfm(q), carry = 0;
-    for (;; q += 64) {
-        u64 m2 = tm(q + 64), lf2 = lfm(q + 64), mm = m & ((lf & -lf) - 1);   // bytes before the LF
-        u32 more = (u32)_tzcnt_u64(~m2);
-        for (u64 s = mm & ~(mm << 1 | carry); s; s &= s - 1) {
+    for (;;) {
+        u64 lf = lfm(q), mm = tm(q) & ((lf & -lf) - 1);   // bytes before the LF
+        u32 cut = 64 - (u32)_lzcnt_u64(~mm);
+        u64 s0 = _bzhi_u64(mm & ~(mm << 1), cut), s = s0;
+        for (u32 j = 0; j < TK; j++, s &= s - 1) {
             u32 st = (u32)_tzcnt_u64(s), L = (u32)_tzcnt_u64(~(mm >> st));
-            const u8 *t = q + st;
-            L = st + L == 64 ? L + more : L;
-            keys[n++] = hash_at(t, L);
+            keys[n + j] = hash_at(q + st, L);
         }
-        if (lf) { *pn = n; return q + _tzcnt_u64(lf) + 1; }
-        carry = mm >> 63; m = m2; lf = lf2;
+        n += (u32)_mm_popcnt_u64(s0 ^ s);
+        if (lf && !s) { *pn = n; return q + _tzcnt_u64(lf) + 1; }
+        if (!cut) {                                       // 64 token bytes: the hash reads 32 at most
+            keys[n++] = hash_at(q, 64);
+            while (!~tm(q)) q += 64;
+            q += _tzcnt_u64(~tm(q));
+            continue;
+        }
+        u32 nx = (u32)_tzcnt_u64(s);
+        q += nx < cut ? nx : cut;
     }
 }
 // A docs.txt line is its id, a TAB and the text; ids run 0 to N-1 in file order (spec).
@@ -234,6 +241,7 @@ static void parse(const u8 *p, const u8 *e, u32 q) {
             p += ph ? 1 : p[1] == 'O' ? 4 : 5;
         }
         qk[q] = (u8)k;
+        if (k == 1) qkind[q] = 0, __atomic_store_n(&bflag[qterm[8 * q]], 1, __ATOMIC_RELAXED);   // the same documents as a BOOL term
         p += ph ? 2 : 1;
     }
 }
@@ -348,7 +356,9 @@ static void scan_part(Worker *me, int p) {
             _mm256_storeu_si256((__m256i *)(dl + ndh), _mm256_permutevar8x32_epi32(id, _mm256_load_si256((const __m256i *)PACK[dm])));
             _mm256_storeu_si256((__m256i *)(rl + nr), _mm256_permutevar8x32_epi32(s, _mm256_load_si256((const __m256i *)PACK[rm])));
             ndh += (u32)_mm_popcnt_u32(dm); nr += (u32)_mm_popcnt_u32(rm);
-            for (u32 m = (u32)_mm256_movemask_ps(_mm256_castsi256_ps(v)); m; m &= m - 1) aps[na++] = i + _tzcnt_u32(m);
+            u32 am = (u32)_mm256_movemask_ps(_mm256_castsi256_ps(v));   // anchor lanes, left-packed like the rest: this loop mispredicted
+            _mm256_storeu_si256((__m256i *)(aps + na), _mm256_permutevar8x32_epi32(_mm256_add_epi32(_mm256_set1_epi32((int)i), _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7)), _mm256_load_si256((const __m256i *)PACK[am])));
+            na += (u32)_mm_popcnt_u32(am);
         }
         for (u32 k = 0; k < ndh; k++) db[dl[k]] = 0x80;
         for (u32 k = 0; k < nr; k++) { u32 s = rl[k]; *sp[s >> SH]++ = s << 16 | d; }
@@ -447,12 +457,10 @@ static u32 filt(const u16 *a, u32 an, const u16 *b, u32 bn, u16 *d, u32 keep) {
         __m128i A = ld128(a + i);
         u32 x = a[i + 7], y = b[j + 7];
         acc |= (u32)_mm_cvtsi128_si32(_mm_cmpestrm(ld128(b + j), 8, A, 8, _SIDD_UWORD_OPS | _SIDD_CMP_EQUAL_ANY));
-        if (x <= y) {
-            u32 m = (acc ^ (keep - 1)) & 0xFF;
-            _mm_storeu_si128((__m128i *)(d + n), _mm_shuffle_epi8(A, ld128(tbl[m])));
-            n += (u32)_mm_popcnt_u32(m); i += 8; acc = 0;
-        }
-        j += y <= x ? 8 : 0;
+        u32 adv = -(u32)(x <= y), m = (acc ^ (keep - 1)) & 0xFF & adv;   // as arithmetic: x <= y is a coin flip
+        _mm_storeu_si128((__m128i *)(d + n), _mm_shuffle_epi8(A, ld128(tbl[m])));
+        n += (u32)_mm_popcnt_u32(m); i += 8 & adv; acc &= ~adv;
+        j += (u32)(y <= x) * 8;
     }
     for (j = j0 < j ? j0 : j; i < an && j < bn;) { u16 x = a[i], y = b[j]; d[n] = x; n += keep ? x == y : x < y; i += x <= y; j += y <= x; }
     while (!keep && i < an) d[n++] = a[i++];
