@@ -1,6 +1,6 @@
-# C17 built by gcc 15 for x86-64-v3, linked statically, copied into a slim
+# C17 built by gcc 16 for x86-64-v3, linked statically, copied into a slim
 # runtime stage. Legacy-builder syntax only (the timing box has no BuildKit).
-FROM gcc:15@sha256:eb5e64286ad47187b32bda75c6b6916166ecb41da56559b8b09e0001748d2cce AS build
+FROM gcc:16@sha256:43978d7710a803d1c3d32f4117c1528ec7285a4ce2c0a51e982ec1a6e3d87d95 AS build
 COPY join.c /src/
 RUN gcc -O3 -march=x86-64-v3 -mpclmul -maes -static -pthread -o /src/join /src/join.c
 
