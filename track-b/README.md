@@ -26,7 +26,7 @@ Reads `queries.txt` (50,000 BOOL and PHRASE queries) and `docs.txt` (254 MB, one
 
 ## The approach
 
-Twelve workers, one per hardware thread of the scoring box. Each owns a contiguous stretch of `docs.txt` (mapped read-only, never copied), cut into 3 parts of at most 32,768 documents, so a document's number inside its part fits in 16 bits.
+Twelve workers, one per hardware thread of the scoring box (the CPU count; `SD_WORKERS` overrides it for our hash tests at 1, 4, 12 and 24 workers). Each owns a contiguous stretch of `docs.txt` (mapped read-only, never copied), cut into 3 parts of at most 32,768 documents, so a document's number inside its part fits in 16 bits.
 
 1. **Queries.** Each worker parses one slice of `queries.txt` into the shared term table. Every BOOL term is flagged; each phrase is a list of term ids.
 2. **Sample and renumber.** Each worker counts document frequencies on the first 1/64 of its first part. From the summed counts, terms in over 1/32 of the sampled documents are common (about 370 on seed 1), and every term gets a new id: common, then rare BOOL, then phrase-only. Each phrase is anchored at its term with the lowest sampled frequency.
@@ -50,11 +50,11 @@ None. The C standard library and POSIX threads, linked statically. Built by the 
 
 ## With another 24 hours
 
-Instructions per token (box, `perf`): tokenize about 36, lookup and record about 33 (62 before b-105), count and scatter about 10, answering about 46. The box is instruction-bound (3.4 instructions per cycle per core), so instructions are what to cut.
+Instructions per token (box, `perf`, after b-105; each stage's instructions divided by the corpus's 36.3 M tokens): tokenize about 36, lookup and record about 33 (62 before b-105), count and scatter about 10, answering about 46. The box is instruction-bound (3.4 instructions per cycle per core), so instructions are what to cut.
 
 - **The answer phase.** AND and NOT now compare 8-value blocks with SSE4.2 (b-103). OR as a min/max merge network gained 1 ms for 34 more lines, under the 0.05 ms a line costs in the score, so it is not in. Each part still answers every BOOL query; answering a worker's three parts at once would cut that fixed cost, but needs the memory the parts save.
 - **The tokenizer.** About 36 instructions per token. Writing the token starts and ends with unconditional stores (no loop count that depends on the text) cut branch misses by 3.4 M but added 8 % instructions and lost 1 ms; hashing two tokens per vector register would cut the per-token work instead.
-- **The rare-term lists.** Counting and scattering the scan's stream into per-term lists is about a fifth of the scan's cycles, from random writes into 53,000 counters. Splitting the stream by term range first would keep each range's counters in L1.
+- **The rare-term lists.** Counting and scattering the scan's stream into per-term lists is about a fifth of the scan: running that stage twice adds 10.9 ms to the 103.2 ms run (box). The cost is random writes into 53,000 counters. Splitting the stream by term range first would keep each range's counters in L1.
 
 ## Reproduce
 

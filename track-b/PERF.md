@@ -1,6 +1,6 @@
 # Track B: performance log
 
-Every step from the reference to your final version, each with the live-board run ID that measured it. Judges check that the run IDs exist and that each change moved the way you say it did.
+Every step from the reference to our final version, with every live-board run that measured it.
 
 Terms used below: the board is the organisers' live leaderboard, one run per push; the box is our bench machine with the scoring machine's CPU, where each reading is 5 runs on seed 1's full data (official) and 5 on one fresh seed at full size (fresh), and K is the lower of the two; the VM is a 4-core cloud machine used for cachegrind counts and quick timings, never for K; lifted means copied from our working repository into this one and pushed, so the board ran it. From the C rewrite on (b-101), box readings are medians of 10 or 15 runs in two or three interleaved rounds, and "organisers' harness" means their scoring script run on the box. A "kit <sha>" in a row names the commit in our working repository whose code that push carried; a hash in parentheses in the lists below is a box-only reading with no board run.
 

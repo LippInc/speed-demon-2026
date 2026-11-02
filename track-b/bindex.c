@@ -24,7 +24,7 @@
 
 typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t u64;
 
-#define NSUB 3            // parts per worker
+#define NSUB 3            // parts per worker, more if a part would pass MAXPART
 #define MAXPART 32768     // docs per part, so a part-local doc number fits a u16
 #define MAXTOK 65536      // tokens per doc; the spec's longest doc (999 units) has ~10,000
 #define BBITS 15          // term table: 2^15 buckets of 5 keys
@@ -42,8 +42,18 @@ static void die(const char *m) { fprintf(stderr, "bindex: %s\n", m); exit(1); }
 
 enum { AND = 1, OR, NOT };
 typedef struct { u32 q, gid; } Hit;            // phrase query q matches document gid
+// A worker's memory. One document's scan: keys (its token keys, then the next
+// document's), ids (their term ids), aps (positions of its anchor tokens), db (a
+// byte per bitmap term: seen in this document). One part: bt (64 documents' db
+// bits, transposed into bm, the bitmap rows), stream (rare term numbers in token
+// order, document d's from docoff[d]), post (each rare term's documents, from
+// off to end). Answers: la and lb (list buffers), rec and nrec (a record per
+// matched query), qdone (ids recorded per query), hit, nhit and hcap (phrase
+// matches). Setup: sdf and nsd (sampled document counts per term slot, documents
+// sampled), cnt (terms per class: bitmap row, list, phrase only). w64: 64-bit
+// words per bitmap row.
 typedef struct {
-    _Alignas(64) u64 *keys, *bm, *bt;     // aligned: no two workers share a cache line
+    _Alignas(64) u64 *keys, *bm, *bt;     // each Worker starts a cache line: no two share one
     u8 *heap; size_t hsize;                    // the part arrays, unmapped before the merge
     u32 *ids, *aps, *sdf, *off, *end, *docoff, *rec, nrec, nsd, w64, nhit, hcap, cnt[3];
     u16 *la, *lb, *stream, *post;
@@ -118,7 +128,7 @@ static u64 KM[17][2];
 static inline u64 key_at(const u8 *p, u32 L) {
     u32 a = L < 8 ? L : 8, b = L < 16 ? L - a : 8;
     u64 k = _bzhi_u64(ld64(p) | LOWER, 8 * a) ^ _bzhi_u64(ld64(p + 8) | LOWER, 8 * b) * 0x9E3779B97F4A7C15ull;
-    if (L > 16) {                              // the generator's longest token has 17 bytes
+    if (L > 16) {                              // the generator's longest token has 17 bytes; keys cover 32
         u32 c = L < 24 ? L - 16 : 8;
         k ^= _bzhi_u64(ld64(p + 16) | LOWER, 8 * c) * 0xC2B2AE3D27D4EB4Full
            ^ _bzhi_u64(ld64(p + 24) | LOWER, 8 * (L - 16 - c)) * 0x165667B19E3779F9ull;
@@ -575,7 +585,9 @@ static void *worker(void *arg) {
         if (nsparse > 65536) die("over 65,536 rare BOOL terms");
     }
     pthread_barrier_wait(&bar);
-    // Phrase queries listed per anchor term: counted, offsets summed, filled.
+    // Phrase queries listed per anchor term: counted, offsets summed, filled. The
+    // fill counts each offset back down, so aoff[v] ends as term v's first slot
+    // and aoff[v + 1] > aoff[v] says that v anchors a phrase.
     for (u32 q = base; q < base + n; q++) if (qkind[q]) __atomic_fetch_add(&aoff[anchor_of(q, &pos)], 1, __ATOMIC_RELAXED);
     pthread_barrier_wait(&bar);
     if (!w) for (u32 i = 1; i <= nterms; i++) aoff[i] += aoff[i - 1];
