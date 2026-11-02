@@ -36,7 +36,9 @@ static uint32_t SCAP;     // entries per worker per shard (address space only), 
 // tokens per doc; the spec's longest doc (999 units) has ~10,000
 #define MAXTOK 65536
 #define RB 2048            // dense and rare hits gathered over documents before they are applied
-#define MT (MAXTOK + 16 + RB)
+#define BT 1024             // tokens per batch, at least
+#define MT (MAXTOK + 16 + RB + BT)
+#define KS (4096 + MAXTOK)      // keys and doc numbers per batch buffer
 #ifndef BBITS
 #define BBITS 15          // term table: 2^15 buckets of 7 tags
 #endif
@@ -68,7 +70,7 @@ typedef struct { u64 sum; u32 cnt, nid, top[10]; } Tally;   // a query's answer 
 // words per bitmap row.
 typedef struct {
     _Alignas(64) u64 *keys, *cw, *sa, *sb;
-    u8 *sdf; u32 *ids, *aps, *dl, *rl, *sbase, *sp[(65536 >> SH) + 1], nsd, nhit, hcap, cnt[3];
+    u8 *sdf; u32 *ids, *dk, *aps, *dl, *rl, *sbase, *sp[(65536 >> SH) + 1], nsd, nhit, hcap, cnt[3];
     u16 *la, *lb;
     Hit *hit;
     char *out; size_t outlen;
@@ -78,7 +80,11 @@ static Worker wk[WMAX];
 // wmem: all workers' memory, WS bytes of address space each: keys, ids, aps, dl, rl, sa, sb, la, lb, sbase, cw, out
 static u8 *wmem;
 static size_t WS;
-static int nw, P, PH;                          // workers, parts (one per worker per phase), phases
+#define CK 4               // parts per worker per phase
+static int nw, P, PH, NC;                      // workers, parts, phases, parts per phase
+// each part's ends in its worker's streams and hit list: [0] where it began, [1] where it ended
+static u32 *cs[2][WMAX * CK][(65536 >> SH) + 1], ch[2][WMAX * CK], sclaim[256];
+static u8 co[WMAX * CK];                       // the part's worker
 static const u8 *doc, *qtxt;
 static size_t dlen, qlen, qs[WMAX + 1], *pstart;
 static u32 ndocs, nq, ndense, nsparse, nterms, qc[WMAX], qb[WMAX + 1], *pfirst;
@@ -130,7 +136,7 @@ typedef struct { _Alignas(64) u32 tag[8]; u32 val[8]; } Bucket;
 static _Alignas(1 << 21) Bucket tab[1u << BBITS]; // on one huge page: lookups take no TLB misses
 #define BMASK ((1u << BBITS) - 1)
 #define BOFF ((u64)BMASK << 6)           // a key's bits 6..20: its bucket's byte offset; its high half: the tag
-#define BKT(h) ((const Bucket *)((const u8 *)tab + ((h) & BOFF)))
+#define BKT(h) ((const Bucket *)((const u8 *)tab + (u32)(h)))
 #define TG(s) tab[s >> 3].tag[s & 7] // slot s's tag and value, without a lookup
 #define TV(s) tab[s >> 3].val[s & 7]
 
@@ -141,7 +147,7 @@ static inline u64 hash_at(const u8 *p, u64 L) {
     __m128i x = _mm_and_si128(_mm_or_si128(ld128(p), _mm_set1_epi8(32)), _mm_load_si128((const __m128i *)(M + L)));
     if (__builtin_expect(L > 256, 0)) x = _mm_xor_si128(x, _mm_aesenc_si128(_mm_and_si128(_mm_or_si128(ld128(p + 16), _mm_set1_epi8(32)), _mm_load_si128((const __m128i *)(M + L - 256))), _mm_set1_epi32(0x3C6EF372)));
     const __m128i K = _mm_set_epi64x(0x9E3779B97F4A7C15ll, 0x243F6A8885A308D3ll);
-    return (u64)_mm_cvtsi128_si64(_mm_aesenc_si128(_mm_aesenc_si128(x, K), K));
+    return (u64)_mm_cvtsi128_si64(_mm_and_si128(_mm_aesenc_si128(_mm_aesenc_si128(x, K), K), _mm_set_epi64x(0, (long long)(BOFF | ~(u64)0 << 32))));
 }
 
 static u32 probe(u64 h, u32 b) {               // the tag may sit in a later bucket
@@ -155,9 +161,9 @@ static u32 probe(u64 h, u32 b) {               // the tag may sit in a later buc
 static inline u32 lookup(const u64 *ph) {
     const Bucket *t = BKT(*ph);
     u32 m = (u32)_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(_mm256_load_si256((const __m256i *)t->tag), _mm256_set1_epi32(((const int *)ph)[1]))));
-    u32 v = t->val[_tzcnt_u32(m | 128)];
-    return __builtin_expect(v == PROBE, 0) ? probe(*ph, (u32)(*ph >> 6) & BMASK) : v;
+    return t->val[_tzcnt_u32(m | 128)];
 }
+#define LOOK(ph, v) (__builtin_expect((v) == PROBE, 0) ? probe(*(ph), (u32)(*(ph) >> 6) & BMASK) : (v))
 
 // Called by all workers at once while they parse: a free tag slot is claimed by
 // compare-and-swap. Relaxed order is enough: no worker looks a term up before
@@ -199,12 +205,14 @@ static inline u64 lfm(const u8 *q) {
 // window's end waits for the next round; only a token of 64 bytes or more needs a branch.
 // Loads may run past the LF and the file end.
 #define TK 8
-static const u8 *tokenize(const u8 *q, u64 *keys, u32 *pn) {
+static const u8 *tokenize(const u8 *q, u64 *keys, u32 *pn, u32 *dk, u32 d) {
     u32 n = 0;
+    const __m256i DV = _mm256_set1_epi32((int)d);
     for (;;) {
         u64 lf = lfm(q), mm = tm(q) & ((lf & -lf) - 1);   // bytes before the LF
         u64 nm = ~mm, cut = 64 - _lzcnt_u64(nm);
         u64 s0 = _bzhi_u64(mm & ~(mm << 1), (u32)cut), s = s0, *kp = keys + n;
+        _mm256_storeu_si256((__m256i *)(dk + n), DV);
         for (u32 j = 0; j < TK; j++, s &= s - 1) {
             u64 st = _tzcnt_u64(s), L = _tzcnt_u64(nm >> st);
             kp[j] = hash_at(q + st, L);
@@ -212,7 +220,7 @@ static const u8 *tokenize(const u8 *q, u64 *keys, u32 *pn) {
         n += (u32)_mm_popcnt_u64(s0 ^ s);
         if (lf && !s) { *pn = n; return q + _tzcnt_u64(lf) + 1; }
         if (!cut) {                                       // 64 token bytes: the hash reads 32 at most
-            keys[n++] = hash_at(q, 64);
+            dk[n] = d, keys[n++] = hash_at(q, 64);
             while (!~tm(q)) q += 64;
             q += _tzcnt_u64(~tm(q));
             continue;
@@ -227,7 +235,10 @@ static inline const u8 *skip_id(const u8 *q) { while (*q != '\t') q++; return q 
 
 // the first offset at or after o that starts a line of b[0..len) whose id is a multiple of m (m 1: any line)
 static size_t nxt(size_t o, size_t len, const u8 *b, u32 m) {
-    while (o && o < len && (b[o - 1] != '\n' || (m > 1 && id_at(b + o) % m))) o++;
+    while (o && o < len && (b[o - 1] != '\n' || (m > 1 && id_at(b + o) % m))) {
+        const u8 *l = memchr(b + o, '\n', len - o);
+        o = l ? (size_t)(l - b) + 1 : len;
+    }
     return o;
 }
 
@@ -258,11 +269,11 @@ static void parse(const u8 *p, const u8 *e, u32 q) {
 // Document frequency of every term over the first 1/64 of the worker's first
 // part; sdf[slot] = tokens counted, stopping at 255.
 static void sample(Worker *me, int w) {
-    const u8 *q = doc + pstart[w], *end = q + (pstart[w + 1] - pstart[w]) / SAMPLE_DIV;
+    const u8 *q = doc + pstart[w * CK], *end = q + (pstart[w * CK + 1] - pstart[w * CK]) / (SAMPLE_DIV / CK);
     u32 d = 0, n; u8 *sdf = me->sdf = sdfs + (size_t)w * NSLOT;
     while (q < end) {
-        q = tokenize(skip_id(q), me->keys, &n), d++;
-        for (u32 i = 0, v; i < n; i++) if ((v = lookup(me->keys + i)) != MISS) sdf[v] += sdf[v] < 255;
+        q = tokenize(skip_id(q), me->keys, &n, me->dk, 0), d++;
+        for (u32 i = 0, v; i < n; i++) if ((v = lookup(me->keys + i)), (v = LOOK(me->keys + i, v)) != MISS) sdf[v] += sdf[v] < 255;
     }
     me->nsd = d;
 }
@@ -281,25 +292,38 @@ static u32 anchor_of(u32 q, u32 *pj) {
 static inline u32 cls(u32 s, u32 thr) { return bflag[s] ? (sampdf[s] > thr ? 0 : 1) : 2; }
 
 // ---------------------------------------------------------------- scan
-static void match_phrases(Worker *me, u32 n, u32 na, u32 gid) {
+static void match_phrases(Worker *me, u32 na, const u32 *dk, u32 pf) {
     const u32 *ids = me->ids;
-    u32 h0 = me->nhit;
-    for (u32 a = 0; a < na; a++) _mm_prefetch((const char *)(aoff + ids[me->aps[a]]), _MM_HINT_T0);
+    u32 h0 = me->nhit, g0 = 0;
+    for (u32 a = 0; a < na; a++) _mm_prefetch((const char *)(aoff + (ids[me->aps[a]] & ~ANCHOR)), _MM_HINT_T0);
     for (u32 a = 0; a < na; a++) {
-        u32 pos = me->aps[a], t = ids[pos];
+        long pos = me->aps[a], t = ids[pos] & ~ANCHOR;
         for (u32 e = aoff[t]; e < aoff[t + 1]; e++) {
-            u32 j = aj[e] & 255, k = aj[e] >> 8, side = j + 1 < k ? pos + 1 : pos - 1;
-            if (j > pos || pos - j + k > n || ids[side] != an[e]) continue;
-            u32 q = aq[e], x = 0;
+            u32 j = aj[e] & 255, k = aj[e] >> 8;
+            if ((ids[pos + 1 - 2 * (j + 1 == k)] & ~ANCHOR) != an[e]) continue;
+            u32 q = aq[e], x = 0, gid = pf + dk[pos] + 1;
             const u32 *qt = qterm + 8 * q, *dt = ids + pos - j;
-            while (x < k && dt[x] == qt[x]) x++;
+            while (x < k && (dt[x] & ~ANCHOR) == qt[x]) x++;
             if (x < k) continue;
+            if (gid != g0) g0 = gid, h0 = me->nhit;
             for (x = h0; x < me->nhit && me->hit[x].q != q; x++) {}
             if (x < me->nhit) continue;        // this doc already matched q
             if (me->nhit == me->hcap) me->hit = realloc(me->hit, (me->hcap = 2 * me->hcap + 4096) * sizeof(Hit));
-            me->hit[me->nhit++] = (Hit){ q, gid };
+            me->hit[me->nhit++] = (Hit){ q, gid - 1 };
         }
     }
+}
+
+// Tokenizes documents *pd.. into K until BT tokens, a row's end (d a multiple of 64) or de. Each document ends in a
+// sentinel key: bucket 0, tag 0, which answers MISS, so no phrase matches across it.
+static const u8 *batch(const u8 *q, u64 *K, u32 *dk, u32 *pd, u32 de, u32 *pn) {
+    u32 n = 0, m, d = *pd;
+    do {
+        q = tokenize(skip_id(q), K + n, &m, dk + n, d), n += m;
+        K[n++] = 0;
+    } while (++d < de && d & 63 && n < BT);
+    *pd = d, *pn = n;
+    return q;
 }
 
 // Per token: only the lookup; the dense flags, the rare stream entries and the
@@ -318,39 +342,41 @@ static _Alignas(32) u32 PACK[256][8];
 #ifndef AHEAD
 #define AHEAD 12
 #endif
-#define RING 512
 static void scan_part(Worker *me, int p) {
-    const u32 ND = ndense, NS = nsparse, pf = pfirst[p / nw * nw], d0 = pfirst[p] - pf, de = pfirst[p + 1] - pf;
-    u64 *cw = me->cw, *K = me->keys;
-    u32 *ids = me->ids, *aps = me->aps, *dl = me->dl, *rl = me->rl, **sp = me->sp, n = 0, nn = 0, a = 0;
+    const u32 ND = ndense, NS = nsparse, pf = pfirst[p / NC * NC], c0 = p % NC, d0 = pfirst[p] - pf, de = pfirst[p + 1] - pf;
+    u64 *cw = me->cw, *K = me->keys, *K2 = K + KS, *ks;
+    u32 *ids = me->ids, *aps = me->aps, *dl = me->dl, *rl = me->rl, **sp = me->sp, *dk = me->dk, *dk2 = dk + KS, *ds, n = 0, nn, d = d0, dn;
     size_t ndh = 0, nr = 0;
     const u8 *q = doc + pstart[p];
     const __m256i NDN = _mm256_set1_epi32((int)ND), NSN = _mm256_set1_epi32((int)(NS + 0x80000000u)), NDB = _mm256_set1_epi32((int)(ND - 0x80000000u));
-    for (u32 c = 0; c < ((NS + (1u << SH) - 1) >> SH); c++) sp[c] = me->sbase + c * SCAP;
-    if (d0 < de) q = tokenize(skip_id(q), K, &n);
-    for (u32 d = d0; d < de; d++) {
-        // the current doc's hashes sit at K + a, the next doc's right after them,
-        // so the prefetch ahead needs no choice of buffer
-        if (a > RING) { memmove(K, K + a, (size_t)n * 8); a = 0; }   // keep the touched memory small
-        const u64 *cur = K + a;
-        if (d + 1 < de) q = tokenize(skip_id(q), K + a + n, &nn);
+    memcpy(cs[0][c0], sp, sizeof me->sp), ch[0][c0] = me->nhit, co[c0] = (u8)(me - wk);
+    if (d0 < de) q = batch(q, K, dk, &d, de, &n);
+    while (n) {
+        // the next batch's first keys follow this one's, for the prefetch ahead
+        dn = d, nn = 0;
+        if (d < de) q = batch(q, K2, dk2, &d, de, &nn);
+        memcpy(K + n, K2, AHEAD * 8);
+        const u64 *cur = K;
         size_t na = 0;
         __m256i pos = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
-        const __m256i DV = _mm256_set1_epi32((int)d), D6 = _mm256_set1_epi32((int)(d & 63));
         for (size_t i = 0; i < n; i++) {
-            _mm_prefetch((const char *)BKT(cur[i + AHEAD]), _MM_HINT_T0);   // AHEAD tokens ahead, into the next doc
+            _mm_prefetch((const char *)BKT(cur[i + AHEAD]), _MM_HINT_T0);   // AHEAD tokens ahead, into the next batch
             ids[i] = lookup(cur + i);
         }
         _mm256_storeu_si256((__m256i *)(ids + n), _mm256_set1_epi32((int)MISS));   // the last block's padding lanes count as misses
         // blocks of 8: anchor, dense and rare lanes as masks, dense and rare hits left-packed
         for (size_t i = 0; i < n; i += 8) {
             __m256i v = _mm256_loadu_si256((__m256i *)(ids + i));
+            if (__builtin_expect(_mm256_movemask_epi8(_mm256_cmpeq_epi32(v, _mm256_set1_epi32(PROBE))), 0)) {
+                for (u32 l = 0; l < 8 && i + l < n; l++) ids[i + l] = LOOK(cur + i + l, ids[i + l]);
+                v = _mm256_loadu_si256((__m256i *)(ids + i));
+            }
             __m256i id = _mm256_and_si256(v, _mm256_set1_epi32((int)~ANCHOR)), s = _mm256_sub_epi32(id, NDB);
-            _mm256_storeu_si256((__m256i *)(ids + i), id);
             u32 dm = (u32)_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(NDN, id)));
             u32 rm = (u32)_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(NSN, s)));   // s is biased: id - ND + 2^31 < NS + 2^31 as signed
+            const __m256i DV = _mm256_loadu_si256((const __m256i *)(dk + i));
             s = _mm256_or_si256(_mm256_slli_epi32(s, 16), DV);   // a stream entry: term << 16 | doc
-            _mm256_storeu_si256((__m256i *)(dl + ndh), _mm256_permutevar8x32_epi32(_mm256_or_si256(_mm256_slli_epi32(id, 6), D6), _mm256_load_si256((const __m256i *)PACK[dm])));
+            _mm256_storeu_si256((__m256i *)(dl + ndh), _mm256_permutevar8x32_epi32(_mm256_or_si256(_mm256_slli_epi32(id, 6), _mm256_and_si256(DV, _mm256_set1_epi32(63))), _mm256_load_si256((const __m256i *)PACK[dm])));
             _mm256_storeu_si256((__m256i *)(rl + nr), _mm256_permutevar8x32_epi32(s, _mm256_load_si256((const __m256i *)PACK[rm])));
             ndh += (u32)_mm_popcnt_u32(dm); nr += (u32)_mm_popcnt_u32(rm);
             u32 am = (u32)_mm256_movemask_ps(_mm256_castsi256_ps(v));   // anchor lanes, left-packed like the rest: this loop mispredicted
@@ -358,7 +384,7 @@ static void scan_part(Worker *me, int p) {
             na += (u32)_mm_popcnt_u32(am);
             pos = _mm256_add_epi32(pos, _mm256_set1_epi32(8));
         }
-        int last = d + 1 == de, row = last || (d & 63) == 63;   // a row word is complete every 64 documents
+        int last = dn == de, row = last || !(dn & 63);   // a row word is complete every 64 documents
         if (nr > RB || last) {
             for (size_t k = 0; k < nr; k++) { u32 e = rl[k]; *sp[e >> (16 + SH)]++ = e; }
             nr = 0;
@@ -368,13 +394,14 @@ static void scan_part(Worker *me, int p) {
             ndh = 0;
         }
         if (row) {
-            for (u32 c = 0; c < ND; c++) bm[(size_t)c * W64 + (d >> 6)] = cw[c];
+            for (u32 c = 0; c < ND; c++) bm[(size_t)c * W64 + ((dn - 1) >> 6)] = cw[c];
             memset(cw, 0, ND * 8ull);
         }
-        if (na) match_phrases(me, n, (u32)na, pf + d);
-        a += n; n = nn;
+        if (na) match_phrases(me, (u32)na, dk, pf);
+        ks = K, K = K2, K2 = ks, ds = dk, dk = dk2, dk2 = ds, n = nn;
     }
-    if (p % nw == nw - 1)                      // the phase's last stretch: rows past its last document stay empty
+    memcpy(cs[1][c0], sp, sizeof me->sp), ch[1][c0] = me->nhit;
+    if (c0 == NC - 1)                          // the phase's last stretch: rows past its last document stay empty
         for (u32 r = 0; r < ND; r++) memset(bm + (size_t)r * W64 + (de + 63) / 64, 0, (W64 - (de + 63) / 64) * 8);
 }
 
@@ -385,15 +412,15 @@ static void build(u32 c, int k) {
     u32 lo = c << SH, hi = (c + 1) << SH, o = 0;
     if (hi > nsparse) hi = nsparse;
     memset(end + lo, 0, (hi - lo) * 4);
-    for (int w = 0; w < nw; w++) {
-        const u32 *e = wk[w].sbase + c * SCAP, *x = wk[w].sp[c];
+    for (int w = 0; w < NC; w++) {
+        const u32 *e = cs[0][w][c], *x = cs[1][w][c];
         o += (u32)(x - e);
         for (; e < x; e++) end[*e >> 16]++;
     }
     o = __atomic_fetch_add(&pcur[k], o + hi - lo, __ATOMIC_RELAXED);
     for (u32 s = lo; s < hi; s++) { post[o] = 0xFFFF; off[s] = ++o; o += end[s]; end[s] = off[s]; }
-    for (int w = 0; w < nw; w++)
-        for (const u32 *e = wk[w].sbase + c * SCAP, *x = wk[w].sp[c]; e < x; e++) {
+    for (int w = 0; w < NC; w++)
+        for (const u32 *e = cs[0][w][c], *x = cs[1][w][c]; e < x; e++) {
             u32 s = *e >> 16, i = end[s];
             post[i] = (u16)*e;
             end[s] = i + (post[i - 1] != (u16)*e);
@@ -449,7 +476,7 @@ static u32 filt(const u16 *a, u32 an, const u16 *b, u32 bn, u16 *d, u32 keep) {
     if (keep && an > bn) { const u16 *t = a; a = b; b = t; u32 tn = an; an = bn; bn = tn; }
     u32 i = 0, j = 0, n = 0, acc = 0, j0 = 0;
     if (an * 16 < bn)
-        for (; i < an; i++) { j += lower(b + j, bn - j, a[i]); d[n] = a[i]; n += (j < bn && b[j] == a[i]) == keep; }
+        for (; i < an; i++) { j = lower(b, bn, a[i]); d[n] = a[i]; n += (j < bn && b[j] == a[i]) == keep; }
     // j0: the next b block while no match is pending, so once one is, the b block
     // where the pending a block first matched; the tail restarts there.
     for (; i + 8 <= an && j + 8 <= bn; j0 = acc ? j0 : j) {
@@ -588,10 +615,10 @@ static void *worker(void *arg) {
     Worker *me = &wk[w];
     // two key buffers, then ids, anchor positions, dense and rare hits
     me->keys = (u64 *)(wmem + w * WS);
-    u32 *z = me->ids = (u32 *)(me->keys + 8192 + 2 * MAXTOK);
+    u32 *z = me->ids = (u32 *)(me->keys + 2 * KS);
+    z[-1] = MISS, me->dk = z + 4 * MT;
     me->aps = z + MT, me->dl = z + 2 * MT, me->rl = z + 3 * MT;
-    for (int k = 0; k < PH; k++) {             // this worker's stretch of each phase: starts at a line whose id is a multiple of 64
-        int p = k * nw + w;
+    for (int p = w; p < P; p += nw) {          // parts start at a line whose id is a multiple of 64
         size_t o = nxt(dlen * (size_t)p / (size_t)P, dlen, doc, 64);
         pstart[p] = o, pfirst[p] = o < dlen ? id_at(doc + o) : ndocs;
     }
@@ -647,10 +674,10 @@ static void *worker(void *arg) {
     for (u32 q = base; q < base + n; q++) for (u32 j = 0; j < qk[q]; j++) qterm[8 * q + j] = newid[qterm[8 * q + j]];
     // 3. index and answer each part
     u32 maxnd = 1, sz, nsp = (nsparse + 2047) >> SH;
-    for (u32 k = 0; k < (u32)PH * nw; k += nw) maxnd = (sz = pfirst[k + nw] - pfirst[k]) > maxnd ? sz : maxnd;
+    for (u32 k = 0; k < (u32)P; k += NC) maxnd = (sz = pfirst[k + NC] - pfirst[k]) > maxnd ? sz : maxnd;
     maxnd < 65535 || die("a phase holds over 65,534 documents");
     u32 W = (maxnd + 255) / 256 * 4;           // whole 32-byte blocks for bsum
-    me->sa = (u64 *)(z + 4 * MT), me->sb = me->sa + 1024, me->la = (u16 *)(me->sb + 1024), me->lb = me->la + 65568;
+    me->sa = (u64 *)(me->dk + 2 * KS), me->sb = me->sa + 1024, me->la = (u16 *)(me->sb + 1024), me->lb = me->la + 65568;
     me->sbase = (u32 *)(me->lb + 65568), me->cw = (u64 *)(me->sbase + ((65536 >> SH) + 1) * SCAP);
     if (!w) {
         size_t bs = (size_t)ndense * W * 8, n = bs + nq * sizeof(Tally) + (size_t)8 * nsparse + 66 * (size_t)PCAP;
@@ -661,23 +688,27 @@ static void *worker(void *arg) {
     pthread_barrier_wait(&bar);
     memset(tally + (size_t)nq * w / nw, 0, ((size_t)nq * (w + 1) / nw - (size_t)nq * w / nw) * sizeof(Tally));
     for (int k = 0; k < PH; k++) {
-        int p = k * nw + w;
-        me->nhit = 0, scan_part(me, p);
-        uintptr_t a = ((uintptr_t)doc + pstart[p] + 4095) & -4096, b = ((uintptr_t)doc + pstart[p + 1]) & -4096;
+        me->nhit = 0;
+        for (u32 c = 0; c < nsp; c++) me->sp[c] = me->sbase + c * SCAP;
+        for (u32 c; (c = claim(&sclaim[k])) < (u32)NC;) {
+            scan_part(me, k * NC + c);
+        }
+        pthread_barrier_wait(&bar);
+        int p = (k * nw + w) * CK;
+        uintptr_t a = ((uintptr_t)doc + pstart[p] + 4095) & -4096, b = ((uintptr_t)doc + pstart[p + CK]) & -4096;
         // the text's page-table entries, dropped in parallel, not at exit
         a < b && madvise((void *)a, b - a, MADV_DONTNEED);
-        pthread_barrier_wait(&bar);
         for (u32 c; (c = claim(&bclaim[k])) < nsp;) build(c, k);
         pthread_barrier_wait(&bar);
         if (!w)                                // phrase matches, each worker's ascending, the workers in doc order
-            for (int v = 0; v < nw; v++)
-                for (u32 i = 0; i < wk[v].nhit; i++) {
-                    Hit h = wk[v].hit[i];
+            for (int v = 0; v < NC; v++)
+                for (u32 i = ch[0][v]; i < ch[1][v]; i++) {
+                    Hit h = wk[co[v]].hit[i];
                     Tally *t = &tally[h.q];
                     t->cnt++, t->sum += h.gid, t->nid < MAXQ ? t->top[t->nid++] = h.gid : 0;
                 }
         for (u32 c; (c = claim(&qclaim[k])) * QB < nq;)
-            eval_range(me, c * QB, nq < (c + 1) * QB ? nq : (c + 1) * QB, pfirst[k * nw]);
+            eval_range(me, c * QB, nq < (c + 1) * QB ? nq : (c + 1) * QB, pfirst[k * NC]);
         pthread_barrier_wait(&bar);
     }
     // 4. format the queries this worker parsed
@@ -713,14 +744,14 @@ int main(int argc, char **argv) {
     qk = (u8 *)(an + maxq), qkind = qk + maxq;
     for (; t > 0 && doc[t - 1] != '\n'; t--);
     ndocs = id_at(doc + t) + 1;
-    PH = (int)((ndocs + PHDOCS - 1) / PHDOCS), P = nw * PH;
+    PH = (int)((ndocs + PHDOCS - 1) / PHDOCS), NC = nw * CK, P = NC * PH;
     pstart = malloc((P + 1) * sizeof *pstart), pfirst = malloc((P + 1) * 4);
     pstart[P] = dlen, pfirst[P] = ndocs;
     for (u32 m = 0; m < 256; m++)
         for (u32 l = 0, k = 0; l < 8; l++)
             if (m >> l & 1) tbl[m][2 * k] = 2 * l, tbl[m][2 * k + 1] = 2 * l + 1, PACK[m][k++] = l;
     pthread_barrier_init(&bar, NULL, (unsigned)nw);
-    WS = (65536 + MAXTOK * 16ull + MT * 16ull + 16384 + 65568 * 4 + (((65536 >> SH) + 1) * (size_t)SCAP + NSLOT * 2) * 4 + qlen / nw * 24 + 4096) >> 6 << 6;
+    WS = (KS * 24ull + MT * 16ull + 16384 + 65568 * 4 + (((65536 >> SH) + 1) * (size_t)SCAP + NSLOT * 2) * 4 + qlen / nw * 24 + 4096) >> 6 << 6;
     wmem = arena(nw * WS, 0);
     worker(NULL);
     char path[4096];
