@@ -86,7 +86,7 @@ static void all_workers(void (*fn)(int)) {
     rest(&spins);
 }
 
-// ---- memory: big arrays on huge pages, each faulted once by one thread; small
+// ---- memory: big arrays on huge pages, each page faulted by one thread; small
 // sparse ones on 4 KB pages.
 
 // Map memory that costs nothing until touched; the advice picks huge or small
@@ -351,10 +351,11 @@ static u32 spill_top = 1, round_next, round_end;
 // node, and flat staging lists for the fifth and later edges before they are
 // spilled.
 typedef struct {
-  // A byte per node: a node with 256 or more input edges would lose edges. The
+  // A byte per node: a node with out-degree 256 or more would lose edges. The
   // README lists this as a limit; road-like graphs stay far below it.
   u8 fill[BUCKET_NODES];
   u32 next[BUCKET_NODES];
+  // No bounds check: room for 65,536 edges a bucket; ten seeds peak at 321.
   u32 extra_low[1 << 16], extra_edge[1 << 16];
 } RowWork;
 static RowWork *row_work;
@@ -433,7 +434,7 @@ enum { FRONT_BATCH = 16 };
 // One zone per worker: the nodes in BFS order, the edges they emit, and the
 // bases that place this zone's ids and edges inside the global arrays. The
 // struct is 64-byte aligned because two zones side by side on one cache line
-// cost the phase nearly a third to false sharing (see PERF.md).
+// cost the phase a quarter to false sharing (31 -> 23.5 ms, see PERF.md).
 typedef struct __attribute__((aligned(64))) {
   u32 *order, *edges;
   u8 *degree;
@@ -454,7 +455,7 @@ typedef struct {
 static Zone *zones;
 static u32 seed_next;
 
-// No atomics: a locked operation on these shared lines was 40 % of this phase.
+// No atomics: locked operations on these lines took this phase 17.1 -> 23.5 ms.
 // Two workers that race for a node both list it; heads all get the id written
 // last, the other copy is a row no edge leads to, and is harmless.
 INLINE void claim(Zone *z, u32 v) {
@@ -522,7 +523,7 @@ static void grow_zone(Zone *z, u32 seed, Road *roads) {
         nroads = 0;
     u32 first = z->batch_first = z->edge_count;
     // Prefetch, before the scan: the rows of the next nodes, twice as far ahead
-    // as the batch, then the state bytes of this batch's edge heads.
+    // as the batch, then the state bytes of the next batch's edge heads.
     for (u32 h = hi; h < z->nodes && h < hi + 2 * FRONT_BATCH; h++)
       fetch(rows + 4ul * z->order[h]);
     for (u32 h = hi; h < z->nodes && h < hi + FRONT_BATCH; h++)
@@ -979,7 +980,8 @@ static u64 search(Searcher *s, u32 src, u32 dst, u64 limit) {
     u64 shortest = limit, lowest = INF;
     for (u32 i = fwd_off[src]; i < fwd_off[src + 1]; i++)
       lowest = fwd_weight(i) < lowest ? fwd_weight(i) : lowest;
-    // A search only to beat what the lightest edge gave: usually no search.
+    // Pass 0 searches the lightest edge. Pass 1 tries every edge lighter than
+    // the answer so far, the lightest again included, bounded by that answer.
     for (int pass = 0; pass < 2; pass++)
       for (u32 i = fwd_off[src]; i < fwd_off[src + 1]; i++) {
         u64 w = fwd_weight(i);

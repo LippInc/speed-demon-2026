@@ -28,7 +28,7 @@ Every scored commit from the reference to our final version, with every live-boa
 
 Every push to the repository re-evaluates all four competition tracks on the official leaderboard. Many of those runs re-measure unchanged Track D binaries, triggered by changes to tracks A, B, C or root configuration; they are in the appendix at the end, and they document real host variance on unchanged code. Across 11 consecutive runs of the row 31 code (rows 31 to 41), wall time spans from 0.23 s to 0.25 s. Across 14 runs of the row 42 code (rows 42 to 55), it spans from 0.23 s to 0.31 s, with transient host-load spikes reaching 0.31 s (row 47) and 0.48 s (row 13).
 
-Terms. The *board* is the organisers' live run; the *box* is our own machine running the official harness. *Official* and *fresh* are seed 1 and another seed's dataset, and *deciding K* is the lowest K over the datasets tried. *Points* are the board's speed points, which rise with the log of K: +15 % K is about +3 points. A *GO line* is the K gain a probe had to show before we built the full version.
+Terms. The *board* is the organisers' live run; the *box* is our own machine running the official harness. We had two, *box 1* and *box 2*; a *laptop* number is only compared with another laptop number. *Official* and *fresh* are seed 1 and another seed's dataset, and *deciding K* is the lowest K over the datasets tried. *Points* are the board's speed points, which rise with the log of K: +15 % K is about +3 points. A *GO line* is the K gain a probe had to show before we built the full version.
 
 ## From the reference to step 1
 
@@ -85,7 +85,7 @@ The 186x reduction came from six structural changes:
 - **Landmark (ALT) lower bounds, probe only (commit d7f7783, branch exp/d-15-probe-alt, never lifted)**: two landmarks with forward and backward full searches in parallel cost more wall time on box than settles saved (bench K 12.90, T 0.352 / 0.358 s vs 0.225 / 0.230 s without, ~0.127 s cost and +55 MB memory).
 - **Early drop of relabel claim flags (commit b4be9db, branch exp/d-15-q, reverted in f9dab2e)**: box M stayed within spread of same code without it (bench K 17.72 fresh / 17.97 official, M 119.1 vs 118.9-119.5 MB, S +1 line). Dropped: no gain beyond the spread, and one more line.
 - **Fused forward and reverse rows into single records (d-16a, dropped before building)**: both search sides reach only 4,921 of 8,065,456 labels (0.06%), so storing forward and reverse edges together wastes cache bandwidth on unvisited directions.
-- **48-bit label representations (d-16c, dropped before building)**: spec bounds answers by (n - 1)(2^32 - 1) < 2^63 with n up to u32; 48-bit distances risk overflow on deep graphs.
+- **48-bit label representations (d-16c, dropped before building)**: the spec bounds answers by (n - 1)(2^32 - 1), about 2^53 at this graph's size, so 48-bit distances could overflow on a deep graph.
 - **Single-slab reverse build (d-16, dropped before building)**: building reverse CSR in a single slab saves a re-read pass but increases peak memory by +30 MB (-4.6% K).
 - **Symmetric rows probe (commit 7be51bd, branch exp/d-20-sym-glm)**: one row per node holding (neighbour, w_out, w_in) for both search directions, built from the forward and reverse CSRs. Box: query phase median 110.6 ms of 10 runs against the base's 108.85 (+1.75 ms), 5,137,536 entries; inside its GO line (base + 5 ms), so d-21 built the layout in full straight from the parse.
 - **Symmetric graph built from parse without forward or reverse CSR (commits 084610b, 66fbfe5, 6d1f4b2, 20f3189, dde2377, branch exp/d-21-sym-glm)**: the design aimed at M ~120 -> ~90 MB. Laptop against 7068578: peak RSS -27 MB and queries level (111 vs 115 ms), but placing took 91.5 ms against 12.6 + 23.9 ms for the two CSR builds, because the per-bucket unmaps that return memory cost 25-55 ms. Box K 16.69 against the base's 17.73, M 104.6 against 119.2 MB (-15) but S 822 against 610 (+212); its best case was -1 to +0.5 % K, so refining could not reach the GO line. Dropped.
@@ -109,10 +109,10 @@ The Rust program above spent 168 ms and 107 MB, and the top of the board stood a
 - Separator masks flattened in 4 KB runs, three numbers per line in one vector register (KNOWN parts, OURS as combined): parse 7.3 ms against 26 ms in Rust.
 - First rows written in place over the finished bins (OURS): the rows take no new memory and no faults.
 - Dropping dead roads at the end of each batch (OURS): 128,000 fewer edges (3 %) than keeping them as self-loops.
-- Source with no in-edges = lightest first edge + normal search, second edge only if it can still win (OURS): fresh seed queries 39.5 -> 29.6 ms.
+- Source with no in-edges = lightest first edge + normal search, second edge only if it can still win, the lightest edge repeating in that pass under its own answer (OURS): fresh seed queries 39.5 -> 29.6 ms.
 - Huge pages for all final rows, one thread per page, one contiguous layout, recycled queue arrays (KNOWN): query phase anonymous memory 53.5 -> 49.8 MB.
 
-Reading the compiled code paid twice. gcc turned `take ? nd : old` into a branch that goes either way about half the time; written as a mask, queries went 34.3 -> 27.4 ms. And false sharing cost nearly a third of the zones phase, from `Zone` structs side by side on one cache line (zones 31 -> 23.5 ms).
+Reading the compiled code paid twice. gcc turned `take ? nd : old` into a branch that goes either way about half the time; written as a mask, queries went 34.3 -> 27.4 ms. And false sharing cost a quarter of the zones phase, from `Zone` structs side by side on one cache line (zones 31 -> 23.5 ms).
 
 Failed tries in this rewrite:
 
@@ -171,7 +171,7 @@ The big-weight table was 54 % full on D and 53 % on D-fresh (17,788 and 17,292 o
 
 Official harness on box 1 for this code: D T 0.0606 s, M 59.69 MB, S 787, K 38.48; D-fresh T 0.0629 s, M 59.92 MB, K 37.73. 600 repeat runs, 300 on each dataset, with exit code and output hash checked: no failure.
 
-Board runs of this code: run-944839bcefa6, T 69.7 ms, M 58.87 MB, K 35.97; run-b41d8d31d286, T 67.8 ms, M 58.80 MB, K 36.49; run-e59a7ba41a96, T 62.9 ms, M 59.32 MB, K 37.82, the best so far. In the first two runs our other tracks read 5 to 12 % and 3 to 58 % above their own best, so a busy queue moves a single run by more than this step's gain (box K 37.78 -> 38.48).
+Board runs of this code: run-944839bcefa6, T 69.7 ms, M 58.87 MB, K 35.97; run-b41d8d31d286, T 67.8 ms, M 58.80 MB, K 36.49; run-e59a7ba41a96, T 62.9 ms, M 59.32 MB, K 37.82; run-39b97637f319, T 61.7 ms, M 59.96 MB, K 38.09, the best; run-d57b9024136b, T 66.0 ms, M 58.93 MB, K 36.96. In the first two runs our other tracks read 5 to 12 % and 3 to 58 % above their own best, so a busy queue moves a single run by more than this step's gain (box K 37.78 -> 38.48).
 
 ## Appendix: runs of unchanged code
 
@@ -230,4 +230,6 @@ Board runs of this code: run-944839bcefa6, T 69.7 ms, M 58.87 MB, K 35.97; run-b
 | 62 | D unchanged (code of row 61); re-scored by a track C push | run-8469ea648aca | 0.20 | 108 | 64.4 |
 | 65 | D unchanged (code of row 64 plus comments and text, 59cfb26); re-scored by a track A push | run-69e6fabffb63 | 0.18 | 110 | 65.3 |
 | 69 | D unchanged (code of row 68); re-scored by another track's push | run-b41d8d31d286 | 0.068 | 59 | 78.1 |
-| 70 | D unchanged (code of row 68); re-scored by another track's push | run-e59a7ba41a96 | 0.063 | 59 | 78.9 |
+| 70 | D unchanged (code of row 68, commit 1b98d6c); re-scored by another track's push | run-e59a7ba41a96 | 0.063 | 59 | 78.9 |
+| 71 | D unchanged (code of row 68, commit 5737a0d); re-scored by a track B push | run-39b97637f319 | 0.062 | 60 | 79.0 |
+| 72 | D unchanged (code of row 68, commit 7f9ea27); re-scored by a track A push | run-d57b9024136b | 0.066 | 59 | 78.4 |
