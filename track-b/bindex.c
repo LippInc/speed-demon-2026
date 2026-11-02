@@ -3,10 +3,11 @@
 // Only the query terms are indexed. Each of the nw workers parses its share of
 // queries.txt into one shared term table, then owns a contiguous stretch of the
 // corpus cut into parts of at most 32,768 documents. Per part it records which
-// documents hold each BOOL term (a bitmap row for the ~370 common terms, a
-// sorted u16 list for the rest), answers every BOOL query on the part and keeps
-// a record for each query that matched. Phrases are checked during the scan at
-// each occurrence of their rarest term. Last, each worker merges every part's
+// documents hold each BOOL term (a bitmap row for each term in over 1/32 of the
+// sampled documents, about 370 on seed 1; a sorted u16 list for the rest),
+// answers every BOOL query on the part and keeps a record for each query that
+// matched. Phrases are checked during the scan at each occurrence of their
+// rarest term. Last, each worker merges every part's
 // answers for the queries it parsed and formats their lines. No locks: the
 // phases meet at barriers, and each worker writes only its own memory.
 #define _GNU_SOURCE

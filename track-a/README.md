@@ -5,7 +5,7 @@ Reads 3,100,000 HTTP request log lines and, for every hour and endpoint that saw
 ## For the judges, in one minute
 
 - **The code:** one file, [src/main.rs](src/main.rs), Rust with the standard library only, 394 code lines (S). Its top comment describes the pipeline, and each function's comment says why it is shaped the way it is.
-- **The result:** 32.05 s → 15.8 ms (about 2,000×), 228 MB → 16.6 MB. This tip's board run, run-09f11a65e004: T 15.81 ms, M 16.6 MiB, S 394, K 56.23, our best A run. On our copy of the scoring box (12 workers, a fresh tmpfs /out per run, 15 interleaved rounds) it reads T 15.29 ms median and a memory peak of 16.4-17.2 MiB.
+- **The result:** 32.05 s → 15.4 ms (about 2,000×), 228 MB → 16.5 MiB (17.3 MB). The board's best run of this code, run-d0ece92f742e: T 15.44 ms, M 16.5 MiB, S 394, K 56.92; its other runs read 15.8 to 16.5 ms. On our copy of the scoring box (12 workers, a fresh tmpfs /out per run, 15 interleaved rounds) it reads T 15.29 ms median and a memory peak of 16.4-17.2 MiB.
 - **Board noise:** one board run of unchanged code can vary by 20 %: a-65's code ran 15.61, 16.56 and 18.88 ms, and a-66's first run, run-0814c130face, read 18.80 ms (K 50.70).
 - **Where each criterion's evidence is:** code quality in main.rs's comments; technique in the table below, each trick linked to its lines and its PERF step; the optimisation log in [PERF.md](PERF.md), every board run in its table, failed experiments included.
 - **Terms:** T is the run time, M the peak memory, S the code lines after rustfmt, D 1 plus the declared dependencies (ours is 1: none); K, the speed score, grows as each falls against the reference.
@@ -27,7 +27,7 @@ Reproduce with seed 1's full data in `<data>`, then compare the hash with the fu
 
 Every measurement, failed experiments included, with its board run ID: [PERF.md](PERF.md). Receipts for four early pushes (da6f278, c54220e, e2c4246, 5a559a8) are in `reports/a/` at the repository root, each from the board's run of that commit; later steps cite their board run IDs only.
 
-Limit: the run is CPU-bound at 12 workers (hyperthreads fill the cores), so what is left is instructions and the kernel's share: 504 M user instructions and 89 M kernel cycles (page faults and exit teardown) per run since a-64. At a-63, with 520 M, we were level with HighVelocity's public track A (~526 M; 16.21 ms there against our 16.27 on the same box). Moving the mapping's release (a-57 LOST list) does not help: the unmap costs ~2 ms wherever it lands.
+Limit: the run is CPU-bound at 12 workers (hyperthreads fill the cores), so what is left is instructions and the kernel's share: 504 M user instructions and 89 M kernel cycles (page faults and exit teardown) per run since a-64. At a-63, with 520 M, we were level with HighVelocity's public track A (~526 M; 16.21 ms there against our 16.27 on the same box; 16.11 in a-57's rounds). Moving the mapping's release (a-57 LOST list) does not help: the unmap costs ~2 ms wherever it lands.
 
 ## Approach
 

@@ -6,7 +6,7 @@ records.csv (202 MB, 3.32 M records with quoted and escaped name and note fields
 
 - **The scores' terms:** T is the run time, M the peak memory, S the code lines (clang-format defaults), D is 1 plus the number of declared dependencies (ours is 1: none); K, the speed score, grows as each falls against the reference.
 - **The code:** one file, [join.c](join.c), 417 code lines of C17. Its top comment walks through the design in five steps, and every function's comment says why it is shaped the way it is.
-- **The result:** board run-be7fc43b744a measured T 21.31 ms, M 10.5 MB, S 417, K 43.27 (the reference takes 14.44 s); the same code's other board run, run-14a8fd87f9be, measured 21.74 ms. On our test machine the organisers' harness measured v43, whose code this is, at T 20.78 ms.
+- **The result:** board run-5e3b2bc95cec measured T 21.16 ms, M 9.89 MB, S 417, K 43.97 (the reference takes 14.44 s); the same code's other board runs, run-be7fc43b744a and run-14a8fd87f9be, measured 21.31 and 21.74 ms. On our test machine the organisers' harness measured v43, whose code this is, at T 20.78 ms. The final code, v53, adds one line: waits that sleep (see "The board gap").
 - **Where each criterion's evidence is:**
   - Code quality: join.c's header (the design) and the comment on each function (the reason for its shape). Errors on open, map, thread start and output close stop the program with the system's message.
   - Technique: [PERF.md, "The design and why"](PERF.md#the-design-and-why): each choice with the measurement that decided it.
@@ -18,7 +18,7 @@ Twelve threads, one per hardware thread of the scoring box's six P-cores, take 2
 
 Pass 1 lists record ends with three AVX2 compares per 32 bytes and no quote state. Pass 2 reads each record's fields from both ends: the id up to the first comma, the region and amount after the last two commas, and the quoted name, whose end a carry-less multiply finds as the first byte after an odd number of quotes. Region lookups are prefetched in a first loop so their cache misses overlap.
 
-Distinct names per country are the hard part: 2.98 M of the 3.32 M (name, country) pairs are distinct (about 100,000 names, each in about 30 countries). Each name has an owner thread, picked by a hash of its bytes. Readers send owners 8-byte messages through lock-free rings, 128 at a time. Each owner keeps a private table of its names with one bit per country, so no atomic instruction touches the hot path. One table shared by all threads with atomic bit sets took almost twice as long in the Rust version, and in C (v50) 23.00 ms against 20.35.
+Distinct names per country are the hard part: 2.98 M of the 3.32 M (name, country) pairs are distinct (about 100,000 names, each in about 30 countries). Each name has an owner thread, picked by a hash of its bytes. Readers send owners 8-byte messages through lock-free rings, 128 at a time. Each owner keeps a private table of its names with one bit per country, so no atomic instruction touches the hot path. One table shared by all threads with atomic bit sets took almost twice as long in the Rust version, and in C (v50) 23.00 ms against 20.35 in the same alternating rounds (v43's Steps entry: 20.31 ms).
 
 ## Dependencies
 
