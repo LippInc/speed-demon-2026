@@ -172,8 +172,7 @@ static inline u64 lfm(const u8 *q) {
          | (u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(LOADU(q + 32), _mm256_set1_epi8('\n'))) << 32;
 }
 
-// Tokenizes the text from q to its LF into keys[], prefetching each key's
-// bucket for the lookups that follow; returns the byte after the LF. 64-byte
+// Tokenizes the text from q to its LF into keys[]; returns the byte after the LF. 64-byte
 // windows: a token starts at a token byte whose predecessor is not one (carry:
 // the previous window's last byte); its length comes from the mask, plus the
 // next window's leading run when it reaches the window's end. The per-token
@@ -191,7 +190,6 @@ static const u8 *tokenize(const u8 *q, u64 *keys, u32 *pn) {
             L = st + L == 64 ? L + more : L;
             u64 k = L <= 16 ? ((ld64(t) | LOWER) & KM[L][0]) ^ ((ld64(t + 8) | LOWER) & KM[L][1]) * 0x9E3779B97F4A7C15ull
                             : key_at(t, L);
-            _mm_prefetch((const char *)&tab[bucket_of(k)], _MM_HINT_T0);
             keys[n++] = k;
         }
         if (lf) { *pn = n; return q + _tzcnt_u64(lf) + 1; }
@@ -286,8 +284,10 @@ static void transpose64(u64 *a) {
 
 // Per token, in one loop: the lookup, then a dense term sets its flag byte in
 // db, a rare BOOL term appends to the stream and an anchor is noted for the
-// phrase check; branch-free, other tokens flag a spare byte. The next doc is
-// tokenized first, so its prefetches have a whole doc to land. The flags of 64
+// phrase check; branch-free, other tokens flag a spare byte. Each lookup's
+// bucket is asked for 8 tokens ahead, into the next doc (tokenized first): a
+// whole doc ahead, ~200 lines in flight pushed each other out of L1 (b-109:
+// L1 misses 65.5 -> 47.5 M, box 105.0 -> 103.2 ms). The flags of 64
 // docs (bt, one bit per term) turn into a word of each dense term's row by
 // 64x64 transposes, and the stream is counted and scattered into per-term doc
 // lists, list s = post[off[s] .. end[s]), each after a 0xFFFF sentinel so a
@@ -302,9 +302,10 @@ static void scan_part(Worker *me, int p) {
     memset(bm, 0, (size_t)ND * W64 * 8);
     if (nd) q = tokenize(skip_id(q), kc, &n);
     for (u32 d = 0; d < nd; d++) {
-        if (d + 1 < nd) q = tokenize(skip_id(q), kn, &nn);   // its prefetches get this doc's time to land
+        if (d + 1 < nd) q = tokenize(skip_id(q), kn, &nn);
         u32 na = 0;
         for (u32 i = 0; i < n; i++) {
+            _mm_prefetch((const char *)&tab[bucket_of(i + 8 < n ? kc[i + 8] : kn[i + 8 - n])], _MM_HINT_T0);
             u32 v = lookup(kc[i]), id = v & ~ANCHOR, s = id - ND;
             ids[i] = id;
             db[id < ND ? id : JB] = 0x80;

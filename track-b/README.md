@@ -5,7 +5,7 @@ Reads `queries.txt` (50,000 BOOL and PHRASE queries) and `docs.txt` (254 MB, one
 ## For the judges, in one minute
 
 - **The code:** one file, [bindex.c](bindex.c), C17 with no dependencies. Its top comment gives the design in one paragraph, and each function's comment says why it is shaped the way it is.
-- **The result:** 56.35 s → 0.139 s (about 405×), 2.2 GB → 45 MB. On our copy of the scoring box with the organisers' harness (5 runs, seed 1 full): T 138.1-139.1 ms, M 45.2 MB, S 825, D 1. The board measured the first C version at T 153.9 ms, K 30.12 (run-d36b02f5b879); the Rust version it replaced read T 0.218 s, K 25.19 (run-21676903d119).
+- **The result:** 56.35 s → 0.104 s (about 540×), 2.2 GB → 44 MB. The board's best run, run-5321b1fa4c08: T 104.2 ms, M 43.5 MB, K 36.21. The tip (b-109) measures 103.2 ms on our copy of the scoring box, S 853, D 1. The board measured the first C version at T 153.9 ms, K 30.12 (run-d36b02f5b879); the Rust version it replaced read T 0.218 s, K 25.19 (run-21676903d119).
 - **Where each criterion's evidence is:**
   - Code quality: bindex.c's header and function comments. Errors on open, map and write stop the program with the path or call that failed.
   - Technique: the table below, each trick linked to its line.
