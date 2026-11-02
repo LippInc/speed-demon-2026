@@ -2,7 +2,14 @@
 
 Reads 3,100,000 HTTP request log lines and, for every hour and endpoint that saw traffic, writes the request count, the nearest-rank p50, p95 and p99 latency, and the number and rate of 5xx responses.
 
-Rust, standard library only. a-66 on the box (12 workers, fresh tmpfs /out per run, 15 interleaved rounds): T median 15.29 ms, level with a-65, memory peak 16.4-17.2 MB, S 394 against a-65's 430 (393, plus one check on the input mapping): expected K +1.4 %. Board: this tip's run-09f11a65e004 read T 15.81 ms, M 16.6 MB, S 394, K 56.23 (A rank 5), our best A run; a-66's first run, run-0814c130face, read 18.80 ms, as much as one board run of unchanged code varies (a-65's code ran 15.61, 16.56 and 18.88 ms). a-65's best, run-ffd993386390: K 55.90 (T 15.61 ms, M 16.5 MB, S 430).
+## For the judges, in one minute
+
+- **The code:** one file, [src/main.rs](src/main.rs), Rust with the standard library only, 394 code lines (S). Its top comment describes the pipeline, and each function's comment says why it is shaped the way it is.
+- **The result:** 32.05 s → 15.8 ms (about 2,000×), 228 MB → 16.6 MB. This tip's board run, run-09f11a65e004: T 15.81 ms, M 16.6 MB, S 394, K 56.23, our best A run. On our copy of the scoring box (12 workers, a fresh tmpfs /out per run, 15 interleaved rounds) it reads T 15.29 ms median and a memory peak of 16.4-17.2 MB.
+- **Board noise:** one board run of unchanged code can vary by 20 %: a-65's code ran 15.61, 16.56 and 18.88 ms, and a-66's first run, run-0814c130face, read 18.80 ms (K 50.70).
+- **Where each criterion's evidence is:** code quality in main.rs's comments; technique in the table below, each trick linked to its lines and its PERF step; the optimisation log in [PERF.md](PERF.md), every board run in its table, failed experiments included.
+- **Terms:** T is the run time, M the peak memory, S the code lines after rustfmt, D 1 plus the declared dependencies (ours is 1: none); K, the speed score, grows as each falls against the reference.
+
 
 Reproduce with seed 1's full data in `<data>`, then compare the hash with the full seed-1 output hash in the [spec](https://github.com/hackathon-raptors/speed-demon-2026/blob/main/specs/a-ingest.md):
 `docker build -t a track-a && docker run --rm --network=none -v <data>:/data:ro -v <out>:/out a && sha256sum <out>/summary.txt`
