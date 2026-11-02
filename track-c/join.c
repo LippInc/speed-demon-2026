@@ -65,7 +65,7 @@ enum { BUCKETS = 652, SLOTS = 16 * (BUCKETS + 4) };
 
 // One country's running totals, kept per thread: records, id sum, amount
 // sum, min and max in cents, name and note bytes once unescaped (one field: the
-// file is 200 MB, so the low half can't carry), distinct names.
+// file is 202 MB, so the low half can't carry), distinct names.
 // The five additive fields come first and are summed as one array in report.
 typedef struct {
   long long n, ids, sum, text_bytes, names, min, max;
@@ -194,7 +194,11 @@ static inline u32 eq16(const u32 *p, V w) {
 
 // The slot of the name of message msg; a new name takes the first free slot
 // of the walk. A hit is what nearly all messages find (97%), in the first
-// bucket; only the rest pay for the search for a free slot.
+// bucket; only the rest pay for the search for a free slot. The walk ends at
+// the first bucket with a free slot, and that bound is not checked: an owner
+// has 10,496 slots for about 8,400 names (8,604 at most when measured), so full
+// buckets come in short runs, and the 4 extra catch one at the table's end. A
+// dataset with far more names than the generator's ~100,000 would overrun.
 static inline u32 slot_of(Names *nm, const u64 *msg) {
   // The tag, bits 8 to 39 of the message. A name whose tag is 0 (2^-32) would
   // share its row with the next name to take that slot.
@@ -212,7 +216,7 @@ static inline u32 slot_of(Names *nm, const u64 *msg) {
 
 // One step of a wait: a pause, and every 128th a 10 us sleep. A thread that
 // another process has pushed off its CPU then gets the CPU this one frees;
-// waits that only spin ran 15 times slower beside one busy process (PERF.md).
+// waits that only spin ran 14 times slower beside one busy process (PERF.md).
 static void rest(int *w) { ++*w % 128 ? _mm_pause() : (void)usleep(10); }
 
 static int country(const u8 *p) { // numbers countries in order of first sight
@@ -239,6 +243,7 @@ static void regions(int t) {
     while (reg[p] != ',')
       id = id * 10 + reg[p++] - '0';
     mem.rtab[id] = country(reg + p + 1);
+    // Past the comma, the 3-letter code and the LF (spec 2.3)
     p += 5;
   }
 }
@@ -391,9 +396,10 @@ parse(const u8 *b, const u8 *rt, Rec *rc, u64 *open) {
   // digits, '-' and '.' are not. A BOM's first byte is too, as a signed byte.
   const u8 *r = w + d + 1;
   u64 m = (u32)_mm256_movemask_epi8(_mm256_cmpgt_epi8(DASH, load32(r)));
-  u64 c = _tzcnt_u64(m);
+  u64 c = _tzcnt_u64(m); // the comma after the region
   m = _blsr_u64(m);
-  u64 e = _tzcnt_u64(m); // the comma, the end of the amount
+  // The end of the amount: a CR, an LF, or the zeros past the file
+  u64 e = _tzcnt_u64(m);
   // The amount, up in the top of the lane
   u64 v = *(const u64u *)(r + c + 1) << (64 - 8 * (e - c - 1));
   V f = _mm256_min_epu32(fold3(idb, *(const u64u *)r << (64 - 8 * c), v), CAP);
@@ -403,7 +409,9 @@ parse(const u8 *b, const u8 *rt, Rec *rc, u64 *open) {
   _mm_prefetch((const char *)rt + rid, _MM_HINT_T0);
   rc->reg = rid, rc->cents = r[c + 1] == '-' ? -cents : cents;
   // The next record: past the whole run of low bytes, an LF after a CR and a
-  // BOM's three bytes (777 among 3.32 M records) too. The carry ends the run.
+  // BOM's three bytes (777 among 3.32 M records) too. m's lowest bit is the
+  // amount's end. Adding it to m carries through the run of set bits there and
+  // clears them, so the sum's lowest set bit is the first byte past the run.
   return r + _tzcnt_u64(m + _blsi_u64(m));
 }
 
@@ -531,7 +539,9 @@ int main(void) {
   int gfd = open("/data/regions.csv", O_RDONLY);
   if (rfd < 0 || gfd < 0)
     die("/data");
-  rsize = lseek(rfd, 0, SEEK_END), regsize = lseek(gfd, 0, SEEK_END);
+  // A failed lseek gives a size that map below refuses
+  rsize = lseek(rfd, 0, SEEK_END);
+  regsize = lseek(gfd, 0, SEEK_END);
   // records.csv is mapped over the start of a zeroed reservation one page
   // longer, so the vector loads that run past its end read zeros.
   int anon = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
