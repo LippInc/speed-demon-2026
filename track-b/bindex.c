@@ -129,7 +129,7 @@ static const u8 *map_file(const char *dir, const char *name, size_t *len) {
 // (tag[7] stays 0, so it never matches) and reads val[index of the match, or
 // 7], so a hit and a miss take the same path. A slot's value is its own index
 // until the workers renumber the terms.
-typedef struct { _Alignas(64) u32 tag[8], val[8]; } Bucket;
+typedef struct { _Alignas(64) u32 tag[8]; u32 val[8]; } Bucket;
 static Bucket *tab;                            // on one huge page: lookups take no TLB misses
 #define BMASK ((1u << BBITS) - 1)
 #define TG(s) tab[s >> 3].tag[s & 7] // slot s's tag and value, without a lookup
@@ -202,11 +202,11 @@ static const u8 *tokenize(const u8 *q, u64 *keys, u32 *pn) {
     u32 n = 0;
     for (;;) {
         u64 lf = lfm(q), mm = tm(q) & ((lf & -lf) - 1);   // bytes before the LF
-        u32 cut = 64 - (u32)_lzcnt_u64(~mm);
-        u64 s0 = _bzhi_u64(mm & ~(mm << 1), cut), s = s0;
+        u64 nm = ~mm, cut = 64 - _lzcnt_u64(nm);
+        u64 s0 = _bzhi_u64(mm & ~(mm << 1), (u32)cut), s = s0, *kp = keys + n;
         for (u32 j = 0; j < TK; j++, s &= s - 1) {
-            u32 st = (u32)_tzcnt_u64(s), L = (u32)_tzcnt_u64(~(mm >> st));
-            keys[n + j] = hash_at(q + st, L);
+            u64 st = _tzcnt_u64(s), L = _tzcnt_u64(nm >> st);
+            kp[j] = hash_at(q + st, (u32)L);
         }
         n += (u32)_mm_popcnt_u64(s0 ^ s);
         if (lf && !s) { *pn = n; return q + _tzcnt_u64(lf) + 1; }
@@ -216,7 +216,7 @@ static const u8 *tokenize(const u8 *q, u64 *keys, u32 *pn) {
             q += _tzcnt_u64(~tm(q));
             continue;
         }
-        u32 nx = (u32)_tzcnt_u64(s);
+        u64 nx = _tzcnt_u64(s);
         q += nx < cut ? nx : cut;
     }
 }
