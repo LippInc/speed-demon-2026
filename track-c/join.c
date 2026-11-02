@@ -164,39 +164,6 @@ static inline u64 last(__m128i h, __m256i v, u64 n) {
   return _mm_cvtsi128_si64(_mm_aesenc_si128(_mm_aesenc_si128(h, K1), K2));
 }
 
-// The name field at p, right after the id's comma. Returns the hash of its
-// raw bytes (quoting is one-to-one; both empty forms hash as no bytes), the
-// length once unescaped in *len and the comma after it in *end. A name of
-// 31 raw bytes or more is not handled; spec 2.2 sets no bound, but over 40
-// generated seeds the longest was 27 (base name at most 24 by the
-// generator's forms, plus runs of trailing spaces that get rarer about 4
-// times per extra byte), so about 3e-4 per dataset.
-static inline u64 name(const u8 *p, u64 *len, const u8 **end) {
-  if (*p == ',') { // empty, unquoted
-    *len = 0, *end = p;
-    return last(SEED, _mm256_setzero_si256(), 0);
-  }
-  __m256i v = load32(p + 1);
-  u64 q = eq32(p + 1, _mm256_set1_epi8('"'));
-  // The name ends at the first byte that is not a quote and follows an odd
-  // number of them: a "" flips the count twice (12% of names have one).
-  u64 odd = _mm_cvtsi128_si64(_mm_clmulepi64_si128(_mm_cvtsi64_si128(q), _mm_set1_epi8(-1), 0));
-  u64 j = _tzcnt_u64(odd & ~q), k = j - 1; // the comma, the closing quote
-  *len = k - _mm_popcnt_u64(_bzhi_u64(q, k)) / 2, *end = p + 1 + j;
-  return last(SEED, v, k);
-}
-
-// The length of the text field p[0, n) once unescaped: an unquoted field is
-// its bytes; a quoted one holds q quotes, its two delimiters and two per "",
-// and loses q / 2 + 1 bytes.
-static inline u64 text(const u8 *p, u64 n) {
-  u64 q = 0, m = n;
-  for (; m > 64; m -= 64, p += 64)
-    q += _mm_popcnt_u64(quotes(p));
-  q += _mm_popcnt_u64(_bzhi_u64(quotes(p), m));
-  return n - q / 2 - (q > 0);
-}
-
 // The slot of the name of message msg; a new name takes the first free slot
 // of the walk.
 static inline u32 slot_of(Names *nm, u64 msg) {
@@ -268,8 +235,6 @@ static void ends(Scan *z, u64 to) {
   u32 *ix = z->ix;
   for (; at < to; at += 64) {
     u64 s = ends32(f + at) | (u64)ends32(f + at + 32) << 32;
-    if (end - at < 64) // the part's last block: the rest is the next part's
-      s = _bzhi_u64(s, end - at);
     u64 k = n;
     n += _mm_popcnt_u64(s);
     // Two at a time, without a test per bit: a block holds about one. An odd
@@ -279,6 +244,10 @@ static void ends(Scan *z, u64 to) {
         ix[k] = at + _tzcnt_u64(s);
     while (s);
   }
+  // The part's last block can list record ends that belong to the next part.
+  if (at >= end)
+    while (n && ix[n - 1] >= end)
+      n--;
   z->at = at, z->n = n;
 }
 
@@ -353,15 +322,14 @@ static void records(Ctx *x, Scan *z) {
     u32 m = eq32(f + e - 32, comma);
     u64 d = e - 1 - _lzcnt_u32(m);
     u64 c = e - 1 - _lzcnt_u32(_bzhi_u32(m, d + 32 - e)); // the comma before d
-    // The amount ends the record: v is its last 8 raw bytes, "DDDDD.CC" with
-    // the point at byte 5, and the shift moves the digits before it up over
-    // it; fold3 turns the bytes into digit values.
-    u64 cr = f[e - 1] == '\r', neg = f[d + 1] == '-', nd = e - cr - d - 2 - neg;
-    u64 v = *(const u64u *)(f + e - cr - 8);
-    v = (v & 0xFFFF000000000000) | (v << 8 & 0x0000FFFFFFFFFF00);
+    u64 cr = f[e - 1] == '\r', neg = f[d + 1] == '-';
+    // The amount: its bytes up in the top of the lane, "DDDDD.CC" with the
+    // point at byte 5; pext drops the point and the shift closes the gap.
+    u64 v = *(const u64u *)(f + d + 1) << (64 - 8 * (e - cr - d - 1));
+    v = _pext_u64(v, 0xFFFF00FFFFFFFFFF) << 8;
     __m256i num = fold3(*(const u64u *)(f + at) << (64 - 8 * a),
                         *(const u64u *)(f + c + 1) << (72 - 8 * (d - c)),
-                        v & ~0ull << (64 - 8 * nd));
+                        v);
     u64 rid = _mm256_extract_epi64(num, 1);
     int32_t cents = _mm256_extract_epi64(num, 2);
     rid = rid < top ? rid : top;
@@ -380,10 +348,35 @@ static void records(Ctx *x, Scan *z) {
       g->min = cents;
     if (cents > g->max)
       g->max = cents;
-    const u8 *b;
-    u64 nl, h = name(f + rs[r].name, &nl, &b);
+    // The name field at p. A name of 31 raw bytes or more is not handled;
+    // spec 2.2 sets no bound, but over 40 generated seeds the longest was 27
+    // (base name at most 24 by the generator's forms, plus runs of trailing
+    // spaces that get rarer about 4 times per extra byte), so about 3e-4 per
+    // dataset. The name ends at the first byte that is not a quote and
+    // follows an odd number of them: a "" flips the count twice (12% of names
+    // have one). Both empty forms hash as no bytes (quoting is one-to-one).
+    const u8 *p = f + rs[r].name;
+    u64 q = quotes(p), ns = 1, h, nl;
+    if (__builtin_expect(*p == ',', 0)) { // empty, unquoted: 0.5% of records
+      nl = 0, h = last(SEED, _mm256_setzero_si256(), 0);
+    } else { // p[0] is the opening quote; r1 counts the quotes from p + 1
+      u64 r1 = q >> 1;
+      u64 odd = _mm_cvtsi128_si64(_mm_clmulepi64_si128(_mm_cvtsi64_si128(r1), _mm_set1_epi8(-1), 0));
+      u64 j = _tzcnt_u64(odd & ~r1), k = j - 1; // the comma, the closing quote
+      nl = k - _mm_popcnt_u64(_bzhi_u64(r1, k)) / 2;
+      h = last(SEED, load32(p + 1), k);
+      ns = j + 2; // past the closing quote and its comma
+    }
     g->nb += nl;
-    g->tb += text(b + 1, f + rs[r].comma - b - 1);
+    // The note, from the one quote mask: an unquoted field is its bytes; a
+    // quoted one holds q quotes, its two delimiters and two per "", and
+    // loses q / 2 + 1 bytes.
+    u64 len = rs[r].comma - rs[r].name - ns;
+    u64 qn = _mm_popcnt_u64(_bzhi_u64(q >> ns, len));
+    if (__builtin_expect(ns + len > 64, 0)) // the note runs past the mask: 2%
+      for (u64 i = 64; i < ns + len; i += 64)
+        qn += _mm_popcnt_u64(_bzhi_u64(quotes(p + i), ns + len - i));
+    g->tb += len - qn / 2 - (qn > 0);
     u64 o = (h >> 40 & 255) * NT >> 8; // the name's owner: h's bits 40-47
     x->batch[o][x->fill[o]] = (h & ~255ull) | co;
     if (++x->fill[o] == BATCH)
