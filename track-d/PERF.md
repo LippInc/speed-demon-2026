@@ -1,5 +1,7 @@
 # Track D: performance log
 
+Track D got the least attention. The Rust program came down from 0.39 s to 0.17 s over the first days, and then we left it to work on the other tracks. About two and a half hours before the freeze we looked again: 168 ms and 107 MB, with the top of the board at half of both, so no single phase could explain the gap. We rewrote it from nothing in C instead of tuning it (d-40), and the first version read 73 ms and 60 MB on the board. The Rust steps stay below because they show how far tuning got us.
+
 Every scored commit from the reference to our final version, with every live-board run that measured it. The sub-steps inside d-40 to d-42 are box medians from interleaved rounds. Runs of unchanged code are in the appendix at the end, numbered the same.
 
 | Step | Change | Run ID | T (s) | M (MB) | Points |
@@ -169,7 +171,7 @@ The big-weight table was 54 % full on D and 53 % on D-fresh (17,788 and 17,292 o
 
 Official harness on box 1 for this code: D T 0.0606 s, M 59.69 MB, S 787, K 38.48; D-fresh T 0.0629 s, M 59.92 MB, K 37.73. 600 repeat runs, 300 on each dataset, with exit code and output hash checked: no failure.
 
-Board runs of this code so far: run-944839bcefa6, T 69.7 ms, M 58.87 MB, K 35.97; run-b41d8d31d286, T 67.8 ms, M 58.80 MB, K 36.49. The board has not followed the box's gain (box K 37.78 -> 38.48, board 37.30 -> 35.97 and 36.49). In those same two runs our other tracks read 5 to 12 % and 3 to 58 % above their own best, so a queue this busy cannot separate the two versions. M fell as on the box. We keep d-42: the final score is five runs on a quiet machine, which the box resembles more than these runs do.
+Board runs of this code: run-944839bcefa6, T 69.7 ms, M 58.87 MB, K 35.97; run-b41d8d31d286, T 67.8 ms, M 58.80 MB, K 36.49; run-e59a7ba41a96, T 62.9 ms, M 59.32 MB, K 37.82, the best so far. In the first two runs our other tracks read 5 to 12 % and 3 to 58 % above their own best, so a busy queue moves a single run by more than this step's gain (box K 37.78 -> 38.48).
 
 ## Appendix: runs of unchanged code
 
@@ -228,3 +230,4 @@ Board runs of this code so far: run-944839bcefa6, T 69.7 ms, M 58.87 MB, K 35.97
 | 62 | D unchanged (code of row 61); re-scored by a track C push | run-8469ea648aca | 0.20 | 108 | 64.4 |
 | 65 | D unchanged (code of row 64 plus comments and text, 59cfb26); re-scored by a track A push | run-69e6fabffb63 | 0.18 | 110 | 65.3 |
 | 69 | D unchanged (code of row 68); re-scored by another track's push | run-b41d8d31d286 | 0.068 | 59 | 78.1 |
+| 70 | D unchanged (code of row 68); re-scored by another track's push | run-e59a7ba41a96 | 0.063 | 59 | 78.9 |
