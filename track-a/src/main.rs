@@ -40,6 +40,12 @@ const CLAIM: usize = 256;
 /// Bytes of address space per region, of which only the pages touched cost memory: rows, then the sorted latencies, and
 /// from the top down the hour's long list.
 const STRIDE: usize = 1 << 27;
+/// The timestamp's 27 bytes and the space after them: a line's method starts here.
+const METHOD_AT: usize = 28;
+/// From the space after the endpoint to the latency: that space, the 3-digit status, a space.
+const TO_LATENCY: usize = 5;
+/// The window opens at 18:00Z: hour 0 is 18:00 on the first of DAYS.
+const FIRST_HOUR: usize = 18;
 
 unsafe extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
@@ -75,7 +81,7 @@ unsafe fn digits8(v: u64) -> u64 {
 /// finds up to its LF. Read forward, the next line's start comes out of the latency's length: no LF search first.
 /// Safety: d + p..d + p + 128 must be readable, and so must the line's end + 32.
 unsafe fn line(d: *const u8, p: usize) -> (usize, usize, u32, usize) {
-    let mut at = p + 28;
+    let mut at = p + METHOD_AT;
     let spaces = mask32(d.add(at), b' ') as u64 | (mask32(d.add(at + 32), b' ') as u64) << 32;
     let ep = at + 1 + spaces.trailing_zeros() as usize;
     // The space after the endpoint; past the first 64 bytes, 32 at a time (bits stay relative to `at`).
@@ -85,14 +91,14 @@ unsafe fn line(d: *const u8, p: usize) -> (usize, usize, u32, usize) {
         rest = (mask32(d.add(at + 32), b' ') as u64) << 32;
     }
     let end = at + rest.trailing_zeros() as usize;
-    let digits = (d.add(end + 5) as *const u64).read_unaligned() ^ 0x3030_3030_3030_3030;
+    let digits = (d.add(end + TO_LATENCY) as *const u64).read_unaligned() ^ 0x3030_3030_3030_3030;
     // After the xor a byte is a digit exactly when it is below 10; adding 0x76 sets the top bit of every other one.
     let other = (digits.wrapping_add(0x7676_7676_7676_7676) | digits) & 0x8080_8080_8080_8080;
     let n = other.trailing_zeros() as usize / 8;
     // n digits from end + 5, then the LF; with no other byte in the load n is 8, and any rest comes one by one (spec 2: an
     // unsigned 32-bit value, so at most 10 digits, and the u32 below holds it).
     let mut latency = digits8(digits << (64 - 8 * n));
-    let mut q = end + 5 + n;
+    let mut q = end + TO_LATENCY + n;
     while n == 8 && *d.add(q) != b'\n' {
         latency = latency * 10 + (*d.add(q) - b'0') as u64;
         q += 1;
@@ -125,8 +131,16 @@ unsafe fn ep_hash(p: *const u8, len: usize) -> u64 {
     _mm_cvtsi128_si64(x) as u64
 }
 
+/// An endpoint's bytes, where the line that first had it lies in the input's mapping: 128 bytes can be read from its start.
+type Name = &'static [u8];
 /// An hour's result for one endpoint: count, p50, p95, p99, errors, error_ppm (count 0: no line).
 type Cell = [u32; 6];
+/// An hour's place in the output: where its text starts and how long it is.
+#[derive(Clone, Copy)]
+struct Place {
+    offset: usize,
+    size: usize,
+}
 /// A thread's open chunk of CLAIM rows in an hour's region: the next free row and the chunk's end.
 #[derive(Clone, Copy)]
 struct Chunk {
@@ -148,7 +162,7 @@ struct State {
     next_hour: usize,              // every hour below it is claimed for finishing
     late: bool,                    // a block brought lines of an hour already claimed
     sizes: BTreeMap<usize, usize>, // finished hours waiting for the ones before them: the text's size
-    places: Vec<(usize, usize)>,   // the hours placed so far: offset and size
+    places: Vec<Place>,            // the hours placed so far
     next_text: usize,              // every hour below it is claimed for its text
     front: usize,                  // the hour of the first line at the watermark
 }
@@ -171,9 +185,8 @@ static RELEASED: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
 /// cache. A slot carries its id, so its load needs no ordering.
 static TABLE: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
 /// The names, by id, pushed under the lock into room for IDS made up front, so the Vec never moves and a name, once
-/// pushed, is never written again: readers keep a pointer to them. A name is the endpoint's bytes where the line that first
-/// had it lies in the input's mapping: 128 bytes can be read from its start. Then the ids in byte order, as last asked for.
-static NAMES: Mutex<(Vec<&[u8]>, Vec<u16>)> = Mutex::new((Vec::new(), Vec::new()));
+/// pushed, is never written again: readers keep a pointer to them. Then the ids in byte order, as last asked for.
+static NAMES: Mutex<(Vec<Name>, Vec<u16>)> = Mutex::new((Vec::new(), Vec::new()));
 
 /// A new endpoint for slot i, unless another thread just filled it.
 #[cold]
@@ -204,7 +217,7 @@ fn id(p: *const u8, len: usize) -> u32 {
 
 /// The id of every endpoint met, in byte order (spec 4), and the names by id: the ids new since the last call are
 /// appended and sorted in, a stable sort that finds the sorted prefix as one run.
-fn order() -> (Vec<u16>, *const &'static [u8]) {
+fn order() -> (Vec<u16>, *const Name) {
     let mut guard = NAMES.lock().unwrap();
     let (names, order) = &mut *guard;
     if order.len() < names.len() {
@@ -236,7 +249,7 @@ fn align(data: &[u8], b: usize) -> usize {
 fn hour_at(data: &[u8], p: usize) -> usize {
     // Safety: the mapping has 4 KiB of zeros after the input.
     let digit = |i: usize| unsafe { *data.as_ptr().add(p + i) }.wrapping_sub(b'0') as usize;
-    ((digit(9) + digit(6)) * 24 + digit(11) * 10 + digit(12)).wrapping_sub(18)
+    ((digit(9) + digit(6)) * 24 + digit(11) * 10 + digit(12)).wrapping_sub(FIRST_HOUR)
 }
 
 /// Writes a row for every line starting in data[start..end] into its hour's region, through cur, this thread's open
@@ -354,11 +367,11 @@ fn finish(h: usize, cells: *mut Cell) -> usize {
 
 /// Hour h's text at its place in the output, from its cells, which then go back to the kernel. Stores pass a line's end
 /// (the next line covers them), so near the hour's end, next to another hour's text, a line goes through a small buffer.
-fn text(h: usize, (offset, size): (usize, usize), out: *mut u8, cells: *mut Cell) {
+fn text(h: usize, Place { offset, size }: Place, out: *mut u8, cells: *mut Cell) {
     let (order, names) = order();
     // 20 bytes, then spaces to 32 so it can be copied whole: byte 20 stays the space after the label, and the
     // name, copied from byte 21, covers the rest.
-    let (day, hour) = (DAYS[(h + 18) / 24], (h + 18) % 24);
+    let (day, hour) = (DAYS[(h + FIRST_HOUR) / 24], (h + FIRST_HOUR) % 24);
     let label = format!("{day}T{hour:02}:00:00Z            ");
     let mut tmp = [0u8; 512];
     // finish's arrays give their pages back: finish and text are called from the same frame in work, and
@@ -436,16 +449,29 @@ fn deal<const N: usize>(src: &[u32], dst: &mut [u32], hist: &mut [u32; N], shift
     }
 }
 
-/// One of the run's threads; out and cells are the output's and the cells' mappings, as addresses.
-fn work(data: &[u8], out: usize, cells: usize, workers: usize, lag: usize) {
+/// What every thread of a run works on: the input, the output's and the cells' mappings as addresses, the number of
+/// threads, and how many hours past an hour the parsed prefix must be before it is finished.
+#[derive(Clone, Copy)]
+struct Job {
+    data: &'static [u8],
+    out: usize,
+    cells: usize,
+    workers: usize,
+    lag: usize,
+}
+
+/// One of the run's threads.
+fn work(job: Job) {
+    let (data, out, cells) = (job.data, job.out, job.cells);
     let nblocks = data.len().div_ceil(BLOCK);
+    // Two nulls read as at == end, so a thread's first row of an hour claims a chunk.
     let (at, end) = (std::ptr::null_mut(), std::ptr::null_mut());
     let mut cur = [Chunk { at, end }; HOURS];
     let mut idle = 0;
     let mut s = STATE.lock().unwrap();
     while !s.late && s.next_text < HOURS {
         let parsed = s.watermark == nblocks;
-        if s.next_hour < HOURS && (parsed || s.next_hour + lag <= s.front) {
+        if s.next_hour < HOURS && (parsed || s.next_hour + job.lag <= s.front) {
             let h = s.next_hour;
             s.next_hour += 1;
             drop(s);
@@ -455,8 +481,8 @@ fn work(data: &[u8], out: usize, cells: usize, workers: usize, lag: usize) {
             st.sizes.insert(h, size);
             // places.len() is the next hour to place; a size for it means every hour before it is placed.
             while let Some(size) = st.sizes.remove(&st.places.len()) {
-                let at = st.places.last().map_or(0, |p| p.0 + p.1);
-                st.places.push((at, size));
+                let offset = st.places.last().map_or(0, |p| p.offset + p.size);
+                st.places.push(Place { offset, size });
             }
             // The region goes back. Once the input is parsed no hour takes one, so the pages go back to the kernel,
             // before the text's pages come; the thread that parsed the last block empties the pool.
@@ -470,7 +496,7 @@ fn work(data: &[u8], out: usize, cells: usize, workers: usize, lag: usize) {
                 // Safety: nothing reads the region now.
                 unsafe { madvise(r, STRIDE, MADV_DONTNEED) };
             }
-        } else if s.next_block < nblocks && s.next_block < s.watermark + 2 * workers {
+        } else if s.next_block < nblocks && s.next_block < s.watermark + 2 * job.workers {
             let b = s.next_block;
             s.next_block += 1;
             drop(s);
@@ -508,7 +534,7 @@ fn work(data: &[u8], out: usize, cells: usize, workers: usize, lag: usize) {
         }
         s = STATE.lock().unwrap();
     }
-    let end = s.places.last().map_or(0, |p| p.0 + p.1);
+    let end = s.places.last().map_or(0, |p| p.offset + p.size);
     drop(s);
     // All is claimed. Left to the exit, tearing down these mappings runs on one CPU, inside the timed run (a-71), so the
     // threads give the pages back in shared steps. A page still in use just faults in again: so the input's first 8 MiB,
@@ -528,12 +554,11 @@ fn work(data: &[u8], out: usize, cells: usize, workers: usize, lag: usize) {
 }
 
 /// Thread i of a run starts threads 2i and 2i + 1: the last one is up after four spawns, not eleven.
-fn go<'s, 'e>(s: &'s Scope<'s, 'e>, i: usize, job: (&'static [u8], usize, usize, usize, usize)) {
-    let (data, out, cells, workers, lag) = job;
-    for c in [2 * i, 2 * i + 1].into_iter().filter(|&c| c <= workers) {
-        s.spawn(move || go(s, c, job));
+fn spawn_tree<'s, 'e>(s: &'s Scope<'s, 'e>, i: usize, job: Job) {
+    for c in [2 * i, 2 * i + 1].into_iter().filter(|&c| c <= job.workers) {
+        s.spawn(move || spawn_tree(s, c, job));
     }
-    work(data, out, cells, workers, lag);
+    work(job);
 }
 
 #[unsafe(no_mangle)]
@@ -543,7 +568,11 @@ extern "C" fn main() -> i32 {
     // No transparent huge pages (PR_SET_THP_DISABLE 41): with THP on, an hour's first row would charge 2 MiB.
     unsafe { prctl(41, 1usize, 0usize, 0usize, 0usize) };
     // Safety, for this function's system calls: they take constants, descriptors and mappings made here, no Rust data.
-    let map = |len, prot, flags, fd| unsafe { mmap(std::ptr::null_mut(), len, prot, flags, fd, 0) };
+    let map = |len, prot, flags, fd| {
+        let p = unsafe { mmap(std::ptr::null_mut(), len, prot, flags, fd, 0) };
+        assert_ne!(p as isize, -1, "mmap failed");
+        p
+    };
     let file = File::open("/data/requests.log").expect("open input");
     let len = file.metadata().expect("stat input").len() as usize;
     // Map the file read-only over an anonymous reservation 4 KiB longer (PROT_READ 1; MAP_PRIVATE | MAP_ANONYMOUS
@@ -556,6 +585,7 @@ extern "C" fn main() -> i32 {
     // O_RDWR | O_CREAT | O_TRUNC: the text goes through a shared mapping (PROT_READ | PROT_WRITE 3, MAP_SHARED 1). Its
     // size is known only at the end: mapped at twice the input's (a line is at most 1.5 times an input line), then cut.
     let fd = unsafe { open(c"/out/summary.txt".as_ptr(), 0o1102, 0o644) };
+    assert!(fd >= 0, "cannot open /out/summary.txt");
     unsafe { ftruncate(fd, 2 * len as i64 + 4096) };
     let out = map(2 * len + 4096, 3, 1, fd) as usize;
     // MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE 0x4022: only the pages touched cost memory.
@@ -564,11 +594,16 @@ extern "C" fn main() -> i32 {
     POOL.lock().unwrap().extend(regions);
     let cells = map(HOURS * IDS * size_of::<Cell>(), 3, 0x4022, -1) as usize;
     NAMES.lock().unwrap().0.reserve(IDS);
-    let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
     // The redo below runs with an argument: no hour is finished early.
     let redo = std::env::args().len() > 1;
-    let lag = if redo { HOURS } else { LAG };
-    std::thread::scope(|s| go(s, 1, (data, out, cells, workers, lag)));
+    let job = Job {
+        data,
+        out,
+        cells,
+        workers: std::thread::available_parallelism().map_or(1, |n| n.get()),
+        lag: if redo { HOURS } else { LAG },
+    };
+    std::thread::scope(|s| spawn_tree(s, 1, job));
     let st = STATE.lock().unwrap();
     if st.late {
         // A line came after its hour was finished. Nothing is written yet: again, with no hour finished before every
@@ -577,7 +612,7 @@ extern "C" fn main() -> i32 {
         panic!("cannot start the run again: {exec_failed}");
     }
     let last = st.places[HOURS - 1];
-    unsafe { ftruncate(fd, (last.0 + last.1) as i64) };
+    unsafe { ftruncate(fd, (last.offset + last.size) as i64) };
     // Everything is written; exit without freeing what the kernel reclaims anyway.
     std::process::exit(0);
 }
