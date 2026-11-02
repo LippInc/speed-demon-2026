@@ -254,6 +254,23 @@ Experiments measured on our bench box only, with no board run (their box status 
   `a-57 med 20.26 ms (min 18.57) | a-58 first cut med 18.51 (min 16.95) | a-58 med 17.92 (min 16.57)`, and an earlier
   round `a-57 19.03 | first cut 18.38`. Memory peak 23.4-24.2 -> 20.4-21.4 MB (the span buffer replaces two row
   buffers). Hash checked at 1, 4, 12 and 24 workers. S 545 -> 659 (+114 lines).
+  Board (one run): `4f9b0f5 run-62d88f26d2ed | K 44.00 | T 20.46 ms | M 20.1 MB | S 659`, against a-57's
+  `f0b3b86 run-9eeff87230e9 | K 44.75 | T 19.48 ms | M 24.1 MB | S 545`: the box's three A/B rounds all had a-58
+  ahead by 0.6-2.3 ms, so the board's one T reading is taken as noise until re-runs land.
+  LOST: the standard library's select_nth_unstable three times per span (S 513, box 20.93 ms against 18.09, net
+  -3.5 % K) and sort_unstable per span (22.20 ms); PR_SET_THP_DISABLE alone on a-58 (M and T level).
+- a-59 (OURS + KNOWN), kept: rows in per-hour regions, on a-58. KNOWN (AVENGERS' public track A): records as 32-bit
+  rows written straight into per-hour areas of one MAP_NORESERVE reservation, claimed in chunks, text over the rows,
+  hours written with pwrite at their offsets, the area released after its write, THP off. OURS: the select finish of
+  a-58 on top, long latencies in a separate area of the region so both row passes are plain loops, and free slots
+  dealt to one trash slot so the scatter has no branch. Box, 20 interleaved rounds: `a-58 med 18.20 | a-59 18.29`
+  (level); memory peak 20.4-21.4 -> 16.4-17.0 MB (output 9.64 MB of it). perf stat (10 runs): task-clock 172 -> 195
+  ms, page faults 6.1 K -> 13.9 K, user instructions 625 -> 650 M. Hash checked at 1, 4, 12 and 24 workers. S 659 ->
+  673.
+  - first cut (escape slot inline, row walks stepping over it): 19.72 ms, user instructions 712 M.
+  - without PR_SET_THP_DISABLE: 47 ms and a 42 MB peak (the box runs THP always: each hour's first row took a 2 MiB
+    page).
+  - LOST: the span buffer per thread instead of in the region (v26c): 20.13 ms and +3 MB (malloc's per-thread arenas).
 
 ## Decisions
 
