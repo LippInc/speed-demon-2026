@@ -284,6 +284,7 @@ static inline u32 cls(u32 s, u32 thr) { return bflag[s] ? (sampdf[s] > thr ? 0 :
 static void match_phrases(Worker *me, u32 n, u32 na, u32 gid) {
     const u32 *ids = me->ids;
     u32 h0 = me->nhit;
+    for (u32 a = 0; a < na; a++) _mm_prefetch((const char *)(aoff + ids[me->aps[a]]), _MM_HINT_T0);
     for (u32 a = 0; a < na; a++) {
         u32 pos = me->aps[a], t = ids[pos];
         for (u32 e = aoff[t]; e < aoff[t + 1]; e++) {
@@ -628,7 +629,11 @@ static void *worker(void *arg) {
     // and aoff[v + 1] > aoff[v] says that v anchors a phrase.
     for (u32 q = base; q < base + n; q++) qkind[q] && claim(&aoff[anchor_of(q, &pos)]);
     pthread_barrier_wait(&bar);
-    for (u32 i = w ? nterms + 1 : 1; i <= nterms; i++) aoff[i] += aoff[i - 1];
+    u32 al = (nterms + 1) * (u64)w / nw, ah = (nterms + 1) * (u64)(w + 1) / nw, acc = 0;   // prefix sums: per range, then each range's base
+    for (u32 i = al; i < ah; i++) aoff[i] = acc += aoff[i];
+    me->cnt[0] = acc, pthread_barrier_wait(&bar);
+    for (int i = acc = 0; i < w; i++) acc += wk[i].cnt[0];
+    for (u32 i = al; i < ah; i++) aoff[i] += acc;
     pthread_barrier_wait(&bar);
     for (u32 q = base; q < base + n; q++)
         if (qkind[q]) {
@@ -718,7 +723,6 @@ int main(int argc, char **argv) {
     WS = (65536 + MAXTOK * 16ull + MT * 16ull + 16384 + 65568 * 4 + (((65536 >> SH) + 1) * (size_t)SCAP + NSLOT * 2) * 4 + qlen / nw * 24 + 4096) >> 6 << 6;
     wmem = arena(nw * WS, 0);
     worker(NULL);
-    for (int w = 1; w < nw; w++) pthread_join(th[w], NULL);
     char path[4096];
     snprintf(path, sizeof path, "%s/results.txt", out);
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
