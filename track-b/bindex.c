@@ -133,7 +133,9 @@ static size_t WS;
 static int nw, P, PH, NC;
 // each part's ends in its worker's streams and hit list: [0] where it began,
 // [1] where it ended
-static u32 *cs[2][WMAX * CK][SHARDS], ch[2][WMAX * CK], sclaim[256];
+static u32 *cs[2][WMAX * CK][SHARDS], ch[2][WMAX * CK];
+// the next part to scan, one counter per phase
+static u32 sclaim[256];
 // the part's worker
 static u8 co[WMAX * CK];
 static const u8 *doc, *qtxt;
@@ -469,9 +471,12 @@ static void match_phrases(Worker *me, u32 na, const u32 *dk, u32 pf) {
       // this doc already matched q
       if (x < me->nhit)
         continue;
-      if (me->nhit == me->hcap)
-        me->hit =
-            realloc(me->hit, (me->hcap = 2 * me->hcap + 4096) * sizeof(Hit));
+      if (me->nhit == me->hcap) {
+        me->hcap = 2 * me->hcap + 4096;
+        me->hit = realloc(me->hit, me->hcap * sizeof(Hit));
+        if (!me->hit)
+          die("realloc");
+      }
       me->hit[me->nhit++] = (Hit){q, gid - 1};
     }
   }
@@ -1086,6 +1091,8 @@ int main(int argc, char **argv) {
   ndocs = id_at(doc + t) + 1;
   PH = (int)((ndocs + PHDOCS - 1) / PHDOCS), NC = nw * CK, P = NC * PH;
   pstart = malloc((P + 1) * sizeof *pstart), pfirst = malloc((P + 1) * 4);
+  if (!pstart || !pfirst)
+    die("malloc");
   pstart[P] = dlen, pfirst[P] = ndocs;
   for (u32 m = 0; m < 256; m++)
     for (u32 l = 0, k = 0; l < 8; l++)
