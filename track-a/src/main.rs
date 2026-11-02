@@ -31,8 +31,8 @@ const BLOCK: usize = 1 << 20;
 // far a line is out of order (generated files: at most one hour behind the latest hour before it), so a line that comes
 // after its hour was finished is detected, and the run starts over with no early finishing: exact for any order.
 const LAG: usize = 2;
-/// Slots of the endpoint table: 8,192 stay under a quarter full (spec 2: 1,842 endpoints), so a probe nearly always
-/// ends at the first slot.
+/// Slots of the endpoint table: 16,384 stay a ninth full (spec 2: 1,842 endpoints), so a probe nearly always ends at the
+/// first slot, and a miss there costs more than the bigger table (a-69).
 const SLOTS: usize = 16384;
 /// A row is (endpoint id + 1) << 21 | 5xx << 20 | latency, 0 for a slot no line took; a line with a latency of ESCAPE
 /// or more (0.24 pct on seed 1) goes to its hour's long list instead, as latency << 32 | the row without the latency.
@@ -79,33 +79,33 @@ unsafe fn digits8(v: u64) -> u64 {
 #[inline(always)]
 unsafe fn line(d: *const u8, p: usize) -> (usize, usize, u32, usize) {
     let mut at = p + 28;
-    let m = mask32(d.add(at), b' ') as u64 | (mask32(d.add(at + 32), b' ') as u64) << 32;
-    let ep = at + 1 + m.trailing_zeros() as usize;
+    let spaces = mask32(d.add(at), b' ') as u64 | (mask32(d.add(at + 32), b' ') as u64) << 32;
+    let ep = at + 1 + spaces.trailing_zeros() as usize;
     // The space after the endpoint; past the first 64 bytes, 32 at a time (bits stay relative to `at`).
-    let mut rest = m & m.wrapping_sub(1);
+    let mut rest = spaces & spaces.wrapping_sub(1);
     while rest == 0 {
         at += 32;
         rest = (mask32(d.add(at + 32), b' ') as u64) << 32;
     }
-    let sp = at + rest.trailing_zeros() as usize;
-    let v = (d.add(sp + 5) as *const u64).read_unaligned() ^ 0x3030_3030_3030_3030;
+    let end = at + rest.trailing_zeros() as usize;
+    let digits = (d.add(end + 5) as *const u64).read_unaligned() ^ 0x3030_3030_3030_3030;
     // After the xor a byte is a digit exactly when it is below 10; adding 0x76 sets the top bit of every other one.
-    let other = (v.wrapping_add(0x7676_7676_7676_7676) | v) & 0x8080_8080_8080_8080;
+    let other = (digits.wrapping_add(0x7676_7676_7676_7676) | digits) & 0x8080_8080_8080_8080;
     let n = other.trailing_zeros() as usize / 8;
     let (latency, next) = if other == 0 {
         // 8 digits or more (spec 2: at most 10): the rest one by one.
-        // The latency starts at sp + 5 and digits8 read 8 digits, so the rest start at sp + 13.
-        let (mut latency, mut q) = (digits8(v), sp + 13);
+        // The latency starts at end + 5 and digits8 read 8 digits, so the rest start at end + 13.
+        let (mut latency, mut q) = (digits8(digits), end + 13);
         while *d.add(q) != b'\n' {
             latency = latency * 10 + (*d.add(q) - b'0') as u64;
             q += 1;
         }
         (latency, q + 1)
     } else {
-        // n digits from sp + 5, then the LF: the next line starts at sp + 6 + n.
-        (digits8(v << (64 - 8 * n)), sp + 6 + n)
+        // n digits from end + 5, then the LF: the next line starts at end + 6 + n.
+        (digits8(digits << (64 - 8 * n)), end + 6 + n)
     };
-    (ep, sp - ep, latency as u32, next)
+    (ep, end - ep, latency as u32, next)
 }
 
 /// A 64-bit hash of the whole len-byte endpoint at p: its first and last 32 bytes, each cut to the endpoint, and from 65
@@ -244,7 +244,7 @@ fn hour_at(data: &[u8], p: usize) -> usize {
 fn parse(data: &[u8], (start, end): (usize, usize), cur: &mut [Chunk; HOURS]) -> usize {
     let d = data.as_ptr();
     let (mut prev_prefix, mut p, mut h, mut low) = (u64::MAX, start, 0, HOURS);
-    let mut c = cur[0]; // hour h's chunk (h starts at 0)
+    let mut chunk = cur[0]; // hour h's chunk (h starts at 0)
     while p < end {
         // Lines usually share the previous line's hour, so compare it first: spec 2's year is always 2026, so bytes
         // 5..13 ("MM-DDTHH") name the hour, one u64 load (a-56). Two lines ahead are asked for meanwhile: the
@@ -254,11 +254,11 @@ fn parse(data: &[u8], (start, end): (usize, usize), cur: &mut [Chunk; HOURS]) ->
         unsafe { _mm_prefetch::<_MM_HINT_T0>(d.add(p + 1344) as _) };
         let prefix = unsafe { (d.add(p + 5) as *const u64).read_unaligned() };
         if prefix != prev_prefix {
-            cur[h] = c;
+            cur[h] = chunk;
             h = hour_at(data, p);
-            (c, low, prev_prefix) = (cur[h], low.min(h), prefix);
+            (chunk, low, prev_prefix) = (cur[h], low.min(h), prefix);
         }
-        // Safety: the line and the 128 bytes after its start are inside the input or its zero tail.
+        // Safety: what line reads (its doc: 128 bytes from the start, the line's end + 32) is inside the input or its zero tail.
         let (ep, len, latency, next) = unsafe { line(d, p) };
         let row = (id(d.wrapping_add(ep), len) + 1) << 21;
         // Safety: the status follows the endpoint, its first digit '5' exactly for a 5xx.
@@ -269,21 +269,21 @@ fn parse(data: &[u8], (start, end): (usize, usize), cur: &mut [Chunk; HOURS]) ->
             // Safety: the region's top holds them (STRIDE is far more than two rows per line and 8 bytes per long one).
             unsafe { top.sub(i + 1).write((latency as u64) << 32 | row as u64) };
         } else {
-            if c.0 == c.1 {
+            if chunk.0 == chunk.1 {
                 // A new chunk of CLAIM rows. A pooled region holds an older hour's bytes, and a row no line
                 // takes must read 0, so the chunk is zeroed first.
                 let at = region(h).wrapping_add(CLAIMED[h].fetch_add(CLAIM, Relaxed));
                 // Safety: the chunk lies inside the region (STRIDE holds two rows per line and a chunk per thread).
                 unsafe { at.write_bytes(0, CLAIM) };
-                c = (at, at.wrapping_add(CLAIM));
+                chunk = (at, at.wrapping_add(CLAIM));
             }
-            // Safety: c.0 < c.1, the claimed chunk's end.
-            unsafe { *c.0 = row | latency };
-            c.0 = c.0.wrapping_add(1);
+            // Safety: chunk.0 < chunk.1, the claimed chunk's end.
+            unsafe { *chunk.0 = row | latency };
+            chunk.0 = chunk.0.wrapping_add(1);
         }
         p = next;
     }
-    cur[h] = c;
+    cur[h] = chunk;
     low
 }
 
