@@ -98,6 +98,7 @@ All box readings here are medians in ms of alternating rounds on our i5-13500 wi
 - **b-125.** Same machine code for the short names and moved comments (compared byte for byte), S 852 → 805. Setup loops as arithmetic -0.25.
 - **b-126, this tip.** The parse's length computed once and the sample sum through a local: 52.18 → 51.88. Then the code was made to read plainly for its reviewers: comments rewritten for the final design, comma chains and `x || die()` turned back into statements, the loop macros and a statement-expression macro removed, a checked `write`. The hot loops' assembly is unchanged but for label numbers. S 800 → 833 (+6 for the Dockerfile), about 0.6 % of K, given back on purpose. Parallel `madvise` before exit stays lost (b-113, b-122).
 - **b-127.** A panel of AI reviewers found that a failed `realloc` or `malloc` would not stop the program, while the README said errors do. Both now stop it with the call that failed, S 839 → 845; box 52.17 against 52.07 ms in the same rounds, inside the spread. Two README links landed on the wrong line, because the script that makes them matched a function's name in a comment; it now skips comments, and a check confirms each link points at its function.
+- **b-128, the wrong-answer odds, counted (box only, parked).** The 0.03 % had only been derived, so [reports/b/collide.c](../reports/b/collide.c) counts it with bindex.c's own key. Seed 1: 609,889 distinct tokens, 75,747 query terms, 1,237,173 token-term pairs in a bucket, about 87,600 term pairs: 0.031 % per dataset, about 1 in 3,200. A uniform hash predicts 18.9 pairs at 16 tag bits; low and high bits read 14 and 21 on seed 1, 29 and 23 on the fresh seed, and none at 32 bits on either. The known-bad, the same count with AES removed, read 15 to 4,000,000 times the prediction. Then the fix: ten more key bits in the table's values, checked by an XOR on each lookup (1 in 48,000; two query terms sharing a tag remain). Box 52.04 → 53.26 ms over 9 interleaved rounds, both hashes ok: 2.3 % T, about 0.24 points for certain against 85 points × 0.029 % = 0.025 points. Parked.
 
 **Measurements we got wrong and caught.**
 
@@ -396,7 +397,7 @@ Experiments read on the bench box (sd-bench/B); the lifted ones also have their 
 ## Decisions
 
 The plan's core choices (KNOWN = the known-best technique's version, OURS = our own design), each held or traded with the measurement that decided it:
-- Traded in the last day: per-part answers and their merge, for one shared index per phase and a running tally (b-110, box 103 → 84.5 ms). Exact 8-byte keys, for 32-bit tags over AES (b-111), a wrong-answer risk of about 0.03 % per dataset (610,000 distinct tokens on both seeds × 2.3 terms per bucket × 2^-32, derived), accepted for the second load per token it saves. Memory below the 44 MB cap, for time (b-121).
+- Traded in the last day: per-part answers and their merge, for one shared index per phase and a running tally (b-110, box 103 → 84.5 ms). Exact 8-byte keys, for 32-bit tags over AES (b-111), a wrong-answer risk of about 1 dataset in 3,200 (counted in b-128), accepted for the second load per token it saves. Memory below the 44 MB cap, for time (b-121).
 
 
 - 1, map `docs.txt` read-only and never copy it to the heap (KNOWN): held. The mapped corpus costs about nothing in the box's M (b-1).

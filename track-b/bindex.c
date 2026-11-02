@@ -203,8 +203,8 @@ static const u8 *map_file(const char *dir, const char *name, size_t *len) {
 // to 32 bytes. Bits 6..20 of the key are its bucket's byte offset, the high
 // half its tag. The text is never compared: a token that is no query term
 // passes for one only if its 32-bit tag equals a tag in its bucket. With about
-// 610,000 distinct tokens and 2.3 terms per bucket that is about 0.03 % per
-// dataset, and the longest token in the data is 17 bytes, well inside what the
+// 610,000 distinct tokens and 2.3 terms per bucket that is about 1 dataset in
+// 3,200, and the longest token in the data is 17 bytes, well inside what the
 // hash reads. A bucket holds 7 tags and their values in one cache line, plus an
 // eighth value that answers a miss: MISS, or PROBE once a term was placed past
 // the bucket. A lookup compares all eight tags at once and reads val[index of

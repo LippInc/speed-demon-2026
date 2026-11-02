@@ -35,7 +35,7 @@ python3 check.py d --data data/d --expected a23dbdf0a3e49cc8901310a9ee1dc6a9a569
 ## Honest limits
 
 - **A:** more than 2,047 distinct endpoints abort on an assert (the spec says exactly 1,842), and timestamps outside the spec's 72-hour window are not handled.
-- **B:** a token is matched by a 32-bit tag, not its text, so a dataset has about a 0.03 % chance of a wrong answer (derived, not measured).
+- **B:** a token is matched by a hash, not its text, so about 1 dataset in 3,200 would get a wrong answer (counted on real data; neither of ours does).
 - **C:** a name is identified by about 45 bits of hash, so two names can merge with odds of about 1.4e-4 per run, and a name over 30 raw bytes is not handled, about 3e-4 per dataset.
 - **D:** built for this generator's shape and scale: node ids must stay below 1,835,008, and parse cells have room for the expected fill plus 8 standard deviations with no bounds check.
 
