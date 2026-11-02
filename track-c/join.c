@@ -36,11 +36,10 @@
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <immintrin.h>
-#include <pthread.h>
+#include <sched.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -53,7 +52,7 @@ typedef u64 __attribute__((aligned(1), may_alias)) u64u;
 // BATCH: messages staged per owner; RING: the messages a ring holds (two
 // batches); PIECE: bytes per piece of records.csv; RUN: records per parse loop.
 enum { NT = 12, BATCH = 128, RING = 2 * BATCH, PIECE = 1 << 17, RUN = 64 };
-enum { BUCKETS = 624, SLOTS = 16 * (BUCKETS + 4) };
+enum { BUCKETS = 652, SLOTS = 16 * (BUCKETS + 4) };
 
 // One country's running totals, kept per thread: records, id sum, amount
 // sum, min and max in cents, name and note bytes once unescaped, distinct names.
@@ -65,14 +64,12 @@ typedef struct {
 // region's table index, name and note bytes once unescaped, the amount in cents.
 typedef struct {
   u64 h;
-  u32 id, reg, nl, tb;
-  int32_t cents;
+  u32 id, reg, nl, tb, cents;
 } Rec;
 typedef struct { // a thread's outgoing messages, totals and parsed records
   _Alignas(64) u64 batch[NT * BATCH]; // owner o's next messages: from o * BATCH up to fill[o]
   Rec rec[RUN];
-  u32 fill[NT];
-  int t;
+  u32 fill[NT], t;
   Agg *agg;
 } Ctx;
 typedef struct { // one owner's names; slot i of tag and row i belong to one name
@@ -80,16 +77,17 @@ typedef struct { // one owner's names; slot i of tag and row i belong to one nam
   u64 row[SLOTS][4];           // a bit per country
 } Names;
 
-static u8 *rec;                    // records.csv, mapped
-static u64 rsize, regsize;         // file sizes
-static const u8 *reg;              // regions.csv, mapped
+static u64 rsize, regsize; // file sizes
+static const u8 *rec, *reg; // records.csv and regions.csv, mapped
 typedef struct { // the messages from one thread to one owner, RING at most
   _Alignas(64) _Atomic u64 tail; // advanced by the sender
   _Alignas(64) _Atomic u64 head; // advanced by the owner
   _Alignas(64) u64 m[RING];      // message i is m[i % RING]
 } Ring;
-#define SET4(x) {x, x, x, x}
-V QUOTE = SET4(0x2222222222222222), DASH = SET4(0x2D2D2D2D2D2D2D2D), ZERO = SET4(0x3030303030303030);
+// Not const: the compiler rebuilds a constant it can see with three instructions
+// per use, and the hot loop has no register free to keep one (2 % of all instructions).
+#define ALL(x) {x, x, x, x}
+V QUOTE = ALL(0x2222222222222222), DASH = ALL(0x2D2D2D2D2D2D2D2D), ZERO = ALL(0x3030303030303030);
 static const u8 KEEP[64] = {[0 ... 31] = 0xFF}; // KEEP + 32 - n: n bytes kept
 
 // All memory the threads use, on three transparent huge pages that main
@@ -105,20 +103,19 @@ typedef struct {
   u8 rtab[1000002]; // id -> country, 0 = unmatched; spec 2.3: ids stop at 999,999; the last entry: any id above
   _Atomic u8 cidx[26 * 26 * 26]; // country code -> country number
   int ncountry;
-  pthread_mutex_t cmu; // zero bytes are an unlocked mutex
-  atomic_int finished;
-  atomic_int ready; // arrivals at the two meeting points
+  atomic_flag cmu; // zero bytes: clear
+  atomic_int finished, ready; // ready: arrivals at the two meeting points
   _Alignas(64) _Atomic u64 piece; // the next piece of records.csv to parse
-  _Alignas(4096) u8 stack[NT][1 << 14]; // the worker threads' stacks (the least pthreads takes)
+  _Alignas(64) u8 stack[NT][1 << 12]; // the worker threads' stacks; they use at most 640 bytes
   Names names[NT]; // the rest of Mem fits the first huge page
 } Mem;
 _Static_assert(sizeof(Mem) <= 3 << 21, "three huge pages");
 #define mem (*(Mem *)(3ull << 29))
 
 static void die(const char *what) { perror(what), exit(1); }
-static inline V load32(const u8 *p) { return _mm256_loadu_si256((const void *)p); }
-static inline u32 eq32(const u8 *p, V c) { // a bit per byte of p == c
-  return _mm256_movemask_epi8(_mm256_cmpeq_epi8(load32(p), c));
+static inline V load32(const u8 *p) { return _mm256_loadu_si256((const V *)p); }
+static inline u32 eq32(V a, V b) { // a bit per byte of a == b
+  return _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b));
 }
 
 // Three numbers at once, each up to 8 raw bytes in the top bytes of a
@@ -137,8 +134,7 @@ static inline V fold3(u64 a, u64 b, u64 c) {
 
 // A bit per quote byte of 64 bytes: the first 32 in v, then those at p
 static inline u64 quotes(V v, const u8 *p) {
-  V q = QUOTE;
-  return (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, q)) | (u64)eq32(p, q) << 32;
+  return eq32(v, QUOTE) | (u64)eq32(load32(p), QUOTE) << 32;
 }
 
 // Name hashing: 32 bytes v at a time go into the 128-bit state h, the first
@@ -158,8 +154,10 @@ static inline u64 name_hash(V v, u64 n) {
 // A bit per tag of the 16 at p that equals x
 static inline u32 eq16(const u32 *p, u32 x) {
   V w = _mm256_set1_epi32(x);
-  return _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(_mm256_load_si256((const V *)p), w))) |
-         _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(_mm256_load_si256((const V *)(p + 8)), w))) << 8;
+  V d = _mm256_cmpeq_epi32(_mm256_load_si256((const V *)p), w);
+  V e = _mm256_cmpeq_epi32(_mm256_load_si256((const V *)(p + 8)), w);
+  return _mm256_movemask_ps(_mm256_castsi256_ps(d)) |
+         _mm256_movemask_ps(_mm256_castsi256_ps(e)) << 8;
 }
 
 // The slot of the name of message msg; a new name takes the first free slot
@@ -177,13 +175,19 @@ static inline u32 slot_of(Names *nm, u64 msg) {
   }
 }
 
+// One step of a wait: a pause, and every 128th a 10 us sleep. A thread that
+// another process has pushed off its CPU then gets the CPU this one frees;
+// waits that only spin ran 15 times slower beside one busy process (PERF.md).
+static void rest(int *w) { ++*w % 128 ? _mm_pause() : (void)usleep(10); }
+
 static int country(const u8 *p) { // numbers countries in order of first sight
-  int k = (p[0] - 'A') * 676 + (p[1] - 'A') * 26 + (p[2] - 'A'), c = mem.cidx[k];
-  if (!c) {
-    pthread_mutex_lock(&mem.cmu);
+  int k = (p[0] - 'A') * 676 + (p[1] - 'A') * 26 + (p[2] - 'A'), c;
+  if (!(c = mem.cidx[k])) {
+    for (int w = 0; atomic_flag_test_and_set(&mem.cmu);)
+      rest(&w);
     if (!(c = mem.cidx[k]))
       c = mem.cidx[k] = ++mem.ncountry;
-    pthread_mutex_unlock(&mem.cmu);
+    atomic_flag_clear(&mem.cmu);
   }
   return c;
 }
@@ -243,11 +247,6 @@ static u64 drain(int t, Agg *a) {
   return done;
 }
 
-// One step of a wait: a pause, and every 128th a 10 us sleep. A thread that
-// another process has pushed off its CPU then gets the CPU this one frees;
-// waits that only spin ran 15 times slower beside one busy process (PERF.md).
-static void rest(int *w) { ++*w % 128 ? _mm_pause() : (void)usleep(10); }
-
 // Waits until n arrivals in all have reached the meeting points.
 static void meet(int n) {
   atomic_fetch_add(&mem.ready, 1);
@@ -289,19 +288,20 @@ static u64 note_end(const u8 *b) {
 
 // Reads the record at b into *rc; returns the next record's start.
 static inline __attribute__((always_inline)) const u8 *parse(const u8 *b, const u8 *rt, Rec *rc) {
-  V comma = _mm256_set1_epi8(',');
-  if (__builtin_expect(*b >= 0xBB, 0)) { // a BOM: 777 among 3.32 M records; see the end of parse
+  // A BOM: 777 among 3.32 M records; see the end of parse
+  if (__builtin_expect(*b >= 0xBB, 0)) {
     b += *b == 0xEF ? 3 : 2;
     __asm__(""); // stays a branch: a cmov would put this load on the way to the next record
   }
   _mm_prefetch((const char *)b + 512, _MM_HINT_T0);
   _mm_prefetch((const char *)b + 576, _MM_HINT_T0);
-  u64 a = _tzcnt_u64(eq32(b, comma)), j, d, qn, o = 0, pq = 0; // a: the id's digits
+  u64 a = _tzcnt_u64(eq32(load32(b), _mm256_set1_epi8(','))), j, d, qn, o = 0, pq = 0; // a: the id's digits
   // The quote mask starts at w, past most ids, so that for 97% of records it
   // reaches the end of the note. j and d count from w.
   const u8 *w = b + 6;
   u64 q = quotes(load32(w), w + 32);
-  if (__builtin_expect(a < 5 || b[a + 1] == ',', 0)) { // a short id (0.6%) or an empty, unquoted name (0.5%)
+  // A short id (0.6%) or an empty, unquoted name (0.5%)
+  if (__builtin_expect(a < 5 || b[a + 1] == ',', 0)) {
     u64 ne = note_end(b + a + 1), n = (u32)ne;
     j = a + 1 - 6 + n, pq = ne >> 32;
     rc->nl = n - pq / 2 - (n != 0);
@@ -310,16 +310,16 @@ static inline __attribute__((always_inline)) const u8 *parse(const u8 *b, const 
     // Past the opening quote, the commas after the name and after the note
     // are the first two bytes that follow an odd number of quotes and are
     // not one. A "" flips the count twice.
-    u64 t = a - 5; // the opening quote
+    // The opening quote is at a - 5.
     o = _andn_u64(q, odd_quotes(_blsr_u64(q)));
     j = _tzcnt_u64(o), o = _blsr_u64(o);
     pq = _mm_popcnt_u64(_bzhi_u64(q, j));
-    rc->nl = j - t - 1 - pq / 2;
+    rc->nl = j - a + 4 - pq / 2;
     // A name of 31 raw bytes or more is not handled; spec 2.2 sets no bound,
     // but over 40 generated seeds the longest was 27 (base name at most 24 by
     // the generator's forms, plus runs of trailing spaces that get rarer
     // about 4 times per extra byte), so about 3e-4 per dataset.
-    rc->h = name_hash(load32(b + a + 2), j - t - 2);
+    rc->h = name_hash(load32(b + a + 2), j - a + 3);
   }
   if (__builtin_expect(o != 0, 1)) {
     d = _tzcnt_u64(o);
@@ -336,8 +336,7 @@ static inline __attribute__((always_inline)) const u8 *parse(const u8 *b, const 
   // The region and the amount. The commas, CRs and LFs are the bytes below '-';
   // digits, '-' and '.' are not. A BOM's first byte is too, as a signed byte.
   const u8 *r = w + d + 1;
-  V tail = load32(r);
-  u64 m = (u32)_mm256_movemask_epi8(_mm256_cmpgt_epi8(DASH, tail));
+  u64 m = (u32)_mm256_movemask_epi8(_mm256_cmpgt_epi8(DASH, load32(r)));
   u64 c = _tzcnt_u64(m);
   m = _blsr_u64(m);
   u64 e = _tzcnt_u64(m); // the comma, the end of the amount
@@ -365,7 +364,7 @@ static void records(Ctx *x, const u8 *a, const u8 *m, const u8 *e) {
   Rec *rs = x->rec;
   u64 n;
   while (a < m || b < e) {
-    for (n = 0; n < RUN && ((a - m) & (b - e)) < 0; n += 2) {
+    for (n = 0; n < RUN && ((a - m) & (b - e)) < 0; n += 2) { // a < m, b < e
       a = parse(a, rt, rs + n);
       b = parse(b, rt, rs + n + 1);
     }
@@ -376,7 +375,7 @@ static void records(Ctx *x, const u8 *a, const u8 *m, const u8 *e) {
     for (u64 r = 0; r < n; r++) {
       u64 co = rt[rs[r].reg], h = rs[r].h;
       Agg *g = ag + co;
-      int64_t cents = rs[r].cents;
+      int64_t cents = (int32_t)rs[r].cents;
       g->n++;
       g->ids += rs[r].id;
       g->sum += cents;
@@ -396,7 +395,7 @@ static void records(Ctx *x, const u8 *a, const u8 *m, const u8 *e) {
   }
 }
 
-static void *worker(void *arg) {
+static int worker(void *arg) {
   int t = (int)(intptr_t)arg;
   Ctx *x = &mem.ctx[t];
   x->agg = mem.agg[t], x->t = t;
@@ -428,7 +427,8 @@ static void *worker(void *arg) {
   // mapping each, or exit tears down all 49,000 page-table entries on one CPU.
   if (t) {
     u64 a = rsize * (t - 1) / (NT - 1) & ~4095ull, e = rsize * t / (NT - 1);
-    madvise(rec + a, (e & ~4095ull) - a, MADV_DONTNEED);
+    madvise((u8 *)rec + a, (e & ~4095ull) - a, MADV_DONTNEED);
+    atomic_fetch_add(&mem.ready, 1);
   }
   return 0;
 }
@@ -453,39 +453,36 @@ static void report(FILE *o, const char *code, int c) {
   fprintf(o, " %lld %lld %lld\n", g.names, g.nb, g.tb);
 }
 
-// Reads one byte per 2 MB and the last byte, to fault the page-table pages in.
+// Reads one byte per 2 MB up to the last byte, to fault the page-table pages in.
 static void touch(const u8 *p, u64 n) {
-  for (u64 i = 0; i < n; i += 1 << 21)
-    (void)((volatile const u8 *)p)[i];
-  (void)((volatile const u8 *)p)[n - 1];
+  for (u64 i = 0; i < n + (1 << 21) - 1; i += 1 << 21)
+    (void)((volatile const u8 *)p)[i < n ? i : n - 1];
 }
 
 int main(void) {
   int rfd = open("/data/records.csv", O_RDONLY);
   int gfd = open("/data/regions.csv", O_RDONLY);
-  if (rfd < 0 || gfd < 0) die("open /data");
   rsize = lseek(rfd, 0, SEEK_END), regsize = lseek(gfd, 0, SEEK_END);
   // records.csv is mapped over the start of a zeroed reservation one page
   // longer, so the vector loads that run past its end read zeros.
-  // A failed map crashes at the first touch, which fails the run just as loudly.
-  rec = mmap(0, rsize + 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-  mmap(rec, rsize, PROT_READ, MAP_PRIVATE | MAP_FIXED, rfd, 0);
+  // A failed open or map crashes at the first touch, which fails the run just as loudly.
+  int anon = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
+  rec = mmap(0, rsize + 4096, PROT_READ, anon, -1, 0);
+  mmap((u8 *)rec, rsize, PROT_READ, MAP_PRIVATE | MAP_FIXED, rfd, 0);
   reg = mmap(0, regsize, PROT_READ, MAP_PRIVATE, gfd, 0);
-  mmap(&mem, 3 << 21, PROT_READ | PROT_WRITE,
-       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1, 0);
+  mmap(&mem, 3 << 21, PROT_READ | PROT_WRITE, anon | MAP_FIXED, -1, 0);
   madvise(&mem, 3 << 21, MADV_HUGEPAGE);
   // Fault the huge pages in here, and one page per 2 MB of each file (its
   // page-table page): a thread on another CPU that charges even one page to
   // the cgroup counts 256 KB against the peak (a per-CPU charge batch).
   *(volatile u8 *)&mem = 0;
   touch(reg, regsize);
-  pthread_t th[NT];
-  pthread_attr_t at;
-  pthread_attr_init(&at);
-  for (long t = 1; t < NT; t++) {
-    pthread_attr_setstack(&at, mem.stack[t], 1 << 14);
-    if (pthread_create(&th[t], &at, worker, (void *)t)) die("pthread_create");
-  }
+  // Plain threads: they share main's thread-local block and use nothing of it
+  // but errno, and take no memory for a TLS block or a thread descriptor.
+  int fl = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
+  for (long t = 1; t < NT; t++)
+    if (clone(worker, mem.stack[t + 1], fl, (void *)t) < 0)
+      die("clone");
   // The threads fill the region table meanwhile: all they touch before the
   // barrier lies on the first huge page.
   for (u64 i = 1 << 21; i < 3 << 21; i += 1 << 21) ((volatile u8 *)&mem)[i] = 0;
@@ -498,7 +495,6 @@ int main(void) {
       report(o, (char[]){'A' + k / 676, 'A' + k / 26 % 26, 'A' + k % 26, 0}, mem.cidx[k]);
   report(o, "_UNMATCHED", 0); // "_" sorts after every code
   fclose(o);
-  for (int t = 1; t < NT; t++)
-    pthread_join(th[t], 0);
+  meet(3 * NT); // every other thread is done with its part of the mapping
   return 0;
 }
