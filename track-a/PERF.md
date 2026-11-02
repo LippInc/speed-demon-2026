@@ -221,6 +221,27 @@ Experiments measured on our bench box only, with no board run (their box status 
   `K 43.58 (lower: fresh) | official K 44.64 T 0.022s (0.021-0.023) | fresh K 43.58 T 0.023s (0.022-0.024) | M 20.7MB S 464 L | sha 5/5+5/5 OK`
   and `K 43.80 (lower: fresh) | official K 43.89 T 0.023s (0.022-0.023) | fresh K 43.80 T 0.023s (0.023-0.024) | M 20.7MB S 464 L | sha 5/5+5/5 OK`,
   against a6b3205's `K 42.96 / 43.04 / 42.54 (lower: fresh)`; five-round A/B medians 43.93 vs 43.02 (+2.1 % K).
+- a-57 (OURS + KNOWN), kept: the CPU cut, in three steps on a-56, each timed on the box with a fresh tmpfs /out per
+  run (as the board writes), 12 workers. Final A/B, 20 interleaved rounds: a-56 median 23.37 ms (min 22.06), a-57
+  19.09 ms (min 18.51); HighVelocity's public binary on the same box 16.11 ms. Hash checked at 1, 4, 12 and 24 workers.
+  - finish without sort or select (OURS): records packed to 32-bit rows, latency << 11 | id, two stable counting
+    passes by latency (11 and 10 bits; the 0.24 % of latencies >= 2^21 sorted aside), then a third pass deals them to
+    each endpoint's span in byte order, so p50, p95 and p99 are one read each; branch-free `put` (all ten digits at
+    once, leading zeros shifted out); finish and text buffers pooled. Branch misses 2.49 -> 0.95 M, 22.1 -> 20.8 ms.
+  - lookup (KNOWN, after HighVelocity): CRC32 of the length and the first and last 8 bytes; the confirm compares raw
+    32-byte loads masked to the length with `bzhi`, so no masked copy of the line; records written through a raw
+    pointer. User instructions 860 -> 666 M, 20.8 -> 19.0 ms.
+  - LF prescan (OURS): each 4 KiB chunk's LFs found first (64-byte windows, two unconditional stores each), so a line
+    is read from both ends: the method's space from the front, the latency's space from the back; the file is mapped
+    over a zero tail, so the last line needs no copy. One worker 133 -> 114 ms; 12 workers level with the step before
+    (the run is throughput-bound there), kept for the single-worker cut.
+  - cost: memory peak 20.0-20.6 -> 23.0-23.9 MB (cgroup peak, output 9.64 MB of it): the pooled finish and text
+    buffers stay resident at the pools' high-water mark (5-6 finishers and 8 texts at once, per a memory log).
+  - LOST, each against the kept step: the mapping's release per block (20.8 ms), none (21.8: exit teardown ~2.5 ms),
+    after all hours (same), in 4 MiB steps during the scan (same): the unmap costs ~2 ms wherever it lands. Record
+    vectors shrunk to fit (+1 MB, +1.6 ms). Exact-size and capped pools (-3.2 MB, but +1.7-2.3 ms: freeing or
+    growing a buffer unmaps while the other threads release the input). At most 2 or 3 hours finishing at once
+    (+7 MB: records wait for their hour).
 
 ## Decisions
 
