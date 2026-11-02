@@ -181,7 +181,8 @@ struct Job<'a> {
     names: Mutex<(Vec<Name>, Vec<u16>)>, // by id; the ids in byte order, as last asked for
 }
 
-// Safety: threads write only the row chunks they claimed; an hour's region is read only by the thread finishing it;
+// Safety: threads write only the row chunks they claimed; an hour's region is read only by the thread finishing it
+// (a late line, one for an hour already finished, breaks this: `run` reports it and main redoes the run from scratch);
 // slots are only filled under the lock of `names`, so a slot seen empty there ends the probe; a name is written once,
 // under that lock, before its slot is.
 unsafe impl Sync for Job<'_> {}
@@ -274,7 +275,8 @@ impl Job<'_> {
             if prefix != prev_prefix {
                 cur[h] = c;
                 // Hours since 2026-10-30T18, from "YYYY-MM-DDTHH" (spec 2: the window crosses two midnights and the
-                // October to November boundary): days 10-30 and 10-31 are 0 and 1, 11-01 and 11-02 are 2 and 3.
+                // October to November boundary): days 10-30 and 10-31 are 0 and 1, 11-01 and 11-02 are 2 and 3, which is the
+                // day's ones digit plus the month's.
                 let digit = |i: usize| (self.data[p + i] - b'0') as usize;
                 h = (digit(9) + digit(6)) * 24 + digit(11) * 10 + digit(12) - 18;
                 (c, low, high, prev_prefix) = (cur[h], low.min(h), high.max(h), prefix);
@@ -378,7 +380,8 @@ impl Job<'_> {
     fn finish(&self, h: usize) -> &'static [u8] {
         let (order, names) = self.order();
         let claimed = self.claimed[h].load(Relaxed);
-        // Safety: the region is stride rows; its rows are all written (their blocks are registered) and no other thread
+        // Safety: the region is stride rows; its rows are all written (their blocks are registered; a late line is the
+        // exception that makes main redo the run) and no other thread
         // touches it until it goes to the pool.
         let region = unsafe { from_raw_parts_mut(self.region(h), self.stride) };
         let (head, values) = region.split_at_mut(claimed.max(SPARE));
@@ -537,9 +540,10 @@ fn main() {
     // 0x22, then MAP_PRIVATE | MAP_FIXED 0x12), never unmapped, so the slice lives for the run and the bytes past the
     // input read as zeros: the kernel zero-fills the file's last page and the reservation is zeros. Then ask the
     // kernel to read the file ahead (MADV_WILLNEED 3), a hint whose result is ignored. An empty log (spec 3.7: an
-    // empty summary) maps nothing over the reservation, which reads as no lines.
+    // empty summary) maps nothing over the reservation (a zero-length mmap fails), which reads as no lines.
     let room = unsafe { mmap(std::ptr::null_mut(), len + 4096, 1, 0x22, -1, 0) };
-    unsafe { mmap(room, len, 1, 0x12, file.as_raw_fd(), 0) };
+    let mapped = unsafe { mmap(room, len, 1, 0x12, file.as_raw_fd(), 0) };
+    assert!(len == 0 || mapped as isize > 0, "map input"); // a failed reservation fails this too
     unsafe { madvise(room, len, 3) };
     let data: &'static [u8] = unsafe { from_raw_parts(room, len) };
 

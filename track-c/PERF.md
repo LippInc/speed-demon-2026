@@ -46,7 +46,7 @@ The comment at the top of join.c describes the program. The measurements behind 
 
 ## Steps
 
-Box 2, fast loop, median T, then the live board's T for the same code. On 2026-11-01 we pushed the main steps to the board again, in order, one run each, so each has a board measurement. Until the freeze the board shares its machine with other teams' runs, so a single run can be slow: v32's 84.6 ms is one such run, and v39, with the same sending scheme, measured 21.6 ms 6 minutes later.
+Box 2, fast loop, median T, then the live board's T for the same code. On 2026-11-01 we pushed the main steps to the board again, in order, one run each: each step below with a run ID has that board measurement, and the steps without one were measured on box 2 only. Until the freeze the board shares its machine with other teams' runs, so a single run can be slow: v32's 84.6 ms is one such run, and v39, with the same sending scheme, measured 21.6 ms 6 minutes later.
 
 - v10, 31.6 ms (harness), board 33.6 ms (run-34ea5e6b408e): an early C version of the owner design.
 - v18, 29.4 ms, board 30.1 ms (run-66e847fccb66): hot-loop state in locals (aliasing stores to struct fields had cost ~10 % of instructions), 8-slot SIMD buckets.

@@ -2,9 +2,9 @@
 
 Every step from the reference to your final version, each with the live-board run ID that measured it. Judges check that the run IDs exist and that each change moved the way you say it did.
 
-Terms used below: the board is the organisers' live leaderboard, one run per push; the box is our bench machine with the scoring machine's CPU, where each reading is 5 runs on seed 1's full data (official) and 5 on one fresh seed at full size (fresh), and K is the lower of the two; the VM is a 4-core cloud machine used for quick timings and counts, never for K; lifted means copied from our working repository into this one and pushed, so the board ran it.
+Terms used below: the board is the organisers' live leaderboard, one run per push; the box is our bench machine with the scoring machine's CPU, where each reading is 5 runs on seed 1's full data (official) and 5 on one fresh seed at full size (fresh), and K is the lower of the two; the VM is a 4-core cloud machine used for quick timings and counts, never for K; lifted means copied from our working repository into this one and pushed, so the board ran it. The score's axes: T is the run time, M the peak memory, S the lines of code (rustfmt defaults, code lines only), D 1 plus the declared dependencies (ours is 1: the standard library only); K grows as each falls against the reference, and points are the board's speed points from K. The table's M is in MB of 10^6 bytes; the board lines quoted in the experiment notes give M as the board shows it, in MiB (2^20 bytes). In a box reading, "S 464 L" is S in lines. "A rank 5" is our place on the track A board when that run landed. From a-57 on, box readings are medians of interleaved A/B rounds, with a fresh tmpfs /out per run as the board writes.
 
-| Step | Change | Run ID | T (ms) | M (MB) | Points | KNOWN/OURS | Spread (box T) | Kept/reverted |
+| Step | Change | Run ID (every board run of the code) | T (ms) | M (MB) | Points | KNOWN/OURS | Spread (box T) | Kept/reverted |
 |---|---|---|---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 32047.0 | 228.0 | 0 | - | - | - |
 | 1 | a-1, the floor | f15421b · Track A (run-b0eb3a208c93) | 156.8 | 45.4 | 59.3 | KNOWN | - | kept, part replaced (a-4) |
@@ -44,7 +44,6 @@ Terms used below: the board is the organisers' live leaderboard, one run per pus
 | 35 | a-24 + a-27 + a-29, re-run (another track's push) | 6ba03de · Track A (run-86b0c97eda14) | 37.3 | 23.6 | 77.1 | KNOWN + OURS | 0.029-0.031 s | kept |
 | 36 | a-24 + a-27 + a-29, re-run (another track's push) | 8604c2c · Track A (run-4cb736114b5b) | 31.3 | 23.6 | 79.0 | KNOWN + OURS | 0.029-0.031 s | kept |
 | 37 | a-24 + a-27 + a-29, re-run (another track's push) | 67c71f1 · Track A (run-20c545e1f44a) | 31.2 | 23.3 | 79.1 | KNOWN + OURS | 0.029-0.031 s | kept |
-
 | 38 | a-24 + a-27 + a-29, re-run (root README push) | 6b8f071 · Track A (run-c1f2cb487fc6) | 28.9 | 23.7 | 79.8 | KNOWN + OURS | 0.029-0.031 s | kept |
 | 39 | a-35: cold-code line cuts, S 367 → 356 (kit ce481c8) | da6f278 · Track A (run-136eb6e8fd39) | 28.6 | 23.5 | 80.1 | OURS | 0.029-0.032 s | kept |
 | 40 | a-35, re-run (another track's push) | c54220e · Track A (run-0b9c36b64e7d) | 35.6 | 24.1 | 77.6 | OURS | 0.029-0.032 s | kept |
@@ -54,22 +53,34 @@ Terms used below: the board is the organisers' live leaderboard, one run per pus
 | 44 | a-40, re-run (another track's push) | 63c975d · Track A (run-67d08e654e03) | 28.1 | 23.8 | 79.9 | OURS | 0.027-0.028 s | kept |
 | 45 | a-45: PERF rows 38-44 and README at the tip (kit 9504c76), a-40's code | c8760d4 · Track A (run-c2e53f031834) | 29.1 | 23.6 | 79.6 | OURS | 0.027-0.028 s | kept |
 | 46 | a-45, re-run (another track's push) | 19e5d85 · Track A (run-a43ca3b04d55) | 28.2 | 24.4 | 79.7 | OURS | 0.027-0.028 s | kept |
-| 47 | a-45, re-run (another track's push) | af85844 · Track A (run-1356fbfcd982) | 0.03 | 24 | 79.1 | OURS | 0.027-0.028 s | kept |
-| 48 | a-45, re-run (another track's push) | 1be93e4 · Track A (run-8e41486361d9) | 0.03 | 24 | 79.5 | OURS | 0.027-0.028 s | kept |
-| 49 | a-45, re-run (another track's push) | 3cfa79a · Track A (run-d39e19fdac1c) | 0.03 | 24 | 79.8 | OURS | 0.027-0.028 s | kept |
-| 50 | a-47d: the a-47d lift (sd-kit-a 5c47d22) | 178ceb2 · Track A (run-b79ba3882933) | 0.03 | 23 | 79.4 | OURS | 0.026-0.028 s | kept |
-| 51 | a-47d, re-run (another track's push) | 7890539 · Track A (run-3a21f91ba00d) | 0.03 | 23 | 79.5 | OURS | 0.026-0.028 s | kept |
-| 52 | a-47d, re-run (another track's push) | b769e68 · Track A (run-90473e218dbb) | 0.03 | 23 | 80.5 | OURS | 0.026-0.028 s | kept |
-| 53 | a-47d, re-run (another track's push) | 29fe7fb · Track A (run-8291dc062062) | 0.03 | 23 | 79.9 | OURS | 0.026-0.028 s | kept |
-| 54 | a-47d, re-run (another track's push) | 134b2b2 · Track A (run-59f3735ada49) | 0.03 | 24 | 79.6 | OURS | 0.026-0.028 s | kept |
-| 55 | a-47d, re-run (another track's push) | 60b5493 · Track A (run-a1e8513b77c6) | 0.03 | 23 | 79.3 | OURS | 0.026-0.028 s | kept |
-| 56 | a-47d, re-run (another track's push) | e550f50 · Track A (run-ca6d3c048273) | 0.03 | 23 | 77.6 | OURS | 0.026-0.028 s | kept |
-| 57 | a-55: the a-55 lift (sd-kit-a a6b3205) | f245483 · Track A (run-8c41cebcaeef) | 0.03 | 21 | 80.4 | OURS | 0.023-0.025 s | kept |
-| 58 | a-55, re-run (another track's push) | 585ce17 · Track A (run-2c31c9241d23) | 0.03 | 21 | 81.0 | OURS | 0.023-0.025 s | kept |
-| 59 | a-55, re-run (another track's push) | b1438ef · Track A (run-de31ec2f2b8c) | 0.03 | 21 | 80.6 | OURS | 0.023-0.025 s | kept |
-| 60 | a-55, re-run (another track's push) | 55a0bc1 · Track A (run-66dd7b069673) | 0.03 | 22 | 80.5 | OURS | 0.023-0.025 s | kept |
-| 61 | a-55, re-run (another track's push) | bf07a3a · Track A (run-3bf9d051e3dc) | 0.03 | 20 | 80.2 | OURS | 0.023-0.025 s | kept |
-| 62 | a-55, re-run (another track's push) | a188bdf · Track A (run-6648069094f7) | 0.03 | 21 | 80.4 | OURS | 0.023-0.025 s | kept |
+| 47 | a-45, re-run (another track's push) | af85844 · Track A (run-1356fbfcd982) | 30.2 | 23.7 | 79.1 | OURS | 0.027-0.028 s | kept |
+| 48 | a-45, re-run (another track's push) | 1be93e4 · Track A (run-8e41486361d9) | 29.2 | 23.7 | 79.5 | OURS | 0.027-0.028 s | kept |
+| 49 | a-45, re-run (another track's push) | 3cfa79a · Track A (run-d39e19fdac1c) | 28.6 | 23.5 | 79.8 | OURS | 0.027-0.028 s | kept |
+| 50 | a-47d: the a-47d lift (sd-kit-a 5c47d22) | 178ceb2 · Track A (run-b79ba3882933) | 29.6 | 23.1 | 79.4 | OURS | 0.026-0.028 s | kept |
+| 51 | a-47d, re-run (another track's push) | 7890539 · Track A (run-3a21f91ba00d) | 29.2 | 23.5 | 79.5 | OURS | 0.026-0.028 s | kept |
+| 52 | a-47d, re-run (another track's push) | b769e68 · Track A (run-90473e218dbb) | 27.1 | 22.8 | 80.5 | OURS | 0.026-0.028 s | kept |
+| 53 | a-47d, re-run (another track's push) | 29fe7fb · Track A (run-8291dc062062) | 28.3 | 23.2 | 79.9 | OURS | 0.026-0.028 s | kept |
+| 54 | a-47d, re-run (another track's push) | 134b2b2 · Track A (run-59f3735ada49) | 28.8 | 23.6 | 79.6 | OURS | 0.026-0.028 s | kept |
+| 55 | a-47d, re-run (another track's push) | 60b5493 · Track A (run-a1e8513b77c6) | 30.0 | 23.0 | 79.3 | OURS | 0.026-0.028 s | kept |
+| 56 | a-47d, re-run (another track's push) | e550f50 · Track A (run-ca6d3c048273) | 35.0 | 23.4 | 77.6 | OURS | 0.026-0.028 s | kept |
+| 57 | a-55: the a-55 lift (sd-kit-a a6b3205) | f245483 · Track A (run-8c41cebcaeef) | 26.6 | 21.5 | 80.4 | OURS | 0.023-0.025 s | kept |
+| 58 | a-55, re-run (another track's push) | 585ce17 · Track A (run-2c31c9241d23) | 25.5 | 20.8 | 81.0 | OURS | 0.023-0.025 s | kept |
+| 59 | a-55, re-run (another track's push) | b1438ef · Track A (run-de31ec2f2b8c) | 26.2 | 21.5 | 80.6 | OURS | 0.023-0.025 s | kept |
+| 60 | a-55, re-run (another track's push) | 55a0bc1 · Track A (run-66dd7b069673) | 26.3 | 21.6 | 80.5 | OURS | 0.023-0.025 s | kept |
+| 61 | a-55, re-run (another track's push) | bf07a3a · Track A (run-3bf9d051e3dc) | 28.0 | 20.1 | 80.2 | OURS | 0.023-0.025 s | kept |
+| 62 | a-55, re-run (another track's push) | a188bdf · Track A (run-6648069094f7) | 26.7 | 21.1 | 80.4 | OURS | 0.023-0.025 s | kept |
+| 63-68 | a-56: the forward line walk (kit 538b841) | 85ba2e7 · Track A (run-ae665535dd56); 172a905 · Track A (run-00e07ffcc7bc); 8d3d412 · Track A (run-e9a9abef1d45); ad8a046 · Track A (run-fbad22dfe0ba); 2306aa9 · Track A (run-a40151211d38); 81fcaa9 · Track A (run-e164be93bbcd) | 25.5-27.2 | 20.6-21.7 | 80.3-80.9 | OURS | 0.022-0.023 s | kept |
+| 69-98 | a-56 with cold functions compacted, S 464 → 451, the same work (kit a85da0e) | 09f081f · Track A (run-ac61b19f1e99); 5bcd2df · Track A (run-c0264a2ab8de); 7450b2c · Track A (run-baa506e0f979); 9b9d3c0 · Track A (run-f42a57164dd7); dfcd820 · Track A (run-4645b5b37f42); e733519 · Track A (run-5c2823471e01); and 24 board runs whose IDs we did not save, one per push from 2b5dbbc (11-01 12:10Z) to e733519 (11-01 22:24Z) | 23.8-27.6 | 20.2-21.5 | 80.3-81.7 | OURS | 0.022-0.023 s | kept |
+| 99 | a-57: the CPU cut, finish by two counting passes and a deal, CRC32 lookup | f0b3b86 · Track A (run-9eeff87230e9) | 19.5 | 25.3 | 82.5 | OURS + KNOWN | - | kept |
+| 100 | a-58: finish by one quickselect per endpoint span | 4f9b0f5 · Track A (run-62d88f26d2ed) | 20.5 | 21.1 | 82.2 | OURS + KNOWN | - | kept |
+| 101 | a-59: 32-bit rows in per-hour regions of one reserved mapping | 3a7daea · Track A (run-ee832571a339) | 18.6 | 17.3 | 84.0 | OURS | - | kept |
+| 102 | a-60: a one-region pool of finished hours' regions | e566598 · Track A (board run of 11-02 00:49Z; ID not saved) | 20.8 | 17.9 | 82.5 | OURS | - | kept |
+| 103 | a-61: the finish by radix, two stable 10-bit counting passes | 4c54723 · Track A (run-210a1ffa297a) | 18.3 | 17.4 | 84.7 | KNOWN | - | kept |
+| 104 | a-62: the parse reads forward with one 64-byte space mask | 3a37de8 · Track A (run-987479ba190c) | 17.3 | 17.1 | 85.4 | OURS + KNOWN | - | kept |
+| 105 | a-63: one shared endpoint table keyed by a 64-bit AES hash | f173813 · Track A (run-e1ffe83193a9) | 17.2 | 17.5 | 85.9 | OURS | - | kept |
+| 106 | a-64: 1 MiB blocks, at most two threads faulting the input under one lock | bc73e3c · Track A (run-760e0ef7d853) | 16.1 | 17.4 | 87.0 | OURS | - | kept |
+| 107-109 | a-65: the finish's radix split 9 / 11 bits | 0ca2530 · Track A (board run of 11-02 02:26Z; ID not saved); 8875804 · Track A (run-8cffec26c59b); 846449f · Track A (run-ffd993386390) | 15.6-18.9 | 17.1-17.4 | 85.3-87.4 | OURS | - | kept |
+| 110 | a-66: a shorter program with the same work (S 430 → 393) | a517db7 · Track A (run-0814c130face) | 18.8 | 18.9 | 85.3 | OURS | - | kept |
 
 ## What each push carried
 
@@ -198,7 +209,6 @@ Experiments measured on our bench box only, with no board run (their box status 
 - a-47 (OURS), kept candidate (spec-built), on a-40d: each hour's records reserved at 1 << 16 entries (256 KB, above glibc's 128 KiB mmap threshold, so each buffer is mapped on its own and only the pages written are charged) and its request and 5xx counters at the 2,048 ids that ID_BITS allows, up front (568a639). `K 40.25 (lower: fresh) | official K 40.91 T 0.027s (0.026-0.028) | fresh K 40.25 T 0.027s (0.027-0.028) | M 22.7MB S 396 L | sha 5/5+5/5 OK`, against a-40d's four readings K 39.49-40.03 fresh / 39.66-40.42 official at M 23.0-23.6 MB.
 - a-48 (OURS), failed (spec-built), two branches on a-40d. a-48r, without the per-thread release of the scanned range (91e0d76): `K 39.09 (lower: fresh) | official K 39.64 T 0.028s (0.028-0.030) | fresh K 39.09 T 0.029s (0.028-0.029) | M 23.6MB S 387 L | sha 5/5+5/5 OK`; T +1 ms: the release pays for itself at exit teardown (a-12). a-48p, a per-thread MADV_POPULATE_READ of its range before the scan (5ebcff3): `K 35.08 (lower: fresh) | official K 35.63 T 0.034s (0.034-0.035) | fresh K 35.08 T 0.036s (0.033-0.037) | M 23.1MB S 394 L | sha 5/5+5/5 OK`; T +7 ms: the populate call costs more than the page faults it saves.
 - a-47d (OURS), banked board tip (sd-kit-a 5c47d22), a-47's code with PERF rows 45-46: each hour's records reserved at 256 KB and counters at 2,048 ids up front. Second box reading: `K 39.80 (lower: fresh) | official K 40.23 T 0.027s (0.027-0.028) | fresh K 39.80 T 0.028s (0.028-0.029) | M 22.4MB S 396 | sha OK`, and rerun `K 39.88 (fresh; official 41.05, T 0.026-0.028) | M 22.2MB`. Lifted to the board on row 50 (run-b79ba3882933, points 79.4).
-- a-48 (OURS), failed (spec-built), two branches on a-40d. a-48r, without the per-thread release of the scanned range (91e0d76): `K 39.09 (lower: fresh) | official K 39.64 T 0.028s (0.028-0.030) | fresh K 39.09 T 0.029s (0.028-0.029) | M 23.6MB S 387 L | sha 5/5+5/5 OK`; T +1 ms: the release pays for itself at exit teardown (a-12). a-48p, a per-thread MADV_POPULATE_READ of its range before the scan (5ebcff3): `K 35.08 (lower: fresh) | official K 35.63 T 0.034s (0.034-0.035) | fresh K 35.08 T 0.036s (0.033-0.037) | M 23.1MB S 394 L | sha 5/5+5/5 OK`; T +7 ms: the populate call costs more than the page faults it saves.
 - a-49 (OURS), failed (no board run): batched SIMD parse. Lines parsed in batches (64 lines, db8f945: `K 39.10 (lower: fresh) | official K 39.91 T 0.027-0.028s | S 436`; 8 lines, 9a33286: `K 39.53 (lower: fresh / official) | T 0.027s | S 436`). Scan instructions per line fell 188.1 -> 164.8 (parse 80.7 -> 43.8), but branch mispredicts were not cut. Step (a) edits saved as 303c7ad (a-49s): `K 38.87 (lower: fresh) | official K 39.17 T 0.028s (0.027-0.028) | fresh K 38.87 T 0.028s (0.027-0.030) | M 23.0MB S 438 | sha OK`, rerun K 38.49 (T 0.029 / 0.028). With a-47's reserved hour buffers (a-49m, 124d476): `K 38.98 (lower: fresh; official 39.14 T 0.028s, fresh T 0.028)` and second reading `K 38.52 (official 39.10 T 0.028s, fresh T 0.029s) | M 22.4-22.6MB | S 442`. T level with incumbent, S +46 (-2.0 % K): dropped.
 - a-50 (OURS), failed (no board run): block stealing. 64 line-aligned blocks per thread, stealing from the thread with the most left (24d64df): `K 37.84 (lower: fresh) | official K 39.19 T 0.029s (0.028-0.030) | fresh K 37.84 T 0.030s (0.029-0.031) | M 22.5MB S 414 L | sha 5/5+5/5 OK`; per-block release calls (64 madvise per thread) and counter traffic cost more than the tail spread they removed. a-50r (c245be9), releasing once per run of adjacent blocks: `K 38.52 (lower: fresh) | official K 39.37 T 0.028s (0.027-0.029) | fresh K 38.52 T 0.029s (0.029-0.030) | M 22.6MB S 426`. a-50r8 (4a073b1), 8 blocks per thread: `K 39.14 (lower: fresh) | official K 39.77 T 0.027s (0.026-0.030) | fresh K 39.14 T 0.028s (0.028-0.030) | M 22.7MB S 426`, rerun lowers 39.14 / 39.41 (M 22.3MB). T was flat with a-47 (0.027-0.028 s), while S +30 cost 1.3 % K: dropped.
 - a-51 (OURS), inside the spread (spec-built, no board run), on a-47: each hour's counters sized past every interned id, so the add skips its bounds check (9f3ab56; d55ca7d changes one comment only and is a second reading of the same code): `K 39.58 (lower: fresh) | official K 40.83 T 0.026s (0.026-0.028) | fresh K 39.58 T 0.028s (0.027-0.033) | M 22.4MB S 402 L | sha 5/5+5/5 OK` and `K 40.26 (lower: fresh) | official K 40.26 T 0.027s (0.025-0.028) | fresh K 40.26 T 0.027s (0.027-0.028) | M 22.5MB S 402 L | sha 5/5+5/5 OK`; no gain over a-47 for S +6 and an unsafe block.
@@ -214,7 +224,7 @@ Experiments measured on our bench box only, with no board run (their box status 
   - r2e (afc911c), in-place output formatting with fixed-size copies: `K 41.84 / 42.48 (lower: fresh; official 42.03 / 42.69) | T 0.023s | M 20.6-21.0MB | S 541`. Dropped: inside spread at S +11 lines; reverted to r2d (71473d6).
   - r3 (175024c), 4 interleaved line streams per block: `K 41.26 / 41.08 (lower: fresh; official 41.62 / 41.19) | T 0.024s | M 20.4-20.7MB | S 565`. Dropped. Split (perf stat): line loop is already throughput-bound on 1 worker (IPC 2.67), so overlapping chains cannot win; 4 streams added L1 misses (1 worker 5.79 -> 6.53 M, 12 workers 6.63 -> 7.49 M; cycles +1.6-1.8 %).
   - trim (a6b3205, on 739c1eb): cold-code line cuts (hot functions untouched), S 530 -> 463 (-67 lines): `K 42.54 / 43.04 (lower: fresh; official 42.82 / 43.05) | T 0.024s | M 20.2-20.4MB | S 463`. Kept in family, family tip: +5.7-8.1 % K over banked board tip 5c47d22 (39.80 / 40.25).
-- a-56 (OURS), kept (no board run; measured on bench box): forward line walk (44579b2), after HighVelocity's public
+- a-56 (OURS), kept, board steps 63-68 (85ba2e7 run-ae665535dd56 first): forward line walk (44579b2), after HighVelocity's public
   track-a line walk. The timestamp is always 27 bytes, so one 64-byte space mask from byte 28 holds the ends of method
   and endpoint; status and latency sit at fixed offsets after them; the latency's digits are read 8 per load and
   converted with two multiply-adds; one load checks the hour; the last 256 bytes take a cold copy path. Two readings:
@@ -354,7 +364,7 @@ Experiments measured on our bench box only, with no board run (their box status 
   lines). Box, 15 interleaved rounds: `a-65 15.29 | a-66 15.29` (median ms), M level. LOST alongside: the parse window
   per worker (more blocks in flight) and 1.5 workers' worth of blocks ahead (T and M level). Hash checked: rule 30 kit
   24/24, full local kit 423/481 with the same out-of-spec failures; an input past 2,048 endpoints still aborts (the
-  cap's assert stays: without it the table's id bits overflow and the probe never ends).
+  cap's assert stays: without it the table's id bits overflow and the probe never ends). Then the input mapping's result checked (one assert), S 393 -> 394: hash checked at 1, 4, 12 and 24 workers and on an empty log.
 
 ## Decisions
 
@@ -388,4 +398,4 @@ a-55 r2c (OURS): Name repr(C, align(64)); OnceLock state still sat on a second c
 a-55 r2e (OURS): in-place output formatting with fixed-size copies; inside spread at S +11 lines.
 a-55 r3 (OURS): 4 interleaved line streams per block; throughput-bound loop, 4 streams only added L1 misses.
 
-Final result (this tip, a-66): box T 15.29 ms (median of 15 rounds), M 16.4-17.2 MB peak at 12 workers, S 393, D 1, against the reference's T 32,047 ms and M 228 MB. Best board run so far: run-ffd993386390 (a-65's code, commit 846449f), K 55.90, T 15.61 ms, M 16.5 MB, S 430, A rank 5.
+Final result (this tip, a-66): box T 15.29 ms (median of 15 rounds), M 16.4-17.2 MB peak at 12 workers, S 394 (393 plus the input-mapping check), D 1, against the reference's T 32,047 ms and M 228 MB. Best board run so far: run-ffd993386390 (a-65's code, commit 846449f), K 55.90, T 15.61 ms, M 16.5 MB, S 430, A rank 5.

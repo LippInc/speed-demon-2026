@@ -22,13 +22,13 @@
 //  4. Distinct names: a name is identified by 56 bits of a hash of its raw
 //     bytes (quoting is one-to-one, and spec 2.2 always quotes a non-empty
 //     name). Two of the ~100,000 names share those bits with odds of about
-//     1e-7 per run.
+//     1e-7 per run (n^2 / 2^57).
 //  5. Each name has one owner thread, picked by its hash. The reader sends
 //     the owner an 8-byte message (the hash, with the country in the low
 //     byte) through a lock-free ring, 128 messages at a time (8 at a time
 //     cost 1.5 ms more), and the owner keeps its names in a private table
-//     with one bit per country. One table shared by all
-//     threads took almost twice as long (PERF.md): every lookup missed the
+//     with one bit per country. One table shared by all threads took
+//     almost twice as long in the Rust version (PERF.md): lookups missed the
 //     core's own cache. The owner's table needs no atomic instruction.
 #define _GNU_SOURCE
 #include <fcntl.h>
@@ -390,7 +390,7 @@ static void records(Ctx *x, Scan *z) {
     // at most and an amount 8 characters, so that tail is 19 bytes at most)
     u32 m = eq32(f + e - 32, comma);
     u64 d = e - 1 - _lzcnt_u32(m);
-    u64 c = e - 1 - _lzcnt_u32(_bzhi_u32(m, d + 32 - e));
+    u64 c = e - 1 - _lzcnt_u32(_bzhi_u32(m, d + 32 - e)); // the comma before d
     // The amount ends the record: v is its last 8 bytes, "DDDDD.CC" with the
     // point at byte 5, and the shift moves the digits before it up over it
     u64 cr = f[e - 1] == '\r', neg = f[d + 1] == '-', nd = e - cr - d - 2 - neg;

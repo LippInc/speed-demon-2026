@@ -3,7 +3,7 @@
 // Only the query terms are indexed. Each of the nw workers parses its share of
 // queries.txt into one shared term table, then owns a contiguous stretch of the
 // corpus cut into parts of at most 32,768 documents. Per part it records which
-// documents hold each BOOL term (a bitmap row for the ~180 common terms, a
+// documents hold each BOOL term (a bitmap row for the ~370 common terms, a
 // sorted u16 list for the rest), answers every BOOL query on the part and keeps
 // a record for each query that matched. Phrases are checked during the scan at
 // each occurrence of their rarest term. Last, each worker merges every part's
@@ -30,7 +30,7 @@ typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t
 #define BBITS 15          // term table: 2^15 buckets of 5 keys
 #define NSLOT (5u << BBITS)
 #define SAMPLE_DIV 64     // each worker samples the first 1/64 of its first part
-#define DENSE_DIV 32      // a BOOL term in over 1/16 of the sample gets a bitmap row
+#define DENSE_DIV 32      // a BOOL term in over 1/32 of the sample gets a bitmap row
 #define MAXQ 10           // ids printed per query
 #define WMAX 64
 #define ANCHOR (1u << 31) // table value flag: phrases are checked at this term
@@ -305,7 +305,7 @@ static void scan_part(Worker *me, int p) {
         if (d + 1 < nd) q = tokenize(skip_id(q), kn, &nn);
         u32 na = 0;
         for (u32 i = 0; i < n; i++) {
-            _mm_prefetch((const char *)&tab[bucket_of(i + 8 < n ? kc[i + 8] : kn[i + 8 - n])], _MM_HINT_T0);
+            _mm_prefetch((const char *)&tab[bucket_of(i + 8 < n ? kc[i + 8] : kn[i + 8 - n])], _MM_HINT_T0);   // 8 tokens ahead, into the next doc
             u32 v = lookup(kc[i]), id = v & ~ANCHOR, s = id - ND;
             ids[i] = id;
             db[id < ND ? id : JB] = 0x80;
@@ -593,7 +593,7 @@ static void *worker(void *arg) {
         if (pstart[p + 1] - pstart[p] > maxb) maxb = pstart[p + 1] - pstart[p];
     }
     u32 W64 = me->w64 = (maxnd + 255) / 256 * 4;   // whole 32-byte blocks for bsum
-    for (int pass = 0; pass < 2; pass++) {     // pass 0 sizes the arena, pass 1 carves it
+    for (int pass = 0; pass < 2; pass++) {     // pass 0 sizes the arena (offsets from 0), pass 1 carves it
         u8 *h = me->heap = pass ? arena(me->hsize) : NULL;
         me->bm = take(&h, ((size_t)ndense + 2) * W64 * 8);
         me->bt = take(&h, 64 * (ndense / 64 + 1) * 8); me->db = take(&h, (ndense / 64 + 2) * 64);
