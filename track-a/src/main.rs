@@ -32,7 +32,7 @@ const BLOCK: usize = 1 << 20;
 const LAG: usize = 2;
 /// Slots of the endpoint table: 8,192 stay under a quarter full (spec 2: 1,842 endpoints), so a probe nearly always
 /// ends at the first slot.
-const SLOTS: usize = 8192;
+const SLOTS: usize = 16384;
 /// A row is (endpoint id + 1) << 21 | 5xx << 20 | latency, 0 for a slot no line took; a line with a latency of ESCAPE
 /// or more (0.24 pct on seed 1) goes to its hour's long list instead, as latency << 32 | the row without the latency.
 const ESCAPE: u32 = (1 << 20) - 1;
@@ -137,6 +137,8 @@ unsafe fn ep_hash(p: *const u8, len: usize) -> u64 {
 type Name = &'static [u8];
 /// An hour's result for one endpoint: count, p50, p95, p99, errors, error_ppm (count 0: no line).
 type Cell = [u32; 6];
+/// A thread's open chunk of an hour's rows: next row, chunk end.
+type Chunk = (*mut u32, *mut u32);
 
 /// The run's shared progress, under one lock. Each thread takes, in this order: an hour that is safe to finish, else the
 /// next block, at most two per thread past the oldest unparsed one, so few rows wait; else, once the input is parsed, the
@@ -179,7 +181,7 @@ static NAMES: Mutex<(Vec<Name>, Vec<u16>)> = Mutex::new((Vec::new(), Vec::new())
 fn id(p: *const u8, len: usize) -> u32 {
     // Bit 11 set: no hash matches an empty slot. Safety: as the caller promises.
     let h = unsafe { ep_hash(p, len) } | 1 << 11;
-    let mut i = (h >> 51) as usize;
+    let mut i = (h >> 50) as usize;
     loop {
         match TABLE[i].load(Relaxed) {
             s if s >> 11 == h >> 11 => return (s & 2047) as u32 - 1,
@@ -232,7 +234,7 @@ fn hour_at(data: &[u8], p: usize) -> usize {
 /// Writes a row for every line starting in data[start..end] into its hour's region, through cur, this thread's open
 /// chunk per hour (next row, chunk end), and returns the lowest hour met. Reads may pass the input's end by up to 128
 /// bytes (main maps zeros there) and start up to 32 bytes before an endpoint, inside its line.
-fn parse(data: &[u8], (start, end): (usize, usize), cur: &mut [(*mut u32, *mut u32); HOURS]) -> usize {
+fn parse(data: &[u8], (start, end): (usize, usize), cur: &mut [Chunk; HOURS]) -> usize {
     let d = data.as_ptr();
     let (mut prev_prefix, mut p, mut h, mut low) = (u64::MAX, start, 0, HOURS);
     let mut c = cur[0]; // hour h's chunk (h starts at 0)
@@ -241,11 +243,9 @@ fn parse(data: &[u8], (start, end): (usize, usize), cur: &mut [(*mut u32, *mut u
         // 5..13 ("MM-DDTHH") name the hour, one u64 load (a-56). Two lines ahead are asked for meanwhile: the
         // prefetcher stops at each 4 KiB page (box: 18.12 -> 17.69 ms).
         // Safety: a line has at least 40 bytes; a prefetch never faults.
-        let prefix = unsafe {
-            _mm_prefetch::<_MM_HINT_T0>(d.add(p + 1280) as _);
-            _mm_prefetch::<_MM_HINT_T0>(d.add(p + 1344) as _);
-            (d.add(p + 5) as *const u64).read_unaligned()
-        };
+        unsafe { _mm_prefetch::<_MM_HINT_T0>(d.add(p + 1280) as _) };
+        unsafe { _mm_prefetch::<_MM_HINT_T0>(d.add(p + 1344) as _) };
+        let prefix = unsafe { (d.add(p + 5) as *const u64).read_unaligned() };
         if prefix != prev_prefix {
             cur[h] = c;
             h = hour_at(data, p);
@@ -253,12 +253,12 @@ fn parse(data: &[u8], (start, end): (usize, usize), cur: &mut [(*mut u32, *mut u
         }
         // Safety: the line and the 128 bytes after its start are inside the input or its zero tail.
         let (ep, len, error, latency, next) = unsafe { line(d, p) };
-        let e = id(d.wrapping_add(ep), len);
-        let row = (e + 1) << 21 | (error as u32) << 20;
+        let row = (id(d.wrapping_add(ep), len) + 1) << 21 | (error as u32) << 20;
         if latency >= ESCAPE {
             let i = LONG[h].fetch_add(1, Relaxed);
+            let top = region(h).wrapping_add(STRIDE / 4) as *mut u64;
             // Safety: the region's top holds them (STRIDE is far more than two rows per line and 8 bytes per long one).
-            unsafe { (region(h).add(STRIDE / 4) as *mut u64).sub(i + 1).write((latency as u64) << 32 | row as u64) };
+            unsafe { top.sub(i + 1).write((latency as u64) << 32 | row as u64) };
         } else {
             if c.0 == c.1 {
                 // A new chunk of CLAIM rows. A pooled region holds an older hour's bytes, and a row no line
@@ -269,10 +269,8 @@ fn parse(data: &[u8], (start, end): (usize, usize), cur: &mut [(*mut u32, *mut u
                 c = (at, at.wrapping_add(CLAIM));
             }
             // Safety: c.0 < c.1, the claimed chunk's end.
-            unsafe {
-                *c.0 = row | latency;
-                c.0 = c.0.add(1);
-            }
+            unsafe { *c.0 = row | latency };
+            c.0 = c.0.wrapping_add(1);
         }
         p = next;
     }
@@ -293,12 +291,12 @@ fn finish(h: usize, cells: *mut Cell) -> usize {
     let n = LONG[h].load(Relaxed);
     // Safety: the top n u64 of the region, written by parse.
     let long = unsafe { from_raw_parts_mut((region(h).add(STRIDE / 4) as *mut u64).sub(n), n) };
-    let mut count = [0u32; 2 * IDS]; // by (id + 1) << 1 | 5xx; a free slot counts at 0
-    let (mut low, mut high) = ([0u32; 512], [0u32; 2048]); // by latency bits 0-8, 9-19
+    // By (id + 1) << 1 | 5xx, where a free slot counts at 0, and by latency bits 0-7, 8-19.
+    let (mut count, mut low, mut high) = ([0u32; 2 * IDS], [0u32; 1 << 8], [0u32; 1 << 12]);
     for &r in rows.iter() {
         count[(r >> 20) as usize] += 1;
-        low[(r & 511) as usize] += 1;
-        high[(r >> 9 & 2047) as usize] += 1;
+        low[(r & 255) as usize] += 1;
+        high[(r >> 8 & 4095) as usize] += 1;
     }
     long.iter().for_each(|&p| count[(p as u32 >> 20) as usize] += 1);
     // By id + 1; start[0] is a trash slot past every span, where the free slots go.
@@ -311,7 +309,7 @@ fn finish(h: usize, cells: *mut Cell) -> usize {
     // Sorted by latency (values is scratch here), then dealt to the spans in that order: each span is sorted, the
     // long latencies (all ESCAPE or more) last, sorted among themselves.
     deal(rows, values, &mut low, 0);
-    deal(&values[..claimed], rows, &mut high, 9);
+    deal(&values[..claimed], rows, &mut high, 8);
     long.sort_unstable();
     let short = rows.iter().map(|&r| (r >> 21, r & ESCAPE));
     let long = long.iter().map(|&p| (p as u32 >> 21, (p >> 32) as u32));
@@ -335,7 +333,8 @@ fn finish(h: usize, cells: *mut Cell) -> usize {
             unsafe { *cells.add(h * IDS + k - 1) = cell };
             let len = unsafe { *names.add(k - 1) }.len();
             // 20 bytes of label, spaces and the LF, then a space and the digits of each number.
-            size += 22 + len + cell.iter().map(|v| (v | 1).ilog10() as usize + 2).sum::<usize>();
+            let digits = |v: &u32| (v | 1).ilog10() as usize + 2;
+            size += 22 + len + cell.iter().map(digits).sum::<usize>();
         }
     }
     size
@@ -347,20 +346,22 @@ fn text(h: usize, (offset, size): (usize, usize), out: *mut u8, cells: *mut Cell
     let (order, names) = order();
     // 20 bytes, then spaces to 32 so it can be copied whole: byte 20 stays the space after the label, and the
     // name, copied from byte 21, covers the rest.
-    let label = format!("{}T{:02}:00:00Z{:12}", DAYS[(h + 18) / 24], (h + 18) % 24, "");
+    let (day, hour) = (DAYS[(h + 18) / 24], (h + 18) % 24);
+    let label = format!("{day}T{hour:02}:00:00Z{:12}", "");
     let mut tmp = [0u8; 512];
     // finish's arrays, unused below this frame, give their pages back (MADV_DONTNEED 4).
     let below = (tmp.as_ptr() as usize & !4095) - 4096;
-    unsafe { madvise((below - (1 << 16)) as *const u8, 1 << 16, 4) };
+    unsafe { madvise((below - (1 << 17)) as *const u8, 1 << 17, 4) };
     // Safety: the output is mapped past every hour's place, the names as in finish; each copy reads only its own
     // source's bytes (label 32, name 128), and a line and its stores take at most 300 bytes.
     unsafe {
-        let (mut w, end, cells) = (out.add(offset), out.add(offset + size), cells.add(h * IDS));
+        let (mut w, end, buf) = (out.add(offset), out.add(offset + size), tmp.as_mut_ptr());
+        let cells = cells.add(h * IDS);
         for &id in &order {
             let cell = *cells.add(id as usize);
             if cell[0] > 0 {
                 let name = *names.add(id as usize);
-                let t = if w.add(300) <= end { w } else { tmp.as_mut_ptr() };
+                let t = if w.add(300) <= end { w } else { buf };
                 copy(label.as_ptr(), t, 32);
                 copy(name.as_ptr(), t.add(21), 128);
                 let e = cell.iter().fold(t.add(21 + name.len()), |e, &v| put(e, v));
@@ -517,15 +518,14 @@ extern "C" fn main() -> i32 {
     let out = map(2 * len + 4096, 3, 1, fd) as usize;
     // MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE 0x4022: only the pages touched cost memory.
     let base = map(STRIDE * HOURS, 3, 0x4022, -1) as usize;
-    POOL.lock().unwrap().extend((0..HOURS).map(|i| base + i * STRIDE));
+    let regions = (0..HOURS).map(|i| base + i * STRIDE);
+    POOL.lock().unwrap().extend(regions);
     let cells = map(HOURS * IDS * size_of::<Cell>(), 3, 0x4022, -1) as usize;
     NAMES.lock().unwrap().0.reserve(IDS);
     let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
-    let lag = if std::env::args().len() > 1 { HOURS } else { LAG };
+    let lag = [LAG, HOURS][(std::env::args().len() > 1) as usize];
     std::thread::scope(|s| {
-        for _ in 1..workers {
-            s.spawn(|| work(data, out, cells, workers, lag));
-        }
+        (1..workers).for_each(|_| drop(s.spawn(move || work(data, out, cells, workers, lag))));
         work(data, out, cells, workers, lag);
     });
     let st = STATE.lock().unwrap();
