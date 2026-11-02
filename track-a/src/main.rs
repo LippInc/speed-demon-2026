@@ -5,6 +5,8 @@
 //! in hour order and written at its offset, and the region pooled for a later hour: only a few hours' rows are alive at
 //! once. Main tricks: parse and line (a-62), the endpoint table (a-63), finish and deal (a-61), rows and endpoints in
 //! Job (a-59, a-60), the pipeline (a-55).
+// An unsafe fn runs its unsafe operations bare (its callers' Safety notes cover them); a safe fn wraps each in an
+// unsafe block with its own Safety note.
 #![allow(unsafe_op_in_unsafe_fn)]
 use std::arch::x86_64::*;
 use std::mem::{replace, take};
@@ -73,6 +75,7 @@ unsafe fn line(d: *const u8, p: usize) -> (usize, usize, u64, u32, usize) {
     let n = other.trailing_zeros() as usize / 8;
     let (latency, next) = if other == 0 {
         // 8 digits or more (spec 2: at most 10): the rest one by one.
+        // The latency starts at sp + 5 and digits8 read 8 digits, so the rest start at sp + 13.
         let (mut latency, mut q) = (digits8(v), sp + 13);
         while *d.add(q) != b'\n' {
             latency = latency * 10 + (*d.add(q) - b'0') as u64;
@@ -80,6 +83,7 @@ unsafe fn line(d: *const u8, p: usize) -> (usize, usize, u64, u32, usize) {
         }
         (latency, q + 1)
     } else {
+        // n digits from sp + 5, then the LF: the next line starts at sp + 6 + n.
         (digits8(v << (64 - 8 * n)), sp + 6 + n)
     };
     let error = (*d.add(sp + 1) == b'5') as u64;
@@ -204,7 +208,8 @@ impl Job<'_> {
         }
     }
 
-    /// A new id in slot i, under the lock, unless another thread filled it first (the probe then reads it again).
+    /// Interns an endpoint: a new id in slot i, under the lock, unless another thread filled it first (the probe then
+    /// reads it again).
     #[cold]
     fn add(&self, p: *const u8, len: usize, h: u64, i: usize) {
         let mut names = self.names.lock().unwrap();
@@ -262,7 +267,7 @@ impl Job<'_> {
     fn parse(&self, (start, end): (usize, usize), cur: &mut [Chunk; HOURS]) -> (usize, usize) {
         let d = self.data.as_ptr();
         let (mut prev_prefix, mut p, mut h, mut low, mut high) = (u64::MAX, start, 0, HOURS, 0);
-        let mut c = cur[0]; // hour h's chunk: next row, last row but one
+        let mut c = cur[0]; // hour h's chunk (h starts at 0): next row, chunk end
         while p < end {
             // Lines usually share the previous line's hour, so compare it first: spec 2's year is always 2026, so bytes
             // 5..13 ("MM-DDTHH") name the hour, one u64 load (a-56). Two lines ahead are asked for meanwhile: the
@@ -322,6 +327,7 @@ impl Job<'_> {
                 // Every block is parsed: the mapping's page-table entries are dropped in shared 4 MiB steps, so the
                 // exit has fewer to tear down (a-12: output closed -> process reaped 1.9-2.0 -> 0.8-1.3 ms).
                 let steps = self.data.chunks(4 << 20);
+                // fetch_add gives each step's index to exactly one thread, which skips to it in a fresh iterator.
                 while let Some(step) = steps.clone().nth(self.released.fetch_add(1, Relaxed)) {
                     // Safety: step lies inside the mapping, which nothing reads now; 4 is MADV_DONTNEED.
                     unsafe { madvise(step.as_ptr(), step.len(), 4) };
@@ -420,7 +426,9 @@ impl Job<'_> {
         });
 
         let (day, hour) = (DAYS[(h + 18) / 24], (h + 18) % 24);
-        let label = format!("{day}T{hour:02}:00:00Z{:12}", ""); // 32 bytes
+        // 20 bytes, then spaces to 32 so it can be copied whole: byte 20 stays the space after the label, and the
+        // name, copied from byte 21, covers the rest.
+        let label = format!("{day}T{hour:02}:00:00Z{:12}", "");
         let text = head.as_mut_ptr() as *mut u8;
         let mut w = text;
         for &id in &order {

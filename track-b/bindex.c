@@ -152,7 +152,10 @@ static inline u32 lookup(u64 k) {
     return v == PROBE ? probe(k, bucket_of(k)) : v;
 }
 
-static u32 intern(u64 k) {                     // called by all workers at once
+// Called by all workers at once while they parse: a free key slot is claimed by
+// compare-and-swap. Relaxed order is enough: no worker looks a term up before
+// the barrier after the parse.
+static u32 intern(u64 k) {
     for (u32 b = bucket_of(k);; b = (b + 1) & BMASK) {
         for (u32 i = 0; i < 5; i++) {
             u64 cur = __atomic_load_n(&tab[b].key[i], __ATOMIC_RELAXED);
@@ -305,23 +308,25 @@ static void transpose64(u64 *a) {
 // repeat of the same doc is dropped by comparing with the last.
 static void scan_part(Worker *me, int p) {
     const u32 ND = ndense, NS = nsparse, DW = ND / 64 + 1, JB = DW * 64, W64 = me->w64, first = pfirst[p], nd = pfirst[p + 1] - first;
-    u64 *bt = me->bt, *bm = me->bm, *kc = me->keys, *kn = kc + MAXTOK, *kt;
-    u32 *ids = me->ids, *aps = me->aps, *docoff = me->docoff, sl = 0, n = 0, nn = 0;
+    u64 *bt = me->bt, *bm = me->bm, *cur = me->keys, *next = cur + MAXTOK, *tmp;
+    u32 *ids = me->ids, *aps = me->aps, *docoff = me->docoff, nstream = 0, n = 0, nn = 0;
     u16 *stream = me->stream;
     u8 *db = me->db;
     const u8 *q = doc + pstart[p];
     memset(bm, 0, (size_t)ND * W64 * 8);
-    if (nd) q = tokenize(skip_id(q), kc, &n);
+    if (nd) q = tokenize(skip_id(q), cur, &n);
     for (u32 d = 0; d < nd; d++) {
-        if (d + 1 < nd) q = tokenize(skip_id(q), kn, &nn);
+        if (d + 1 < nd) q = tokenize(skip_id(q), next, &nn);
         u32 na = 0;
         for (u32 i = 0; i < n; i++) {
-            _mm_prefetch((const char *)&tab[bucket_of(i + 8 < n ? kc[i + 8] : kn[i + 8 - n])], _MM_HINT_T0);   // 8 tokens ahead, into the next doc
-            u32 v = lookup(kc[i]), id = v & ~ANCHOR, s = id - ND;
+            _mm_prefetch((const char *)&tab[bucket_of(i + 8 < n ? cur[i + 8] : next[i + 8 - n])], _MM_HINT_T0);   // 8 tokens ahead, into the next doc
+            u32 v = lookup(cur[i]), id = v & ~ANCHOR, s = id - ND;
             ids[i] = id;
             db[id < ND ? id : JB] = 0x80;
-            stream[sl] = (u16)s;
-            sl += s < NS;
+            // every token writes a slot; only a rare BOOL term keeps it, so the
+            // next kept one overwrites a skipped slot
+            stream[nstream] = (u16)s;
+            nstream += s < NS;
             aps[na] = i;
             na += v >> 31;
         }
@@ -339,14 +344,14 @@ static void scan_part(Worker *me, int p) {
                 for (u32 c = 0; c < 64 && 64 * w + c < ND; c++) bm[(size_t)(64 * w + c) * W64 + (d >> 6)] = a[c];
             }
         }
-        docoff[d + 1] = sl;
+        docoff[d + 1] = nstream;
         if (na) match_phrases(me, n, na, first + d);
-        kt = kc; kc = kn; kn = kt; n = nn;
+        tmp = cur; cur = next; next = tmp; n = nn;
     }
     u32 *off = me->off, *end = me->end;
     u16 *post = me->post;
     memset(end, 0, (size_t)NS * 4);
-    for (u32 e = 0; e < sl; e++) end[stream[e]]++;
+    for (u32 e = 0; e < nstream; e++) end[stream[e]]++;
     for (u32 s = 0, o = 0; s < NS; s++) { post[o] = 0xFFFF; off[s] = ++o; o += end[s]; end[s] = off[s]; }
     for (u32 d = 0; d < nd; d++)
         for (u32 e = docoff[d]; e < docoff[d + 1]; e++) {
@@ -374,6 +379,9 @@ static inline __m128i ld128(const void *p) { return _mm_loadu_si128((const __m12
 // 256 block + 8 byte + bit in byte: per byte a popcount and a sum of positions
 // from nibble tables, the bytes weighted by their index in the 32-byte block.
 static void bsum(const u64 *b, u32 w, u32 *cnt, u32 *sum) {
+    // PC: set bits per nibble. PS: the sum of a low nibble's set-bit positions.
+    // PH: the same for a high nibble, PS + 4 * PC (each bit sits 4 places higher).
+    // WT: each byte's index in the 32-byte block, 0-31.
     const __m256i PC = _mm256_broadcastsi128_si256(ld128("\0\1\1\2\1\2\2\3\1\2\2\3\2\3\3\4")),
                   PS = _mm256_broadcastsi128_si256(ld128("\0\0\1\1\2\2\3\3\3\3\4\4\5\5\6\6")),
                   PH = _mm256_add_epi8(PS, _mm256_slli_epi16(PC, 2)), M = _mm256_set1_epi8(15), Z = _mm256_setzero_si256(),
@@ -404,6 +412,8 @@ static u32 filt(const u16 *a, u32 an, const u16 *b, u32 bn, u16 *d, u32 keep) {
     u32 i = 0, j = 0, n = 0, acc = 0, j0 = 0;
     if (an * 16 < bn)
         for (; i < an; i++) { j += lower(b + j, bn - j, a[i]); d[n] = a[i]; n += (j < bn && b[j] == a[i]) == keep; }
+    // j0: the next b block while no match is pending, so once one is, the b block
+    // where the pending a block first matched; the tail restarts there.
     for (; i + 8 <= an && j + 8 <= bn; j0 = acc ? j0 : j) {
         __m128i A = ld128(a + i);
         u32 x = a[i + 7], y = b[j + 7];
@@ -523,6 +533,7 @@ static void finish(Worker *me, int c) {
         for (const u32 *r = rec + bd[c]; r < rec + bd[c + 1]; r += 3 + ((r[0] >> 24) + 1) / 2) {
             u32 q = (r[0] & 0xFFFFFF) - lo;
             cnt[q] += r[1];
+            // a part-local number plus the part's first id is the global id
             sum[q] += r[2] + (u64)r[1] * pfirst[p];
             for (u32 i = 0; i < r[0] >> 24 && nid[q] < MAXQ; i++) top[q * MAXQ + nid[q]++] = pfirst[p] + ((const u16 *)(r + 3))[i];
         }
@@ -639,7 +650,8 @@ static u32 id_at(const u8 *p) { u32 v = 0; while (*p >= '0' && *p <= '9') v = v 
 int main(int argc, char **argv) {
     const char *in = argc > 1 ? argv[1] : "/data", *out = argc > 2 ? argv[2] : "/out";
     cpu_set_t cs;
-    sched_getaffinity(0, sizeof cs, &cs);      // nproc counts every core; the box gives us 12
+    // workers: the hardware threads we may use (12 on the box)
+    sched_getaffinity(0, sizeof cs, &cs);
     nw = getenv("SD_WORKERS") ? atoi(getenv("SD_WORKERS")) : CPU_COUNT(&cs);
     if (nw < 1 || nw > WMAX) nw = nw < 1 ? 1 : WMAX;
     doc = map_file(in, "docs.txt", &dlen);
@@ -662,6 +674,7 @@ int main(int argc, char **argv) {
     while (t > 0 && doc[t - 1] != '\n') t--;
     ndocs = id_at(doc + t) + 1;
     P = nw * NSUB;
+    // more parts if one would pass MAXPART, a multiple of nw so each worker has ppw
     if ((u32)P < (ndocs + MAXPART - 1) / MAXPART) P = (int)(((ndocs + MAXPART - 1) / MAXPART + nw - 1) / nw * nw);
     ppw = P / nw;
     pstart = malloc((P + 1) * sizeof *pstart); pfirst = malloc((P + 1) * 4); bound = malloc((size_t)P * (nw + 1) * 4);
