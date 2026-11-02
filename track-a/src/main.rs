@@ -4,7 +4,7 @@
 //! the parsed prefix of the file reaches a line two hours later, while other threads keep parsing; only a few hours' rows
 //! are alive at once. Once the input is parsed, the text goes straight into the output's pages through a shared mapping,
 //! at each hour's offset, in parallel, as the cells go back to the kernel: 10 MB of text never sits beside the rows.
-//! Main tricks: parse and line (a-62), the endpoint table (a-63), finish and deal (a-61), late text and the holder (a-67).
+//! Main tricks: parse and line (a-62), the endpoint table (a-63), finish and deal (a-61), late text (a-67), the release at the end (a-71).
 // An unsafe fn runs its unsafe operations bare (its callers' Safety notes cover them); a safe fn wraps each in an
 // unsafe block with its own Safety note.
 #![allow(unsafe_op_in_unsafe_fn)]
@@ -16,8 +16,8 @@ use std::ptr::{copy_nonoverlapping as copy, null_mut};
 use std::slice::{from_raw_parts, from_raw_parts_mut};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::*};
 use std::sync::{LazyLock, Mutex, OnceLock};
-use std::{thread::Scope, time::Duration};
 use std::{collections::*, fs::File, process::Command};
+use std::{thread::Scope, time::Duration};
 
 // Spec 2: every timestamp lies in the same 72 hours for every seed and scale, 2026-10-30T18:00Z to 2026-11-02T17:59Z.
 const HOURS: usize = 72;
@@ -50,8 +50,6 @@ unsafe extern "C" {
     fn mallopt(param: i32, value: i32) -> i32;
     fn open(path: *const std::ffi::c_char, flags: i32, ...) -> i32;
     fn ftruncate(fd: i32, len: i64) -> i32;
-    fn pause() -> i32;
-    fn clone(run: extern "C" fn(*mut u8) -> i32, stack: *mut u8, flags: i32, arg: *mut u8) -> i32;
 }
 
 /// Byte mask of `byte` in the 32 bytes at p, one bit per byte. Safety: p..p + 32 must be readable.
@@ -150,14 +148,14 @@ type Chunk = (*mut u32, *mut u32);
 #[derive(Default)]
 struct State {
     next_block: usize,
-    parsed: BTreeSet<usize>, // parsed blocks past the watermark
-    watermark: usize,        // every block below it is parsed
-    next_hour: usize,        // every hour below it is claimed for finishing
-    late: bool,              // a block brought lines of an hour already claimed
+    parsed: BTreeSet<usize>,       // parsed blocks past the watermark
+    watermark: usize,              // every block below it is parsed
+    next_hour: usize,              // every hour below it is claimed for finishing
+    late: bool,                    // a block brought lines of an hour already claimed
     sizes: BTreeMap<usize, usize>, // finished hours waiting for the ones before them: the text's size
     places: Vec<(usize, usize)>,   // the hours placed so far: offset and size
-    next_text: usize,        // every hour below it is claimed for its text
-    front: usize,            // the hour of the first line at the watermark
+    next_text: usize,              // every hour below it is claimed for its text
+    front: usize,                  // the hour of the first line at the watermark
 }
 
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(Mutex::default);
@@ -169,6 +167,8 @@ static POOL: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 static CLAIMED: [AtomicUsize; HOURS] = [const { AtomicUsize::new(0) }; HOURS];
 /// How many lines of each hour are on its long list.
 static LONG: [AtomicUsize; HOURS] = [const { AtomicUsize::new(0) }; HOURS];
+/// How far each mapping's range has been given back at the end of the run.
+static RELEASED: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
 /// Every endpoint met so far, one table for all threads, open addressing with linear probing. A slot is the hash's top
 /// 53 bits and the id + 1 in the low 11, 0 when empty: the hash alone is an endpoint's identity, and for 1,842 of them
 /// the chance that two share those bits is about 2e-10. Slots are only filled, under the lock of NAMES, so a slot seen
@@ -310,7 +310,8 @@ fn finish(h: usize, cells: *mut Cell) -> usize {
         low[(r & 255) as usize] += 1;
         high[(r >> 8 & 4095) as usize] += 1;
     }
-    long.iter().for_each(|&p| count[(p as u32 >> 20) as usize] += 1);
+    long.iter()
+        .for_each(|&p| count[(p as u32 >> 20) as usize] += 1);
     // By id + 1; start[0] is a trash slot past every span, where the free slots go.
     let (mut start, mut sum) = ([0u32; IDS], 0);
     for k in 1..IDS {
@@ -501,14 +502,24 @@ fn work(data: &[u8], out: usize, cells: usize, workers: usize, lag: usize) {
         }
         s = STATE.lock().unwrap();
     }
-}
-
-/// A second process in this address space, doing nothing (a-67): when the run exits, the mappings outlive it, and the
-/// kernel tears them down after the process the timer waits for has gone. It dies with its parent.
-extern "C" fn holder(_: *mut u8) -> i32 {
-    // PR_SET_PDEATHSIG 1, SIGKILL 9.
-    unsafe { prctl(1, 9usize) };
-    unsafe { pause() }
+    let end = s.places.last().map_or(0, |p| p.0 + p.1);
+    drop(s);
+    // All is claimed. Left to the exit, tearing down these mappings runs on one CPU, inside the timed run (a-71), so the
+    // threads give the pages back in shared steps. A page still in use just faults in again: so the input's first 8 MiB,
+    // where the names are, go last, and the output's last 2 MiB, which may still be being written, stay.
+    let give_back = |i: usize, start: *const u8, len: usize, step: usize| {
+        while let at = RELEASED[i].fetch_add(step, Relaxed)
+            && at < len
+        {
+            // Safety: file mappings: the data stays in the files (MADV_DONTNEED 4).
+            unsafe { madvise(start.add(at), step.min(len - at), 4) };
+        }
+    };
+    const NAMES_IN: usize = 8 << 20;
+    let rest = data.len().saturating_sub(NAMES_IN);
+    give_back(0, data.as_ptr().wrapping_add(NAMES_IN), rest, NAMES_IN);
+    give_back(1, data.as_ptr(), data.len().min(NAMES_IN), NAMES_IN);
+    give_back(2, out as *const u8, end.saturating_sub(2 << 20), 1 << 20);
 }
 
 /// Thread i of a run starts threads 2i and 2i + 1: the last one is up after four spawns, not eleven.
@@ -524,9 +535,6 @@ fn go<'s, 'e>(s: &'s Scope<'s, 'e>, i: usize, job: (&'static [u8], usize, usize,
 extern "C" fn main() -> i32 {
     // One malloc arena (M_ARENA_MAX -8): the threads allocate little, and each arena costs pages.
     unsafe { mallopt(-8, 1) };
-    let mut stack = [0u8; 8192];
-    // CLONE_VM 0x100, no signal to the parent.
-    unsafe { clone(holder, stack.as_mut_ptr().add(8192), 0x100, null_mut()) };
     // No transparent huge pages (PR_SET_THP_DISABLE 41): with THP on, an hour's first row would charge 2 MiB.
     unsafe { prctl(41, 1usize, 0usize, 0usize, 0usize) };
     let map = |len, prot, flags, fd| unsafe { mmap(null_mut(), len, prot, flags, fd, 0) };
