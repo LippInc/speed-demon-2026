@@ -242,6 +242,18 @@ Experiments measured on our bench box only, with no board run (their box status 
     vectors shrunk to fit (+1 MB, +1.6 ms). Exact-size and capped pools (-3.2 MB, but +1.7-2.3 ms: freeing or
     growing a buffer unmaps while the other threads release the input). At most 2 or 3 hours finishing at once
     (+7 MB: records wait for their hour).
+- a-58 (OURS + KNOWN), kept: the finish by select, on a-57 (board: K 44.75, T 19.5 ms, M 24.1 MB, 82.54 points).
+  Records counted per endpoint, latencies copied to each endpoint's span in byte order (top bit flipped, so they
+  compare as i32), then one quickselect per span for all three ranks (KNOWN: vectorized partition, AVX2 compress by a
+  permutation table; OURS: one row serves both stores, a side with no rank is never visited, spans of 16 or fewer
+  sorted by a two-register bitonic network). Groups are small on seed 1: median 6 records, 1,762 per hour, 46 % of
+  records in groups over 256. `put` writes numbers below 10^8 with one 8-byte store. The select was first drafted by
+  GLM-5.3 and fixed by hand (a missing intrinsic, the clear lanes' table offsets, the two stores overlapping with 8
+  values left, a wrong 4-lane merge step); its test (every n to 3,000, nine value sets, nearest-rank 50/95/99) failed
+  on two planted bugs before it passed. Box, 12 workers, fresh tmpfs /out, 20 interleaved rounds:
+  `a-57 med 20.26 ms (min 18.57) | a-58 first cut med 18.51 (min 16.95) | a-58 med 17.92 (min 16.57)`, and an earlier
+  round `a-57 19.03 | first cut 18.38`. Memory peak 23.4-24.2 -> 20.4-21.4 MB (the span buffer replaces two row
+  buffers). Hash checked at 1, 4, 12 and 24 workers. S 545 -> 659 (+114 lines).
 
 ## Decisions
 
