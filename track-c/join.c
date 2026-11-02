@@ -47,6 +47,7 @@
 typedef uint64_t u64;
 typedef uint32_t u32;
 typedef uint8_t u8;
+typedef uint16_t __attribute__((may_alias)) u16a;
 typedef __m256i V;
 typedef u64 __attribute__((aligned(1), may_alias)) u64u;
 // BATCH: messages staged per owner; RING: the messages a ring holds (two
@@ -55,10 +56,11 @@ enum { NT = 12, BATCH = 128, RING = 2 * BATCH, PIECE = 1 << 17, RUN = 64 };
 enum { BUCKETS = 652, SLOTS = 16 * (BUCKETS + 4) };
 
 // One country's running totals, kept per thread: records, id sum, amount
-// sum, min and max in cents, name and note bytes once unescaped, distinct names.
-// The six additive fields come first and are summed as one array in report.
+// sum, min and max in cents, name and note bytes once unescaped (one field: the
+// file is 200 MB, so the low half can't carry), distinct names.
+// The five additive fields come first and are summed as one array in report.
 typedef struct {
-  long long n, ids, sum, nb, tb, names, min, max;
+  long long n, ids, sum, nt, names, min, max;
 } Agg;
 // What the parse loop reads out of a record: the name's hash, the id, the
 // region's table index, name and note bytes once unescaped, the amount in cents.
@@ -121,15 +123,16 @@ static inline u32 eq32(V a, V b) { // a bit per byte of a == b
 
 // Three numbers at once, each up to 8 raw bytes in the top bytes of a
 // 64-bit lane: a saturating subtract of '0' turns digits into their values
-// and every other byte (the zeros the shifts brought in, the point, the
-// sign, the comma) into 0, so the zeros below read as leading zeros. Digit
-// pairs, then quads, then octets combine in one multiply each.
+// and every other byte (the zeros the shifts brought in, the sign, the comma)
+// into 0, so the zeros below read as leading zeros. Digit pairs, then quads,
+// then octets combine in one multiply each. Lane c is an amount, "DDDDD.CC":
+// its multipliers leave the point out, and its top four digits count 1000.
 static inline V fold3(u64 a, u64 b, u64 c) {
   V x = _mm256_set_epi64x(0, c, b, a);
   x = _mm256_subs_epu8(x, ZERO);
-  x = _mm256_maddubs_epi16(x, _mm256_set1_epi16(0x010A));    // 10a + b
+  x = _mm256_maddubs_epi16(x, _mm256_set_epi64x(0, 0x010A0001010A010A, 0x010A010A010A010A, 0x010A010A010A010A)); // 10a + b
   x = _mm256_madd_epi16(x, _mm256_set1_epi32(0x00010064));   // 100a + b
-  return _mm256_add_epi64(_mm256_mul_epu32(x, _mm256_set1_epi64x(10000)),
+  return _mm256_add_epi64(_mm256_mul_epu32(x, _mm256_set_epi64x(0, 1000, 10000, 10000)),
                           _mm256_srli_epi64(x, 32));         // 10000a + b
 }
 
@@ -168,7 +171,7 @@ static inline u32 slot_of(Names *nm, const u64 *msg) {
   // share its row with the next name to take that slot.
   V tag = _mm256_broadcastd_epi32(_mm_loadu_si32((const u8 *)msg + 1));
   u32 m;
-  for (u64 b = (*msg >> 48) * BUCKETS >> 16;; b++) {
+  for (u64 b = ((const u16a *)msg)[3] * BUCKETS >> 16;; b++) {
     if (__builtin_expect((m = eq16(nm->tag + 16 * b, tag)) != 0, 1))
       return 16 * b + _tzcnt_u32(m);
     if ((m = eq16(nm->tag + 16 * b, _mm256_setzero_si256()))) {
@@ -211,12 +214,12 @@ static void regions(int t) {
   }
 }
 
-// The first record starting at or after q. Byte 0 starts the BOM and header
-// (spec 2.2), never a record, so the search starts at 1.
+// The first record starting at or after q, past its BOM if it has one. Byte 0
+// starts the BOM and header (spec 2.2), never a record, so the search starts at 1.
 static u64 record_start(u64 q) {
   for (q = q ? q : 1; q < rsize; q++)
     if (rec[q - 1] == '\n' && ((u8)(rec[q] - '0') < 10 || rec[q] == 0xEF))
-      return q;
+      return q + (rec[q] == 0xEF) * 3;
   return rsize;
 }
 
@@ -239,10 +242,10 @@ static u64 drain(int t, Agg *a) {
         _mm_prefetch((const char *)nm->row[id[j]], _MM_HINT_T0);
       }
       for (u64 j = 0; j < e - h; j++) {
-        u64 c = ms[j] & 255, bit = 1ull << (c & 63);
-        u64 *w = &nm->row[id[j]][c >> 6];
-        a[c].names += !(*w & bit);
-        *w |= bit;
+        u64 c = ms[j] & 255, *w = &nm->row[id[j]][c >> 6], x = *w;
+        // Sets the country's bit; a bit that was clear counts (9 instructions in C)
+        __asm__("btsq %2, %0; sbbq $-1, %1" : "+r"(x), "+m"(a[c].names) : "r"(c) : "cc");
+        *w = x;
       }
     }
     atomic_store_explicit(&r->head, k, memory_order_release);
@@ -290,22 +293,22 @@ static u64 note_end(const u8 *b) {
 }
 
 // Reads the record at b into *rc; returns the next record's start.
-static inline __attribute__((always_inline)) const u8 *parse(const u8 *b, const u8 *rt, Rec *rc) {
-  // A BOM: 777 among 3.32 M records; see the end of parse
-  if (__builtin_expect(*b >= 0xBB, 0)) {
-    b += *b == 0xEF ? 3 : 2;
-    __asm__(""); // stays a branch: a cmov would put this load on the way to the next record
-  }
+static inline __attribute__((always_inline)) const u8 *parse(const u8 *b, const u8 *rt, Rec *rc, u64 *open) {
   _mm_prefetch((const char *)b + 512, _MM_HINT_T0);
   _mm_prefetch((const char *)b + 576, _MM_HINT_T0);
-  u64 a = _tzcnt_u64(eq32(load32(b), _mm256_set1_epi8(','))), j, d, qn, o = 0, pq = 0; // a: the id's digits
+  u64 j, d, qn, o = 0, pq = 0;
   // The quote mask starts at w, past most ids, so that for 97% of records it
   // reaches the end of the note. j and d count from w.
   const u8 *w = b + 6;
   u64 q = quotes(load32(w), w + 32), t = _tzcnt_u64(q);
-  // A short id (0.6%) or an empty, unquoted name (0.5%): the mask's first quote
-  // is not the one that opens the name.
-  if (__builtin_expect(t != a - 5, 0)) {
+  // The name opens where it did in this cursor's last record: ids only grow
+  // (spec 2.2), so their length changes 6 times in a file and needs no search.
+  // If the mask's first quote is elsewhere, the id got longer, or is too short
+  // for the mask (0.6%), or the name is empty and unquoted (0.5%). That last
+  // one's first quote is further on than any id as long as the last can put it.
+  if (__builtin_expect(t != *open, 0)) {
+    u64 a = _tzcnt_u64(eq32(load32(b), _mm256_set1_epi8(',')));
+    t = *open = a - 5;
     u64 ne = note_end(b + a + 1), n = (u32)ne;
     j = a + 1 - 6 + n, pq = ne >> 32;
     rc->nl = n - pq / 2 - (n != 0);
@@ -317,12 +320,13 @@ static inline __attribute__((always_inline)) const u8 *parse(const u8 *b, const 
     o = _andn_u64(q, odd_quotes(_blsr_u64(q)));
     j = _tzcnt_u64(o), o = _blsr_u64(o);
     pq = _mm_popcnt_u64(_bzhi_u64(q, j));
-    rc->nl = j - t - 1 - pq / 2;
+    u64 n = j - t - 2;
+    rc->nl = n + 1 - pq / 2;
     // A name of 31 raw bytes or more is not handled; spec 2.2 sets no bound,
     // but over 40 generated seeds the longest was 27 (base name at most 24 by
     // the generator's forms, plus runs of trailing spaces that get rarer
     // about 4 times per extra byte), so about 3e-4 per dataset.
-    rc->h = name_hash(load32(b + a + 2), j - t - 2);
+    rc->h = name_hash(load32(w + t + 1), n);
   }
   if (__builtin_expect(o != 0, 1)) {
     d = _tzcnt_u64(o);
@@ -335,7 +339,7 @@ static inline __attribute__((always_inline)) const u8 *parse(const u8 *b, const 
   // loses qn / 2 + 1 bytes; an unquoted one is empty (1.5%).
   u64 len = d - j - 1;
   rc->tb = len - qn / 2 - (len != 0);
-  u64 idb = *(const u64u *)b << (64 - 8 * a);
+  u64 idb = *(const u64u *)b << (24 - 8 * t & 63); // the id in the top of the lane; it has t + 5 digits
   // The region and the amount. The commas, CRs and LFs are the bytes below '-';
   // digits, '-' and '.' are not. A BOM's first byte is too, as a signed byte.
   const u8 *r = w + d + 1;
@@ -343,19 +347,16 @@ static inline __attribute__((always_inline)) const u8 *parse(const u8 *b, const 
   u64 c = _tzcnt_u64(m);
   m = _blsr_u64(m);
   u64 e = _tzcnt_u64(m); // the comma, the end of the amount
-  // The amount: its bytes up in the top of the lane, "DDDDD.CC" with the
-  // point at byte 5; pext drops the point and the shift closes the gap.
-  u64 v = *(const u64u *)(r + c + 1) << (64 - 8 * (e - c - 1));
-  v = _pext_u64(v, 0xFFFF00FFFFFFFFFF) << 8;
+  u64 v = *(const u64u *)(r + c + 1) << (64 - 8 * (e - c - 1)); // the amount, up in the top of the lane
   V num = _mm256_min_epu32(fold3(idb, *(const u64u *)r << (64 - 8 * c), v), CAP);
   rc->id = _mm256_cvtsi256_si32(num);
   u64 rid = _mm256_extract_epi64(num, 1);
   int32_t cents = _mm256_extract_epi64(num, 2);
   _mm_prefetch((const char *)rt + rid, _MM_HINT_T0);
   rc->reg = rid, rc->cents = r[c + 1] == '-' ? -cents : cents;
-  // The next record: past the end and, if the next byte is a low one too, past
-  // that: an LF after a CR, or a BOM's first byte after an LF (parse's first test).
-  return r + e + 1 + (m >> (e + 1) & 1);
+  // The next record: past the whole run of low bytes, an LF after a CR and a
+  // BOM's three bytes (777 among 3.32 M records) too. The carry ends the run.
+  return r + _tzcnt_u64(m + _blsi_u64(m));
 }
 
 // The records from a up to m and from m up to e, a run of up to RUN at a time:
@@ -365,16 +366,16 @@ static void records(Ctx *x, const u8 *a, const u8 *m, const u8 *e) {
   const u8 *rt = mem.rtab, *b = m;
   Agg *ag = x->agg;
   Rec *rs = x->rec;
-  u64 n;
+  u64 n, oa = -1, ob = -1;
   while (a < m || b < e) {
     for (n = 0; n < RUN && ((a - m) & (b - e)) < 0; n += 2) { // a < m, b < e
-      a = parse(a, rt, rs + n);
-      b = parse(b, rt, rs + n + 1);
+      a = parse(a, rt, rs + n, &oa);
+      b = parse(b, rt, rs + n + 1, &ob);
     }
     for (; n < RUN && a < m; n++)
-      a = parse(a, rt, rs + n);
+      a = parse(a, rt, rs + n, &oa);
     for (; n < RUN && b < e; n++)
-      b = parse(b, rt, rs + n);
+      b = parse(b, rt, rs + n, &ob);
     for (u64 r = 0; r < n; r++) {
       u64 co = rt[rs[r].reg], h = rs[r].h;
       Agg *g = ag + co;
@@ -386,8 +387,7 @@ static void records(Ctx *x, const u8 *a, const u8 *m, const u8 *e) {
         g->min = cents;
       if (cents > g->max)
         g->max = cents;
-      g->nb += rs[r].nl;
-      g->tb += rs[r].tb;
+      g->nt += *(const u64u *)&rs[r].nl; // nl and tb: name bytes in the low half, note bytes in the high half
       u64 o = (h & 255) * NT >> 8; // the name's owner: the hash's low byte, which the message does not carry
       u32 w = x->fill[o];
       x->batch[w++] = (h & ~255ull) | co;
@@ -444,16 +444,16 @@ static void money(FILE *o, long long v) { // cents as -?D+.DD
 static void report(FILE *o, const char *code, int c) {
   Agg g = mem.agg[0][c];
   for (int t = 1; t < NT; t++) {
-    const long long *a = (long long *)&mem.agg[t][c]; // the six additive fields
-    for (int i = 0; i < 6; i++)
+    const long long *a = (long long *)&mem.agg[t][c]; // the five additive fields
+    for (int i = 0; i < 5; i++)
       ((long long *)&g)[i] += a[i];
-    g.min = a[6] < g.min ? a[6] : g.min;
-    g.max = a[7] > g.max ? a[7] : g.max;
+    g.min = a[5] < g.min ? a[5] : g.min;
+    g.max = a[6] > g.max ? a[6] : g.max;
   }
   if (!g.n) return;
   fprintf(o, "%s %lld %lld", code, g.n, g.ids);
   money(o, g.sum), money(o, g.min), money(o, g.max);
-  fprintf(o, " %lld %lld %lld\n", g.names, g.nb, g.tb);
+  fprintf(o, " %lld %lld %lld\n", g.names, g.nt & UINT32_MAX, g.nt >> 32);
 }
 
 // Reads one byte per 2 MB up to the last byte, to fault the page-table pages in.
