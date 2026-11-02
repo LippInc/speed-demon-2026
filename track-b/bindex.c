@@ -76,7 +76,7 @@ static const u8 *doc, *qtxt;
 static size_t dlen, qlen, qs[WMAX + 1], *pstart;
 static u32 ndocs, nq, ndense, nsparse, nterms, qcount[WMAX], qbase[WMAX + 1], *pfirst;
 static u8 *qkind, *qk, *qop, bflag[NSLOT];     // query q: terms at qterm[8q..], op before term i at qop[8q+i]
-static u32 *qterm, *sdfs, *sampdf, *newid, *aoff, *aq, *aj;
+static u32 *qterm, *sdfs, *sampdf, *newid, *aoff, *aq, *aj, *an;
 static size_t sdfsize;
 static u64 *bm;                                // the phase's bitmap rows, W64 words each
 static u32 *off, *end, W64, bclaim[256], qclaim[256];   // a list term's list: post[off[s] .. end[s])
@@ -270,8 +270,9 @@ static void match_phrases(Worker *me, u32 n, u32 na, u32 gid) {
     for (u32 a = 0; a < na; a++) {
         u32 pos = me->aps[a], t = ids[pos];
         for (u32 e = aoff[t]; e < aoff[t + 1]; e++) {
-            u32 q = aq[e], j = aj[e], k = qk[q], x = 0;
-            if (j > pos || pos - j + k > n) continue;
+            u32 j = aj[e] & 255, k = aj[e] >> 8, side = j + 1 < k ? pos + 1 : pos - 1;
+            if (j > pos || pos - j + k > n || ids[side] != an[e]) continue;
+            u32 q = aq[e], x = 0;
             const u32 *qt = qterm + 8 * q, *dt = ids + pos - j;
             while (x < k && dt[x] == qt[x]) x++;
             if (x < k) continue;
@@ -509,6 +510,17 @@ static void eval_range(Worker *me, u32 lo, u32 hi, u32 first) {
             }
             const u16 *xl = post + off[x - ND];
             u32 xn = end[x - ND] - off[x - ND];
+            if (!rb && o == OR && i + 1 == qk[q] && tally[q].nid == MAXQ) {
+                // last term of the query and we already hold 10 ids: only the union count and sum are needed
+                u32 cn = filt(rl, rn, xl, xn, dl, 1), cs = 0;
+                for (u32 k = 0; k < rn; k++) cs += rl[k];
+                for (u32 k = 0; k < cn; k++) cs -= dl[k];
+                for (u32 k = 0; k < xn; k++) cs += xl[k];
+                Tally *t = &tally[q];
+                cn = rn + xn - cn;
+                t->cnt += cn; t->sum += cs + (u64)cn * first;
+                goto next_query;
+            }
             if (!rb) {
                 rn = o == OR ? unite(rl, rn, xl, xn, dl) : filt(rl, rn, xl, xn, dl, o == AND);
                 rl = dl;
@@ -523,6 +535,7 @@ static void eval_range(Worker *me, u32 lo, u32 hi, u32 first) {
             }
         }
         emit(q, first, rb, rl, rn);
+next_query: ;
     }
 }
 
@@ -604,7 +617,12 @@ static void *worker(void *arg) {
     if (!w) for (u32 i = 1; i <= nterms; i++) aoff[i] += aoff[i - 1];
     pthread_barrier_wait(&bar);
     for (u32 q = base; q < base + n; q++)
-        if (qkind[q]) { u32 e = __atomic_sub_fetch(&aoff[anchor_of(q, &pos)], 1, __ATOMIC_RELAXED); aq[e] = q; aj[e] = pos; }
+        if (qkind[q]) {
+            u32 e = __atomic_sub_fetch(&aoff[anchor_of(q, &pos)], 1, __ATOMIC_RELAXED);
+            aq[e] = q; aj[e] = pos | qk[q] << 8;
+            const u32 *t = qterm + 8 * q;          // still slot numbers here
+            an[e] = newid[t[pos + 1 < qk[q] ? pos + 1 : pos - 1]];
+        }
     pthread_barrier_wait(&bar);
     for (u32 s = lo; s < hi; s++)
         if (tab[s >> 3].tag[s & 7]) { u32 v = newid[s]; tab[s >> 3].val[s & 7] = v | (aoff[v + 1] > aoff[v] ? ANCHOR : 0); }
@@ -677,7 +695,7 @@ int main(int argc, char **argv) {
     for (u32 L = 0; L <= 16; L++) memset(LM[L], 0xFF, L);
     sdfs = huge(sdfsize = (size_t)(nw + 2) * NSLOT * 4);   // each worker's sample counts, their sums, the new ids
     sampdf = sdfs + (size_t)nw * NSLOT; newid = sampdf + NSLOT;
-    aoff = arena((size_t)NSLOT * 4 + 4); aq = arena(maxq * 4); aj = arena(maxq * 4);
+    aoff = arena((size_t)NSLOT * 4 + 4); aq = arena(maxq * 4); aj = arena(maxq * 4); an = arena(maxq * 4);
     qterm = arena(maxq * 32); qop = arena(maxq * 8); qk = arena(maxq); qkind = arena(maxq);
     size_t t = dlen - 1;
     while (t > 0 && doc[t - 1] != '\n') t--;
