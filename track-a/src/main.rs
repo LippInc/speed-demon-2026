@@ -20,6 +20,8 @@ const HOURS: usize = 72;
 const DAYS: [&str; 4] = ["2026-10-30", "2026-10-31", "2026-11-01", "2026-11-02"];
 // Spec 2: exactly 1,842 distinct endpoints per seed, and 2,047 ids at most fit their 11 bits (insert asserts it).
 const IDS: usize = 2048;
+const ID_BITS: u32 = IDS.ilog2();
+const ID_MASK: u64 = IDS as u64 - 1;
 // 1 MiB: two blocks share a 2 MiB page table, so at most two threads fault in its pages under its lock at once (with 256 KiB
 // blocks, eight threads did; that lock took 16-18 pct of the kernel's cycles, box 16.29 -> 15.42 ms, a-64).
 const BLOCK: usize = 1 << 20;
@@ -47,6 +49,8 @@ unsafe extern "C" {
     fn open(path: *const std::ffi::c_char, flags: i32, ...) -> i32;
     fn ftruncate(fd: i32, len: i64) -> i32;
 }
+/// madvise's advice: the pages go back to the kernel; file mappings keep their data in the file.
+const MADV_DONTNEED: i32 = 4;
 
 /// Byte mask of `byte` in the 32 bytes at p, one bit per byte. Safety: p..p + 32 must be readable.
 unsafe fn mask32(p: *const u8, byte: u8) -> u32 {
@@ -85,8 +89,8 @@ unsafe fn line(d: *const u8, p: usize) -> (usize, usize, u32, usize) {
     // After the xor a byte is a digit exactly when it is below 10; adding 0x76 sets the top bit of every other one.
     let other = (digits.wrapping_add(0x7676_7676_7676_7676) | digits) & 0x8080_8080_8080_8080;
     let n = other.trailing_zeros() as usize / 8;
-    // n digits from end + 5, then the LF; with no other byte in the load n is 8, and any rest (spec 2: at most 10 digits)
-    // comes one by one.
+    // n digits from end + 5, then the LF; with no other byte in the load n is 8, and any rest comes one by one (spec 2: an
+    // unsigned 32-bit value, so at most 10 digits, and the u32 below holds it).
     let mut latency = digits8(digits << (64 - 8 * n));
     let mut q = end + 5 + n;
     while n == 8 && *d.add(q) != b'\n' {
@@ -123,6 +127,12 @@ unsafe fn ep_hash(p: *const u8, len: usize) -> u64 {
 
 /// An hour's result for one endpoint: count, p50, p95, p99, errors, error_ppm (count 0: no line).
 type Cell = [u32; 6];
+/// A thread's open chunk of CLAIM rows in an hour's region: the next free row and the chunk's end.
+#[derive(Clone, Copy)]
+struct Chunk {
+    at: *mut u32,
+    end: *mut u32,
+}
 
 /// The run's shared progress, under one lock. Each thread takes, in this order: an hour that is safe to finish, else the
 /// next block, at most two per thread past the oldest unparsed one, so few rows wait; else, once the input is parsed, the
@@ -145,7 +155,7 @@ struct State {
 
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(Mutex::default);
 /// Every hour's region of rows, from a pool filled at the start: an hour's region goes back when it is finished and a
-/// later hour takes it, pages already faulted in (a fresh region per hour cost 7.8K page faults, a-59).
+/// later hour takes it, pages already faulted in (a fresh region per hour cost 7.8K more page faults, 6.1K -> 13.9K, a-59).
 static REGIONS: [OnceLock<usize>; HOURS] = [const { OnceLock::new() }; HOURS];
 static POOL: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 /// Threads claim CLAIM rows at a time, so a row needs no atomic.
@@ -174,18 +184,18 @@ fn insert(i: usize, h: u64, p: *const u8, len: usize) {
         assert!(names.0.len() + 1 < IDS);
         // Safety: the endpoint is the len bytes at p, in the input's mapping, which is never unmapped.
         names.0.push(unsafe { from_raw_parts(p, len) });
-        TABLE[i].store(h >> 11 << 11 | names.0.len() as u64, Relaxed);
+        TABLE[i].store(h & !ID_MASK | names.0.len() as u64, Relaxed);
     }
 }
 
 /// The id of the len-byte endpoint at p, a new one the first time it is met; p - 32..p + 128 must be readable.
 fn id(p: *const u8, len: usize) -> u32 {
-    // Bit 11 set: no hash matches an empty slot. Safety: as the caller promises.
-    let h = unsafe { ep_hash(p, len) } | 1 << 11;
+    // That bit set: no hash matches an empty slot. Safety: as the caller promises.
+    let h = unsafe { ep_hash(p, len) } | 1 << ID_BITS;
     let mut i = (h >> 50) as usize;
     loop {
         match TABLE[i].load(Relaxed) {
-            s if s >> 11 == h >> 11 => return (s & 2047) as u32 - 1,
+            s if s >> ID_BITS == h >> ID_BITS => return (s & ID_MASK) as u32 - 1,
             0 => insert(i, h, p, len),
             _ => i = (i + 1) % SLOTS,
         }
@@ -204,6 +214,7 @@ fn order() -> (Vec<u16>, *const &'static [u8]) {
     (order.clone(), names.as_ptr())
 }
 
+/// Hour h's region: the first to ask takes one from the pool (72 regions for 72 hours, so it never runs out).
 fn region(h: usize) -> *mut u32 {
     *REGIONS[h].get_or_init(|| POOL.lock().unwrap().pop().unwrap()) as *mut u32
 }
@@ -212,8 +223,11 @@ fn region(h: usize) -> *mut u32 {
 /// last line ends with an LF); 0 for block 0.
 fn align(data: &[u8], b: usize) -> usize {
     let n = (b * BLOCK).min(data.len());
-    let lf = data[n.saturating_sub(1)..].iter().position(|&c| c == b'\n');
-    lf.map_or(data.len(), |o| n + o) * (n > 0) as usize
+    if n == 0 {
+        return 0;
+    }
+    let lf = data[n - 1..].iter().position(|&c| c == b'\n');
+    lf.map_or(data.len(), |o| n + o)
 }
 
 /// The hour of the line at p: hours since 2026-10-30T18, from "YYYY-MM-DDTHH" (spec 2: the window crosses two midnights
@@ -226,9 +240,9 @@ fn hour_at(data: &[u8], p: usize) -> usize {
 }
 
 /// Writes a row for every line starting in data[start..end] into its hour's region, through cur, this thread's open
-/// chunk per hour (next row, chunk end), and returns the lowest hour met. Reads may pass the input's end by up to 128
+/// chunk per hour, and returns the lowest hour met. Reads may pass the input's end by up to 128
 /// bytes (main maps zeros there) and start up to 32 bytes before an endpoint, inside its line.
-fn parse(data: &[u8], start: usize, end: usize, cur: &mut [(*mut u32, *mut u32); HOURS]) -> usize {
+fn parse(data: &[u8], start: usize, end: usize, cur: &mut [Chunk; HOURS]) -> usize {
     let d = data.as_ptr();
     let (mut prev_prefix, mut p, mut h, mut low) = (u64::MAX, start, 0, HOURS);
     let mut chunk = cur[0]; // hour h's chunk (h starts at 0)
@@ -256,17 +270,18 @@ fn parse(data: &[u8], start: usize, end: usize, cur: &mut [(*mut u32, *mut u32);
             // Safety: the region's top holds them (STRIDE is far more than two rows per line and 8 bytes per long one).
             unsafe { top.sub(i + 1).write((latency as u64) << 32 | row as u64) };
         } else {
-            if chunk.0 == chunk.1 {
+            if chunk.at == chunk.end {
                 // A new chunk of CLAIM rows. A pooled region holds an older hour's bytes, and a row no line
                 // takes must read 0, so the chunk is zeroed first.
                 let at = region(h).wrapping_add(CLAIMED[h].fetch_add(CLAIM, Relaxed));
                 // Safety: the chunk lies inside the region (STRIDE holds two rows per line and a chunk per thread).
                 unsafe { at.write_bytes(0, CLAIM) };
-                chunk = (at, at.wrapping_add(CLAIM));
+                let end = at.wrapping_add(CLAIM);
+                chunk = Chunk { at, end };
             }
-            // Safety: chunk.0 < chunk.1, the claimed chunk's end.
-            unsafe { *chunk.0 = row | latency };
-            chunk.0 = chunk.0.wrapping_add(1);
+            // Safety: chunk.at < chunk.end.
+            unsafe { *chunk.at = row | latency };
+            chunk.at = chunk.at.wrapping_add(1);
         }
         p = next;
     }
@@ -287,7 +302,7 @@ fn finish(h: usize, cells: *mut Cell) -> usize {
     let n = LONG[h].load(Relaxed);
     // Safety: the top n u64 of the region, written by parse.
     let long = unsafe { from_raw_parts_mut((region(h).add(STRIDE / 4) as *mut u64).sub(n), n) };
-    // By (id + 1) << 1 | 5xx, where a free slot counts at 0, and by latency bits 0-7, 8-19.
+    // Counts by (id + 1) << 1 | 5xx, where a free slot counts at 0, then by latency bits 0-7 (256 entries) and 8-19 (4,096).
     let (mut count, mut low, mut high) = ([0u32; 2 * IDS], [0u32; 1 << 8], [0u32; 1 << 12]);
     for &r in rows.iter() {
         count[(r >> 20) as usize] += 1;
@@ -330,8 +345,8 @@ fn finish(h: usize, cells: *mut Cell) -> usize {
             unsafe { *cells.add(h * IDS + k - 1) = cell };
             let len = unsafe { *names.add(k - 1) }.len();
             // 20 bytes of label, spaces and the LF, then a space and the digits of each number.
-            let digits = |v: &u32| (v | 1).ilog10() as usize + 2;
-            size += 22 + len + cell.iter().map(digits).sum::<usize>();
+            let width = |v: &u32| (v | 1).ilog10() as usize + 2;
+            size += 22 + len + cell.iter().map(width).sum::<usize>();
         }
     }
     size
@@ -344,13 +359,14 @@ fn text(h: usize, (offset, size): (usize, usize), out: *mut u8, cells: *mut Cell
     // 20 bytes, then spaces to 32 so it can be copied whole: byte 20 stays the space after the label, and the
     // name, copied from byte 21, covers the rest.
     let (day, hour) = (DAYS[(h + 18) / 24], (h + 18) % 24);
-    let label = format!("{day}T{hour:02}:00:00Z{:12}", "");
+    let label = format!("{day}T{hour:02}:00:00Z            ");
     let mut tmp = [0u8; 512];
-    // finish's arrays give their pages back (MADV_DONTNEED 4): finish and text are called from the same frame in work, and
+    // finish's arrays give their pages back: finish and text are called from the same frame in work, and
     // finish is not inlined, so its arrays (about 49 KiB) lie in the 128 KiB below this frame. If they did not, only the peak
-    // would suffer: nothing in that range is in use.
+    // would suffer: nothing in that range is in use (tmp is this frame's only array, so the frame ends within the page below
+    // tmp, and text calls nothing while the range goes).
     let below = (tmp.as_ptr() as usize & !4095) - 4096;
-    unsafe { madvise((below - (1 << 17)) as *const u8, 1 << 17, 4) };
+    unsafe { madvise((below - (1 << 17)) as *const u8, 1 << 17, MADV_DONTNEED) };
     // Safety: the output is mapped past every hour's place, the names as in finish; each copy reads only its own
     // source's bytes (label 32, name 128), and a line and its stores take at most 300 bytes.
     unsafe {
@@ -372,7 +388,7 @@ fn text(h: usize, (offset, size): (usize, usize), out: *mut u8, cells: *mut Cell
                 w = w.add(len);
             }
         }
-        madvise(cells as *const u8, IDS * size_of::<Cell>(), 4);
+        madvise(cells as *const u8, IDS * size_of::<Cell>(), MADV_DONTNEED);
     }
 }
 
@@ -423,7 +439,8 @@ fn deal<const N: usize>(src: &[u32], dst: &mut [u32], hist: &mut [u32; N], shift
 /// One of the run's threads; out and cells are the output's and the cells' mappings, as addresses.
 fn work(data: &[u8], out: usize, cells: usize, workers: usize, lag: usize) {
     let nblocks = data.len().div_ceil(BLOCK);
-    let mut cur = [(std::ptr::null_mut(), std::ptr::null_mut()); HOURS];
+    let (at, end) = (std::ptr::null_mut(), std::ptr::null_mut());
+    let mut cur = [Chunk { at, end }; HOURS];
     let mut idle = 0;
     let mut s = STATE.lock().unwrap();
     while !s.late && s.next_text < HOURS {
@@ -436,20 +453,23 @@ fn work(data: &[u8], out: usize, cells: usize, workers: usize, lag: usize) {
             s = STATE.lock().unwrap();
             let st = &mut *s;
             st.sizes.insert(h, size);
+            // places.len() is the next hour to place; a size for it means every hour before it is placed.
             while let Some(size) = st.sizes.remove(&st.places.len()) {
                 let at = st.places.last().map_or(0, |p| p.0 + p.1);
                 st.places.push((at, size));
             }
-            // The region goes back. Once the input is parsed no hour takes one, so the pages go back to the kernel
-            // (MADV_DONTNEED 4), before the text's pages come; the thread that parsed the last block empties the pool.
+            // The region goes back. Once the input is parsed no hour takes one, so the pages go back to the kernel,
+            // before the text's pages come; the thread that parsed the last block empties the pool.
             let r = region(h) as *const u8;
             let parsed = st.watermark == nblocks;
             if !parsed {
                 POOL.lock().unwrap().push(r as usize);
             }
             drop(s);
-            // Safety: nothing reads the region now.
-            unsafe { madvise(r, STRIDE * parsed as usize, 4) };
+            if parsed {
+                // Safety: nothing reads the region now.
+                unsafe { madvise(r, STRIDE, MADV_DONTNEED) };
+            }
         } else if s.next_block < nblocks && s.next_block < s.watermark + 2 * workers {
             let b = s.next_block;
             s.next_block += 1;
@@ -466,9 +486,11 @@ fn work(data: &[u8], out: usize, cells: usize, workers: usize, lag: usize) {
             }
             let all = st.watermark == nblocks;
             drop(s);
-            for &r in POOL.lock().unwrap().iter().filter(|_| all) {
-                // Safety: nothing reads a pooled region.
-                unsafe { madvise(r as *const u8, STRIDE, 4) };
+            if all {
+                for &r in POOL.lock().unwrap().iter() {
+                    // Safety: nothing reads a pooled region.
+                    unsafe { madvise(r as *const u8, STRIDE, MADV_DONTNEED) };
+                }
             }
         } else if parsed && s.next_text < s.places.len() {
             let h = s.next_text;
@@ -492,11 +514,11 @@ fn work(data: &[u8], out: usize, cells: usize, workers: usize, lag: usize) {
     // threads give the pages back in shared steps. A page still in use just faults in again: so the input's first 8 MiB,
     // where the names are, go last, and the output's last 2 MiB, which may still be being written, stay.
     let give_back = |i: usize, start: *const u8, len: usize, step: usize| {
-        while let at = RELEASED[i].fetch_add(step, Relaxed)
-            && at < len
-        {
-            // Safety: file mappings: the data stays in the files (MADV_DONTNEED 4).
-            unsafe { madvise(start.add(at), step.min(len - at), 4) };
+        let mut at = RELEASED[i].fetch_add(step, Relaxed);
+        while at < len {
+            // Safety: file mappings: the data stays in the files.
+            unsafe { madvise(start.add(at), step.min(len - at), MADV_DONTNEED) };
+            at = RELEASED[i].fetch_add(step, Relaxed);
         }
     };
     let (start, len, step) = (data.as_ptr(), data.len(), 8 << 20);
@@ -544,13 +566,15 @@ extern "C" fn main() -> i32 {
     NAMES.lock().unwrap().0.reserve(IDS);
     let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
     // The redo below runs with an argument: no hour is finished early.
-    let lag = [LAG, HOURS][(std::env::args().len() > 1) as usize];
+    let redo = std::env::args().len() > 1;
+    let lag = if redo { HOURS } else { LAG };
     std::thread::scope(|s| go(s, 1, (data, out, cells, workers, lag)));
     let st = STATE.lock().unwrap();
     if st.late {
         // A line came after its hour was finished. Nothing is written yet: again, with no hour finished before every
         // block is parsed, so the output is exact for any line order. exec returns only if it failed.
-        panic!("{}", Command::new("/proc/self/exe").arg("redo").exec());
+        let exec_failed = Command::new("/proc/self/exe").arg("redo").exec();
+        panic!("cannot start the run again: {exec_failed}");
     }
     let last = st.places[HOURS - 1];
     unsafe { ftruncate(fd, (last.0 + last.1) as i64) };
