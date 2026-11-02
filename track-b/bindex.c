@@ -128,15 +128,12 @@ typedef struct { _Alignas(64) u32 tag[8], val[8]; } Bucket;
 static Bucket *tab;                            // on one huge page: lookups take no TLB misses
 #define BMASK ((1u << BBITS) - 1)
 
-static u64 KM[17][2];                    // KM[L]: masks of the first L bytes, as two words; filled in main
-static inline u64 ld64(const u8 *p) { u64 x; memcpy(&x, p, 8); return x; }
-#define LOWER 0x2020202020202020ull
+static _Alignas(16) u8 LM[17][16];       // LM[L]: the first L bytes 0xFF; filled in main
 static inline u64 hash_at(const u8 *p, u32 L) {
-    const u64 *m = KM[L < 16 ? L : 16];
-    u64 k = ((ld64(p) | LOWER) & m[0]) ^ ((ld64(p + 8) | LOWER) & m[1]) * 0x9E3779B97F4A7C15ull;
-    if (L > 16) k ^= (ld64(p + 16) | LOWER) * 0xC2B2AE3D27D4EB4Full & (~0ull >> (64 - 8 * (L - 16)));
-    k *= 0xD6E8FEB86659FD93ull;
-    return (k ^ k >> 32) | 1;   // never 0: tag 0 is an empty slot
+    __m128i x = _mm_and_si128(_mm_or_si128(ld128(p), _mm_set1_epi8(32)), _mm_load_si128((const __m128i *)LM[L < 16 ? L : 16]));
+    if (L > 16) x = _mm_xor_si128(x, _mm_slli_epi64(_mm_and_si128(_mm_or_si128(ld128(p + 16), _mm_set1_epi8(32)), _mm_load_si128((const __m128i *)LM[L - 16])), 3));
+    unsigned long long hi, lo = _mulx_u64((u64)_mm_cvtsi128_si64(x) ^ 0x9E3779B97F4A7C15ull, (u64)_mm_extract_epi64(x, 1) ^ 0xD6E8FEB86659FD93ull, &hi);
+    return (hi ^ lo) | 1;   // never 0: tag 0 is an empty slot
 }
 
 static u32 probe(u64 h, u32 b) {               // the tag may sit in a later bucket
@@ -704,7 +701,7 @@ int main(int argc, char **argv) {
     size_t maxq = qlen / 7 + 1;                // the shortest query line is `BOOL a` + LF
     tab = huge(sizeof(Bucket) << BBITS);
     for (u32 b = 0; b <= BMASK; b++) tab[b].val[7] = MISS;
-    for (u32 L = 0; L <= 16; L++) memset(KM[L], 0xFF, L);
+    for (u32 L = 0; L <= 16; L++) memset(LM[L], 0xFF, L);
     sdfs = huge(sdfsize = (size_t)(nw + 8) * NSLOT);   // each worker's sample counts, their sums, the new ids
     sampdf = (u32 *)(sdfs + (size_t)nw * NSLOT); newid = sampdf + NSLOT;
     aoff = arena((size_t)NSLOT * 4 + 4); aq = arena(maxq * 4); aj = arena(maxq * 4); an = arena(maxq * 4);
