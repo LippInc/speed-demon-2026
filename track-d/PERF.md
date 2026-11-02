@@ -215,4 +215,4 @@ Unexplained: the parse phase sits near 7.1 or near 7.95 ms for a whole set of ro
 
 The big-weight table was 54 % full on D and 53 % on D-fresh (17,788 and 17,292 of 32,768 slots), and it is reached by linear probing, so other seeds have room. Only 0.7 % of edges cross a slice in the reverse build.
 
-Official harness on box 1 for this code: D T 0.0612 s, M 59.90 MB, S 787, K 38.24; D-fresh T 0.0625 s, M 60.03 MB, K 37.84.
+Official harness on box 1 for this code: D T 0.0606 s, M 59.69 MB, S 787, K 38.48; D-fresh T 0.0629 s, M 59.92 MB, K 37.73. 600 repeat runs, 300 on each dataset, with exit code and output hash checked: no failure.

@@ -2,15 +2,29 @@
 
 The task, the input files and the exact output format are in the [spec](https://github.com/hackathon-raptors/speed-demon-2026/blob/main/specs/d-traverse.md).
 
-One C file, `traverse.c`, built by gcc 15 for x86-64-v3 and linked statically. No dependencies. Measurements and every failed try: `PERF.md`.
+## For the judges, in one minute
 
-Reproduce from the repository root:
+- **The claim:** exact answers to 2,000 directed shortest-path queries on a road-like graph of 1.74 M nodes and 5 M edges, the whole process from start to exit, in about 62 ms on 12 threads and 60 MB. The reference takes 72.69 s and 893 MB.
+- **The result:** board run run-7d9634c6a75e (commit 3d9eece): T 64.3 ms, M 60.4 MB, S 781, D 1, K 37.30. One board run moves by about 3 %.
+- **Reproduce** from the repository root: `python3 check.py d --data data/d --expected a23dbdf0a3e49cc8901310a9ee1dc6a9a569a85297b6da75c2a7002cb2ed277e` (full seed 1; the expected hash is `specs/d-traverse.md:203`).
+- **The limits:** built for this generator's shape and scale. Node ids must stay below 1,835,008, because the top values of a row's fourth slot mark a spill. Parse cells have room for the expected fill plus 8 standard deviations with no bounds check, so the edge lines must be shuffled, as the generator does. Apart from a missing file (exit code 3), malformed input is not checked.
+- **The code:** one file, [traverse.c](traverse.c), C17 with no dependencies, formatted with clang-format's defaults, so the lines you read are the lines S counts. Its top comment gives the design, and each function's comment says why it is shaped the way it is.
+- **S** is the board's count of code lines after clang-format, plus 6 for the Dockerfile; comments and blank lines do not count.
+- **Where each criterion's evidence is:**
+  - Code quality: `traverse.c`'s header and function comments.
+  - Technique: the table below, each technique linked to its line.
+  - Optimisation log: [PERF.md](PERF.md), every step with its board run, failed tries included. The rewrite in C has its own sections at the end (d-40 to d-42).
 
-```
-python3 check.py d --data data/d --expected a23dbdf0a3e49cc8901310a9ee1dc6a9a569a85297b6da75c2a7002cb2ed277e
-```
-
-(full seed 1; the expected hash is `specs/d-traverse.md:203`.)
+| Technique | Where |
+|---|---|
+| Road contraction in the same pass that orders the nodes: an edge into a node with no real choice walks on to the next node that has one, and the walks of a batch step together so their cache misses overlap | [`grow_zone`](traverse.c#L509), [`road_step`](traverse.c#L475) |
+| The three numbers of a line converted at once in one vector register, from separator positions flattened per run of blocks | [`read_line`](traverse.c#L233), [`parse_piece`](traverse.c#L257) |
+| First rows written over bins already read, each round going as far as that allows, so the phase faults no new memory | [`build_bucket`](traverse.c#L372), [the rounds](traverse.c#L1089) |
+| Unlocked claims: a lost race lists a node twice, and the extra copy is a row no edge leads to | [`claim`](traverse.c#L452) |
+| Reverse rows zone by zone: the few edges that cross wait in a list, and the running sum goes by zones too | [`rev_count_job`](traverse.c#L644), [`rev_sum_job`](traverse.c#L680) |
+| 16-bit labels in blocks handed out in order, with a 64-bit redo for an answer that does not fit | [`new_block`](traverse.c#L790), [`wide_search`](traverse.c#L910) |
+| One pass over a bucket only writes what improved to a list; the pushes and the other side's label read run after the pass, on that list alone | [`drain`](traverse.c#L833) |
+| A source with no in-edges is its lightest first edge plus a normal search, so its heavy first edges do not push it to the 64-bit search | [`search`](traverse.c#L955) |
 
 ## How it works
 

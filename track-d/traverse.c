@@ -147,10 +147,10 @@ static void heavy_put(u32 kind, u64 index, u64 value) {
 }
 
 // Read side; reached only for an edge whose weight field holds the WMAX
-// sentinel, so the common edge never pays a table lookup. The probe ends because
-// every key is put in an earlier phase than the one that reads it: raw weights
-// in the rows, zone edges in the zones, forward rows in the rename, and reverse
-// rows before the queries.
+// sentinel, so the common edge never pays a table lookup. The probe ends
+// because every key is put in an earlier phase than the one that reads it: raw
+// weights in the rows, zone edges in the zones, forward rows in the rename, and
+// reverse rows before the queries.
 static u64 heavy_get(u32 kind, u64 index) {
   u64 key = (u64)kind << 48 | index, i = heavy_slot(key);
   while (heavy_table[i].key != key)
