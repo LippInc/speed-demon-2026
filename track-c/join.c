@@ -33,6 +33,10 @@
 //     almost twice as long in the Rust version, and in C (v50) 23.00 ms
 //     against 20.35 (PERF.md): lookups missed the core's own cache. The
 //     owner's table needs no atomic instruction.
+//  6. All thread memory lies on three huge pages at a fixed address (see Mem),
+//     faulted in by main and one helper before parsing starts. At the end
+//     each thread drops its share of the file's mapping, so exit has next to
+//     nothing left to tear down.
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <immintrin.h>
@@ -40,6 +44,7 @@
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -53,6 +58,9 @@ typedef u64 __attribute__((aligned(1), may_alias)) u64u;
 // BATCH: messages staged per owner; RING: the messages a ring holds (two
 // batches); PIECE: bytes per piece of records.csv; RUN: records per parse loop.
 enum { NT = 12, BATCH = 128, RING = 2 * BATCH, PIECE = 1 << 17, RUN = 64 };
+// BUCKETS: as many as three huge pages hold, 10,496 slots for each owner's
+// ~8,400 names; 590 buckets cost 0.38 ms more (PERF.md). The 4 extra let a walk
+// run past the last bucket.
 enum { BUCKETS = 652, SLOTS = 16 * (BUCKETS + 4) };
 
 // One country's running totals, kept per thread: records, id sum, amount
@@ -60,63 +68,81 @@ enum { BUCKETS = 652, SLOTS = 16 * (BUCKETS + 4) };
 // file is 200 MB, so the low half can't carry), distinct names.
 // The five additive fields come first and are summed as one array in report.
 typedef struct {
-  long long n, ids, sum, nt, names, min, max;
+  long long n, ids, sum, text_bytes, names, min, max;
 } Agg;
 // What the parse loop reads out of a record: the name's hash, the id, the
-// region's table index, name and note bytes once unescaped, the amount in cents.
+// region's table index, name and note bytes once unescaped, the amount in
+// cents.
 typedef struct {
   u64 h;
-  u32 id, reg, nl, tb, cents;
+  u32 id, reg, name_bytes, note_bytes, cents;
 } Rec;
 typedef struct { // a thread's outgoing messages, totals and parsed records
-  _Alignas(64) u64 batch[NT * BATCH]; // owner o's next messages: from o * BATCH up to fill[o]
+  // Owner o's next messages: from o * BATCH up to fill[o]
+  _Alignas(64) u64 batch[NT * BATCH];
   Rec rec[RUN];
-  u32 fill[NT], t;
+  u32 fill[NT], t; // t: this thread's number
   Agg *agg;
 } Ctx;
-typedef struct { // one owner's names; slot i of tag and row i belong to one name
+// One owner's names; slot i of tag and row i belong to one name.
+typedef struct {
   _Alignas(64) u32 tag[SLOTS]; // 0 = free; 16 per bucket, a cache line
-  u64 row[SLOTS][4];           // a bit per country
+  u64 row[SLOTS][4];           // a bit per country number
 } Names;
 
-static u64 rsize, regsize; // file sizes
+static u64 rsize, regsize;  // file sizes
 static const u8 *rec, *reg; // records.csv and regions.csv, mapped
 typedef struct { // the messages from one thread to one owner, RING at most
   _Alignas(64) _Atomic u64 tail; // advanced by the sender
   _Alignas(64) _Atomic u64 head; // advanced by the owner
   _Alignas(64) u64 m[RING];      // message i is m[i % RING]
 } Ring;
-// Not const: the compiler rebuilds a constant it can see with three instructions
-// per use, and the hot loop has no register free to keep one (2 % of all instructions).
+// Not const: the compiler rebuilds a constant it can see with three
+// instructions per use, and the hot loop has no register free to keep one (2 %
+// of all instructions).
 #define ALL(x) {x, x, x, x}
-V QUOTE = ALL(0x2222222222222222), DASH = ALL(0x2D2D2D2D2D2D2D2D), ZERO = ALL(0x3030303030303030);
-// A region id above the table: its last entry, unmatched
+V QUOTE = ALL(0x2222222222222222), DASH = ALL(0x2D2D2D2D2D2D2D2D),
+  ZERO = ALL(0x3030303030303030);
+// Caps fold3's lane 1, the region id: an id above the table reads its last
+// entry, unmatched
 V CAP = {-1, 1000001, -1, -1};
 static const u8 KEEP[64] = {[0 ... 31] = 0xFF}; // KEEP + 32 - n: n bytes kept
 
 // All memory the threads use, on three transparent huge pages that main and
-// one helper fault in before parsing starts, so no other thread ever page-faults
-// on anonymous memory. A fixed address: an aligned static object would put the
-// small variables around it on two more huge pages. It lies past the first GB
-// above the program, where the kernel starts the heap at random, and with it
-// main's thread pointer: at 1 << 30 this map erased those in 0.5 % of runs (PERF.md).
+// one helper fault in before parsing starts, so no other thread ever
+// page-faults on anonymous memory. A fixed address: an aligned static object
+// would put the small variables around it on two more huge pages. It lies past
+// the first GB above the program, where the kernel starts the heap at random,
+// and with it main's thread pointer: at 1 << 30 this map erased those in 0.5 %
+// of runs (PERF.md).
 typedef struct {
   Ring ring[NT][NT];
+  // A country number fits a byte: spec 2.3 has 240 countries, and 0 is
+  // unmatched
   _Alignas(64) Agg agg[NT][256];
   Ctx ctx[NT];
-  u8 rtab[1000002]; // id -> country, 0 = unmatched; spec 2.3: ids stop at 999,999; the last entry: any id above
+  // Region id -> country number. Spec 2.3: ids stop at 999,999; the last entry
+  // stands for any id above.
+  u8 rtab[1000002];
   _Atomic u8 cidx[26 * 26 * 26]; // country code -> country number
   int ncountry;
-  atomic_flag cmu; // zero bytes: clear
-  atomic_int finished, ready; // ready: arrivals at the two meeting points
+  atomic_flag cmu;                // zero bytes: clear
+  atomic_int finished, ready;     // ready: arrivals, see meet
   _Alignas(64) _Atomic u64 piece; // the next piece of records.csv to parse
-  _Alignas(64) u8 stack[NT][1 << 12]; // the worker threads' stacks; they use at most 640 bytes
+  // The worker threads' stacks; they use at most 640 bytes
+  _Alignas(64) u8 stack[NT][1 << 12];
   Names names[NT]; // the rest of Mem fits the first huge page
 } Mem;
 _Static_assert(sizeof(Mem) <= 3 << 21, "three huge pages");
 #define mem (*(Mem *)(3ull << 29))
 
 static void die(const char *what) { perror(what), exit(1); }
+static void *map(void *at, u64 n, int prot, int flags, int fd) {
+  void *p = mmap(at, n, prot, flags, fd, 0);
+  if (p == MAP_FAILED)
+    die("mmap");
+  return p;
+}
 static inline V load32(const u8 *p) { return _mm256_loadu_si256((const V *)p); }
 static inline u32 eq32(V a, V b) { // a bit per byte of a == b
   return _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b));
@@ -132,10 +158,11 @@ static inline V fold3(u64 a, u64 b, u64 c) {
   V x = _mm256_set_epi64x(0, c, b, a);
   x = _mm256_subs_epu8(x, ZERO);
   long long d = 0x010A010A010A010A;
-  x = _mm256_maddubs_epi16(x, _mm256_set_epi64x(0, 0x010A0001010A010A, d, d)); // 10a + b
-  x = _mm256_madd_epi16(x, _mm256_set1_epi32(0x00010064));   // 100a + b
+  x = _mm256_maddubs_epi16(
+      x, _mm256_set_epi64x(0, 0x010A0001010A010A, d, d));  // 10a + b
+  x = _mm256_madd_epi16(x, _mm256_set1_epi32(0x00010064)); // 100a + b
   V y = _mm256_mul_epu32(x, _mm256_set_epi64x(0, 1000, 10000, 10000));
-  return _mm256_add_epi64(y, _mm256_srli_epi64(x, 32));      // 10000a + b
+  return _mm256_add_epi64(y, _mm256_srli_epi64(x, 32)); // 10000a + b
 }
 
 // A bit per quote byte of 64 bytes: the first 32 in v, then those at p
@@ -152,7 +179,8 @@ static inline u64 quotes(V v, const u8 *p) {
 // v's first n bytes are the name
 static inline u64 name_hash(V v, u64 n) {
   v = _mm256_and_si256(v, load32(KEEP + 32 - n));
-  __m128i h = _mm_aesenc_si128(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
+  __m128i h = _mm_aesenc_si128(_mm256_castsi256_si128(v),
+                               _mm256_extracti128_si256(v, 1));
   return _mm_cvtsi128_si64(_mm_aesenc_si128(_mm_aesenc_si128(h, K1), K2));
 }
 
@@ -200,8 +228,8 @@ static int country(const u8 *p) { // numbers countries in order of first sight
 }
 
 // The lines that start in this thread's tenth of regions.csv (thread 1's first
-// line, the header, starts at 0 and is skipped). Threads 0, main, and 11 have
-// none: they are still faulting memory in.
+// line, the header, starts at 0 and is skipped). Main (thread 0) and the helper
+// (thread 11) have none: they are faulting memory in.
 static void regions(int t) {
   u64 p = t > 1 ? regsize * (t - 1) / (NT - 2) : 1, e = regsize * t / (NT - 2);
   while (p < e && reg[p - 1] != '\n')
@@ -216,7 +244,8 @@ static void regions(int t) {
 }
 
 // The first record starting at or after q, past its BOM if it has one. Byte 0
-// starts the BOM and header (spec 2.2), never a record, so the search starts at 1.
+// starts the BOM and header (spec 2.2), never a record, so the search starts
+// at 1.
 static u64 record_start(u64 q) {
   for (q = q ? q : 1; q < rsize; q++)
     if (rec[q - 1] == '\n' && ((u8)(rec[q] - '0') < 10 || rec[q] == 0xEF))
@@ -245,8 +274,12 @@ static u64 drain(int t, Agg *a) {
       }
       for (u64 j = 0; j < e - h; j++) {
         u64 c = ms[j] & 255, *w = &nm->row[id[j]][c >> 6], x = *w;
-        // Sets the country's bit; a bit that was clear counts (9 instructions in C)
-        __asm__("btsq %2, %0; sbbq $-1, %1" : "+r"(x), "+m"(a[c].names) : "r"(c) : "cc");
+        // Sets the country's bit; a bit that was clear counts (9 instructions
+        // in C)
+        __asm__("btsq %2, %0; sbbq $-1, %1"
+                : "+r"(x), "+m"(a[c].names)
+                : "r"(c)
+                : "cc");
         *w = x;
       }
     }
@@ -255,7 +288,9 @@ static u64 drain(int t, Agg *a) {
   return done;
 }
 
-// Waits until n arrivals in all have reached the meeting points.
+// Waits until n arrivals in all have reached the meeting points. The count only
+// grows: all 12 threads arrive at NT and again at 2 * NT, then the 11 others
+// (after they unmap) and main at 3 * NT.
 static void meet(int n) {
   atomic_fetch_add(&mem.ready, 1);
   for (int w = 0; mem.ready < n;)
@@ -278,42 +313,51 @@ static void post(Ctx *x, int o) {
 
 // A bit per byte that follows an odd number of the quotes q, or is one
 static inline u64 odd_quotes(u64 q) {
-  return _mm_cvtsi128_si64(_mm_clmulepi64_si128(_mm_cvtsi64_si128(q), _mm_set1_epi8(-1), 0));
+  return _mm_cvtsi128_si64(
+      _mm_clmulepi64_si128(_mm_cvtsi64_si128(q), _mm_set1_epi8(-1), 0));
 }
 
-// The comma after the note at b, of any length, or empty and unquoted: its
-// offset in the low half, the note's quotes in the high half.
+// The comma after the field at b, a name or a note of any length, quoted or
+// empty and unquoted: its offset in the low half, the field's quotes in the
+// high half.
 static u64 note_end(const u8 *b) {
   u64 p = 0, n = 0;
   for (u64 i = 0;; i += 64) {
-    u64 q = quotes(load32(b + i), b + i + 32), odd = odd_quotes(q) ^ p, o = ~(odd | q);
+    u64 q = quotes(load32(b + i), b + i + 32), odd = odd_quotes(q) ^ p,
+        o = ~(odd | q);
     if (o)
-      return i + _tzcnt_u64(o) | (n + _mm_popcnt_u64(_bzhi_u64(q, _tzcnt_u64(o)))) << 32;
+      return i + _tzcnt_u64(o) |
+             (n + _mm_popcnt_u64(_bzhi_u64(q, _tzcnt_u64(o)))) << 32;
     n += _mm_popcnt_u64(q);
     p = -(odd >> 63);
   }
 }
 
 // Reads the record at b into *rc; returns the next record's start.
-static inline __attribute__((always_inline)) const u8 *parse(const u8 *b, const u8 *rt, Rec *rc, u64 *open) {
+static inline __attribute__((always_inline)) const u8 *
+parse(const u8 *b, const u8 *rt, Rec *rc, u64 *open) {
   _mm_prefetch((const char *)b + 512, _MM_HINT_T0);
   _mm_prefetch((const char *)b + 576, _MM_HINT_T0);
+  // j, d: the commas after the name and the note. pq, qn: the quotes of the
+  // name and the note. o: quote-mask bits that are commas outside quotes.
   u64 j, d, qn, o = 0, pq = 0;
-  // The quote mask starts at w, past most ids, so that for 97% of records it
-  // reaches the end of the note. j and d count from w.
+  // The quote mask q starts at w, past most ids, so that for 97% of records it
+  // reaches the end of the note. j, d and t count from w; t is the first quote.
   const u8 *w = b + 6;
   u64 q = quotes(load32(w), w + 32), t = _tzcnt_u64(q);
   // The name opens where it did in this cursor's last record: ids only grow
   // (spec 2.2), so their length changes 6 times in a file and needs no search.
   // If the mask's first quote is elsewhere, the id got longer, or is too short
   // for the mask (0.6%), or the name is empty and unquoted (0.5%). That last
-  // one's first quote is further on than any id as long as the last can put it.
+  // one's first quote is the note's, a byte past where the name's would be, and
+  // ids never shrink, so it can't match *open either.
   if (__builtin_expect(t != *open, 0)) {
+    // a: the id's comma. A name's opening quote follows it: a - 5 from w.
     u64 a = _tzcnt_u64(eq32(load32(b), _mm256_set1_epi8(',')));
     t = *open = a - 5;
     u64 ne = note_end(b + a + 1), n = (u32)ne;
     j = a + 1 - 6 + n, pq = ne >> 32;
-    rc->nl = n - pq / 2 - (n != 0);
+    rc->name_bytes = n - pq / 2 - (n != 0);
     rc->h = name_hash(load32(b + a + 2), n ? n - 2 : 0);
   } else {
     // Past the opening quote, the commas after the name and after the note
@@ -323,7 +367,7 @@ static inline __attribute__((always_inline)) const u8 *parse(const u8 *b, const 
     j = _tzcnt_u64(o), o = _blsr_u64(o);
     pq = _mm_popcnt_u64(_bzhi_u64(q, j));
     u64 n = j - t - 2;
-    rc->nl = n + 1 - pq / 2;
+    rc->name_bytes = n + 1 - pq / 2;
     // A name of 31 raw bytes or more is not handled; spec 2.2 sets no bound,
     // but over 40 generated seeds the longest was 27 (base name at most 24 by
     // the generator's forms, plus runs of trailing spaces that get rarer
@@ -340,7 +384,7 @@ static inline __attribute__((always_inline)) const u8 *parse(const u8 *b, const 
   // A quoted note holds qn quotes, its two delimiters and two per "", and
   // loses qn / 2 + 1 bytes; an unquoted one is empty (1.5%).
   u64 len = d - j - 1;
-  rc->tb = len - qn / 2 - (len != 0);
+  rc->note_bytes = len - qn / 2 - (len != 0);
   // The id in the top of the lane; it has t + 5 digits
   u64 idb = *(const u64u *)b << (24 - 8 * t & 63);
   // The region and the amount. The commas, CRs and LFs are the bytes below '-';
@@ -391,8 +435,10 @@ static void records(Ctx *x, const u8 *a, const u8 *m, const u8 *e) {
         g->min = cents;
       if (cents > g->max)
         g->max = cents;
-      g->nt += *(const u64u *)&rs[r].nl; // nl and tb: name bytes in the low half, note bytes in the high half
-      u64 o = (h & 255) * NT >> 8; // the name's owner: the hash's low byte, which the message does not carry
+      // Name bytes in the low half, note bytes in the high half
+      g->text_bytes += *(const u64u *)&rs[r].name_bytes;
+      // The name's owner: the hash's low byte, which the message does not carry
+      u64 o = (h & 255) * NT >> 8;
       u32 w = x->fill[o];
       x->batch[w++] = (h & ~255ull) | co;
       x->fill[o] = w;
@@ -402,12 +448,16 @@ static void records(Ctx *x, const u8 *a, const u8 *m, const u8 *e) {
   }
 }
 
-// Reads one byte per 2 MB up to the last byte, to fault the page-table pages in.
+// Reads one byte per 2 MB up to the last byte, to fault the page-table pages
+// in.
 static void touch(const u8 *p, u64 n) {
   for (u64 i = 0; i < n + (1 << 21) - 1; i += 1 << 21)
     (void)((volatile const u8 *)p)[i < n ? i : n - 1];
 }
 
+// One thread's whole run, main's too as thread 0: its start-up part, the first
+// meeting, pieces until none are left, the last messages, the second meeting,
+// the unmapping.
 static int worker(void *arg) {
   int t = (int)(intptr_t)arg;
   Ctx *x = &mem.ctx[t];
@@ -416,18 +466,21 @@ static int worker(void *arg) {
     x->fill[o] = o * BATCH;
   for (int c = 0; c < 256; c++)
     mem.agg[t][c] = (Agg){.min = INT64_MAX, .max = INT64_MIN};
-  if (t == NT - 1) { // the helper; main does the same with the other huge page and the rest
+  // The helper; main does the same with the other huge page and the rest
+  if (t == NT - 1) {
     ((volatile u8 *)&mem)[2 << 21] = 0;
     touch(rec + rsize * 3 / 8, rsize - rsize * 3 / 8);
   } else
     regions(t);
   meet(NT); // the region table is complete
   // Piece i is the (i / n)th of the 2 MB stretch i % n: threads working at
-  // once never share a stretch's page-table lock when they fault pages in.
+  // once never share a stretch's page-table lock when they fault pages in. A
+  // stretch holds 16 pieces.
   u64 n = (rsize >> 21) + 1;
   for (u64 i; (i = atomic_fetch_add(&mem.piece, 1)) < 16 * n;) {
     u64 c = i % n * (1 << 21) + i / n * PIECE;
-    records(x, rec + record_start(c), rec + record_start(c + PIECE / 2), rec + record_start(c + PIECE));
+    records(x, rec + record_start(c), rec + record_start(c + PIECE / 2),
+            rec + record_start(c + PIECE));
     drain(t, x->agg);
   }
   for (int o = 0; o < NT; o++) // the partial batches
@@ -465,36 +518,40 @@ static void report(FILE *o, const char *code, int c) {
     g.min = a[5] < g.min ? a[5] : g.min;
     g.max = a[6] > g.max ? a[6] : g.max;
   }
-  if (!g.n) return;
+  if (!g.n)
+    return;
   fprintf(o, "%s %lld %lld", code, g.n, g.ids);
   money(o, g.sum), money(o, g.min), money(o, g.max);
-  fprintf(o, " %lld %lld %lld\n", g.names, g.nt & UINT32_MAX, g.nt >> 32);
+  fprintf(o, " %lld %lld %lld\n", g.names, g.text_bytes & UINT32_MAX,
+          g.text_bytes >> 32);
 }
 
 int main(void) {
   int rfd = open("/data/records.csv", O_RDONLY);
   int gfd = open("/data/regions.csv", O_RDONLY);
-  if (rfd < 0 || gfd < 0) die("/data");
+  if (rfd < 0 || gfd < 0)
+    die("/data");
   rsize = lseek(rfd, 0, SEEK_END), regsize = lseek(gfd, 0, SEEK_END);
   // records.csv is mapped over the start of a zeroed reservation one page
   // longer, so the vector loads that run past its end read zeros.
-  // A failed map crashes at the first touch, which fails the run just as loudly.
   int anon = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
-  rec = mmap(0, rsize + 4096, PROT_READ, anon, -1, 0);
-  mmap((u8 *)rec, rsize, PROT_READ, MAP_PRIVATE | MAP_FIXED, rfd, 0);
-  reg = mmap(0, regsize, PROT_READ, MAP_PRIVATE, gfd, 0);
-  mmap(&mem, 3 << 21, PROT_READ | PROT_WRITE, anon | MAP_FIXED, -1, 0);
+  rec = map(0, rsize + 4096, PROT_READ, anon, -1);
+  map((u8 *)rec, rsize, PROT_READ, MAP_PRIVATE | MAP_FIXED, rfd);
+  reg = map(0, regsize, PROT_READ, MAP_PRIVATE, gfd);
+  map(&mem, 3 << 21, PROT_READ | PROT_WRITE, anon | MAP_FIXED, -1);
   madvise(&mem, 3 << 21, MADV_HUGEPAGE);
   // Only main and one helper fault memory in, here and at the top of worker: a
-  // thread on another CPU that charges even one page to the cgroup counts 256 KB
-  // against the peak (a per-CPU charge batch). Reading one byte per 2 MB of each
-  // file faults its page-table pages in, and those use up the helper's batch.
+  // thread on another CPU that charges even one page to the cgroup counts 256
+  // KB against the peak (a per-CPU charge batch). Reading one byte per 2 MB of
+  // each file faults its page-table pages in, and those use up the helper's
+  // batch.
   *(volatile u8 *)&mem = 0;
   touch(reg, regsize);
   // Plain threads: they share main's thread-local block and use nothing of it
   // but errno, and take no memory for a TLS block or a thread descriptor.
   int fl = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
-  // The helper first: it starts ahead of main, so it takes 5/8 of the file
+  // The helper first: it starts ahead of main, so it takes 5/8 of the file. A
+  // stack grows down, so thread t's starts at the end of stack[t].
   for (long t = NT - 1; t > 0; t--)
     if (clone(worker, mem.stack[t + 1], fl, (void *)t) < 0)
       die("clone");
@@ -504,12 +561,14 @@ int main(void) {
   touch(rec, rsize * 3 / 8);
   worker(0);
   FILE *o = fopen("/out/aggregates.txt", "w");
-  if (!o) die("/out/aggregates.txt");
+  if (!o)
+    die("/out/aggregates.txt");
   for (int k = 0, c; k < 26 * 26 * 26; k++) // in code order
     if ((c = mem.cidx[k]))
       report(o, (char[]){'A' + k / 676, 'A' + k / 26 % 26, 'A' + k % 26, 0}, c);
   report(o, "_UNMATCHED", 0); // "_" sorts after every code
-  if (fclose(o)) die("/out/aggregates.txt");
+  if (fclose(o))
+    die("/out/aggregates.txt");
   meet(3 * NT); // every other thread is done with its part of the mapping
   return 0;
 }
