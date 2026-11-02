@@ -3,7 +3,6 @@
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <immintrin.h>
-#include <pthread.h>
 #include <sched.h>
 #include <stdint.h>
 #include <string.h>
@@ -17,7 +16,6 @@ typedef uint64_t u64;
 typedef u64 __attribute__((aligned(1), may_alias)) u64u;
 typedef unsigned __int128 u128;
 
-#define LOAD(x) __atomic_load_n(x, __ATOMIC_RELAXED)
 #define BUMP(x, by) __atomic_fetch_add(x, by, __ATOMIC_RELAXED)
 #define UNLIKELY(c) __builtin_expect(!!(c), 0)
 #define INLINE static inline __attribute__((always_inline))
@@ -40,14 +38,13 @@ static void rest(u32 *spins) {
     sched_yield();
 }
 
-static void *worker_main(void *arg) {
+static int worker_main(void *arg) {
   for (u32 seen = 0, spins = 0;; seen++) {
     while (__atomic_load_n(&phase_no, __ATOMIC_ACQUIRE) == seen)
       rest(&spins);
     phase_fn((int)(intptr_t)arg);
     __atomic_fetch_sub(&phase_left, 1, __ATOMIC_RELEASE);
   }
-  return 0;
 }
 
 static void all_workers(void (*fn)(int)) {
@@ -74,7 +71,6 @@ static void *small_region(size_t bytes) { return (void *)BUMP(&small_top, (bytes
 static u8 *touch_from;
 static u32 touch_next, touch_count;
 static void touch_job(int t) {
-  (void)t;
   for (u32 i; (i = BUMP(&touch_next, 1)) < touch_count;)
     *(volatile u8 *)(touch_from + i * PAGE2M) = 0;
 }
@@ -113,7 +109,7 @@ static u64 heavy_get(u32 kind, u64 index) {
 
 // ---- input
 
-enum { PIECES = 48, REC = 6, ROUND = 12 };
+enum { PIECES = 48, REC = 6 };
 enum { BUCKET_BITS = 13, BUCKET_NODES = 1 << BUCKET_BITS };
 #define ALL_ONES 0xFFFFFFFFu
 #define SPILLED 0xE0000000u // a row's fourth slot at or above this indexes the spill area (node ids stay below)
@@ -129,7 +125,9 @@ static size_t cell_bytes;
 static u8 *bins;
 static u32 *cell_fill;
 static InputEdge *rare_edges;
-static u32 rare_count, piece_next;
+static u32 rare_count, piece_next, query_count, *ends;
+static u8 *state; // one byte per node: a shared line is read once for all three flags, and can be prefetched
+enum { LEAF = 1, TAKEN = 2, QUERIED = 4 };
 
 static const u8 *map_file(const char *path, size_t *len) {
   int fd = open(path, O_RDONLY);
@@ -176,6 +174,7 @@ static void parse_piece(int p, u8 **cursor) {
   u32 sp[64 * 32 + 32];
   int have = 1;
   sp[0] = ALL_ONES; // the separator before the first line, at offset -1
+  u32 piece_bytes = z - a;
   for (u32 b = 0; b < buckets; b++)
     cursor[b] = bins + b * cell_bytes * PIECES + p * cell_bytes;
   __m256i zero_char = _mm256_set1_epi8('0');
@@ -190,11 +189,8 @@ static void parse_piece(int p, u8 **cursor) {
           o[i + k] = base + (u32)_tzcnt_u64(mask);
       have += c;
     }
-    if (block >= z)
-      while (have > 1 && sp[have - 1] >= (u32)(z - a))
-        have--;
     int i = 0;
-    for (; i + 3 < have; i += 3) {
+    for (; i + 3 < have && sp[i] + 1 < piece_bytes; i += 3) {
       u32 e[3];
       read_line(a, sp + i, e);
       if (UNLIKELY(e[2] >= 16383)) {
@@ -216,8 +212,11 @@ static void parse_piece(int p, u8 **cursor) {
     madvise((void *)lo, hi - lo, MADV_DONTNEED);
 }
 
+INLINE u32 ends_cut(int t) { return 2 * query_count * t / workers; }
+
 static void parse_job(int t) {
-  (void)t;
+  for (u32 i = ends_cut(t); i < ends_cut(t + 1); i++)
+    state[ends[i]] = QUERIED;
   u8 *cursor[buckets];
   for (int p; (p = BUMP(&piece_next, 1)) < PIECES;)
     parse_piece(p, cursor);
@@ -227,19 +226,15 @@ static void parse_job(int t) {
 
 static u32 *rows, *spill;
 static u32 spill_top = 1, round_next, round_end;
-static u8 *state; // one byte per node: a shared line is read once for all three flags, and can be prefetched
-enum { LEAF = 1, TAKEN = 2, QUERIED = 4 };
 
 typedef struct {
   u8 fill[BUCKET_NODES];
   u32 next[BUCKET_NODES];
   u32 extra_low[1 << 16], extra_edge[1 << 16];
 } RowWork;
-static RowWork **row_work;
+static RowWork *row_work;
 
 INLINE void add_input_edge(u32 first, u32 *r, RowWork *k, int *extras, u32 low, u32 v, u32 w) {
-  if (UNLIKELY(v == first + low))
-    return;
   u32 f = k->fill[low]++, e = v << 11 | (w < WMAX ? w : WMAX);
   if (UNLIKELY(w >= WMAX))
     heavy_put(RAW_KIND, (u64)(first + low) << 8 | f, w);
@@ -281,14 +276,14 @@ static void build_bucket(u32 b, RowWork *k) {
 
 static void rows_job(int t) {
   for (u32 b; (b = BUMP(&round_next, 1)) < round_end;)
-    build_bucket(b, row_work[t]);
+    build_bucket(b, &row_work[t]);
 }
 
 // ---- zones: each worker grows a breadth-first zone over the first rows. A step through a node with no real
 // choice (out-degree at most 2, not a query endpoint) does not stop: the edge continues along the road to the
 // next node with a choice, so contraction, ordering and gathering are one pass.
 
-enum { FRONT_BATCH = 8, WALKS_MAX = 2048 };
+enum { FRONT_BATCH = 16 };
 #define DEAD ALL_ONES
 
 typedef struct __attribute__((aligned(64))) {
@@ -296,7 +291,8 @@ typedef struct __attribute__((aligned(64))) {
   u8 *degree;
   u32 nodes, edge_count, batch_first;
   u64 *long_edge;
-  u32 id_base, edge_base;
+  u32 id_base, edge_base, rev_base, rev_total;
+  u32 *cross_tail, *cross_edge, cross_count;
 } Zone;
 
 typedef struct {
@@ -305,6 +301,7 @@ typedef struct {
 } Road;
 
 static Zone *zones;
+static u32 seed_next;
 
 // No atomics: a locked operation on these shared lines was 40 % of this phase. Two workers that race for a node
 // both list it; heads all get the id written last, the other copy is a row no edge leads to, and is harmless.
@@ -417,12 +414,13 @@ static void grow_zone(Zone *z, u32 seed, Road *roads) {
 
 static void zones_job(int t) {
   Zone *z = &zones[t];
-  Road *roads = small_region(WALKS_MAX * sizeof(Road));
-  z->long_edge = small_region(WALKS_MAX * sizeof(u64));
+  Road *roads = small_region(m * sizeof(Road));
+  z->long_edge = small_region(m * sizeof(u64));
   z->order = small_region(n * 4ul), z->edges = small_region(m * 4ul), z->degree = small_region(n);
-  for (u32 x = (u64)n * t / workers, end = (u64)n * (t + 1) / workers; x < end; x++)
-    if (!(state[x] & (LEAF | TAKEN)))
-      grow_zone(z, x, roads);
+  for (u32 c; (c = BUMP(&seed_next, 4096)) < n;)
+    for (u32 x = c, end = c + 4096 < n ? c + 4096 : n; x < end; x++)
+      if (!(state[x] & (LEAF | TAKEN)))
+        grow_zone(z, x, roads);
 }
 
 // ---- final graph: rows of head << 11 | weight, in the new ids.
@@ -432,11 +430,15 @@ static u32 *new_id, *fwd_off, *fwd_adj, *rev_off, *rev_adj;
 
 static void ids_job(int t) {
   const Zone *z = &zones[t];
-  for (u32 i = 0; i < z->nodes; i++)
+  for (u32 i = 0; i < z->nodes; i++) {
+    fetch(&new_id[z->order[i + 16]]);
     new_id[z->order[i]] = z->id_base + i;
+  }
 }
 
 static void rename_job(int t) {
+  for (u32 i = ends_cut(t); i < ends_cut(t + 1); i++)
+    ends[i] = new_id[ends[i]];
   const Zone *z = &zones[t];
   u32 pos = 0, at = z->edge_base, id = z->id_base;
   for (u32 i = 0; i < z->nodes; i++, id++) {
@@ -453,34 +455,41 @@ static void rename_job(int t) {
 
 // The reverse rows come from the forward rows, slice by slice of ids: edges into a worker's own slice need no
 // atomics, and the few that cross slices wait in a list and are applied with atomics afterwards.
-typedef struct __attribute__((aligned(64))) {
-  u32 *tail, *edge, count;
-} Crossing;
-static Crossing *crossings;
-
-static void slice(int t, u32 *lo, u32 *hi) {
-  *lo = (u64)new_n * t / workers, *hi = (u64)new_n * (t + 1) / workers;
-}
-
 static void rev_count_job(int t) {
-  u32 lo, hi;
-  slice(t, &lo, &hi);
-  Crossing *c = &crossings[t];
-  c->tail = small_region(new_m * 4ul), c->edge = small_region(new_m * 4ul);
+  u32 lo = zones[t].id_base, hi = lo + zones[t].nodes;
+  Zone *c = &zones[t];
+  c->cross_tail = small_region(new_m * 4ul);
+  c->cross_edge = small_region(new_m * 4ul);
+  memset(rev_off + lo + 2, 0, (hi - lo) * 4ul);
   for (u32 u = lo; u < hi; u++)
     for (u32 i = fwd_off[u], end = fwd_off[u + 1]; i < end; i++) {
       u32 h = fwd_adj[i] >> 11;
       if (h - lo < hi - lo)
         rev_off[h + 2]++;
       else
-        c->tail[c->count] = u, c->edge[c->count++] = i;
+        c->cross_tail[c->cross_count] = u, c->cross_edge[c->cross_count++] = i;
     }
 }
 
 static void rev_cross_count_job(int t) {
-  const Crossing *c = &crossings[t];
-  for (u32 i = 0; i < c->count; i++)
-    BUMP(&rev_off[(fwd_adj[c->edge[i]] >> 11) + 2], 1);
+  const Zone *c = &zones[t];
+  for (u32 i = 0; i < c->cross_count; i++)
+    BUMP(&rev_off[(fwd_adj[c->cross_edge[i]] >> 11) + 2], 1);
+}
+
+static void rev_total_job(int t) {
+  Zone *z = &zones[t];
+  u32 total = 0;
+  for (u32 i = z->id_base + 2, end = i + z->nodes; i < end; i++)
+    total += rev_off[i];
+  z->rev_total = total;
+}
+
+static void rev_sum_job(int t) {
+  const Zone *z = &zones[t];
+  u32 sum = z->rev_base;
+  for (u32 i = z->id_base + 2, end = i + z->nodes; i < end; i++)
+    rev_off[i] = sum += rev_off[i];
 }
 
 INLINE void rev_put(u32 slot, u32 u, u32 i) {
@@ -491,8 +500,7 @@ INLINE void rev_put(u32 slot, u32 u, u32 i) {
 }
 
 static void rev_place_job(int t) {
-  u32 lo, hi;
-  slice(t, &lo, &hi);
+  u32 lo = zones[t].id_base, hi = lo + zones[t].nodes;
   for (u32 u = lo; u < hi; u++)
     for (u32 i = fwd_off[u], end = fwd_off[u + 1]; i < end; i++) {
       u32 h = fwd_adj[i] >> 11;
@@ -502,9 +510,11 @@ static void rev_place_job(int t) {
 }
 
 static void rev_cross_place_job(int t) {
-  const Crossing *c = &crossings[t];
-  for (u32 i = 0; i < c->count; i++)
-    rev_put(BUMP(&rev_off[(fwd_adj[c->edge[i]] >> 11) + 1], 1), c->tail[i], c->edge[i]);
+  const Zone *c = &zones[t];
+  for (u32 i = 0; i < c->cross_count; i++) {
+    u32 edge = c->cross_edge[i];
+    rev_put(BUMP(&rev_off[(fwd_adj[edge] >> 11) + 1], 1), c->cross_tail[i], edge);
+  }
 }
 
 // ---- queries: bidirectional search with 16-bit labels in blocks handed out in order, so a thread's label
@@ -538,7 +548,7 @@ static __attribute__((noinline)) void bucket_release(Searcher *s, Bucket *b) {
   int k = __builtin_ctz(b->cap);
   *(u32 **)b->entry = s->spare[k];
   s->spare[k] = b->entry;
-  b->cap = 0, b->count = 0;
+  b->cap = b->count = 0;
 }
 
 static __attribute__((noinline)) void bucket_grow(Searcher *s, Bucket *b) {
@@ -549,13 +559,12 @@ static __attribute__((noinline)) void bucket_grow(Searcher *s, Bucket *b) {
     s->spare[k] = *(u32 **)fresh;
   else
     fresh = (u32 *)s->pool, s->pool += (cap + 16) * 4ul;
-  if (b->cap) {
-    memcpy(fresh, b->entry, b->count * 4ul);
-    u32 count = b->count;
+  u32 count = b->count;
+  if (count) {
+    memcpy(fresh, b->entry, count * 4ul);
     bucket_release(s, b);
-    b->count = count;
   }
-  b->entry = fresh, b->cap = cap;
+  b->entry = fresh, b->cap = cap, b->count = count;
 }
 
 static __attribute__((noinline)) u32 new_block(Front *f, u32 v) {
@@ -732,7 +741,7 @@ static u64 search(Searcher *s, u32 src, u32 dst, u64 limit) {
   return wide < limit ? wide : INF;
 }
 
-static u32 query_count, query_next, *ends;
+static u32 query_next;
 static u64 *answers;
 
 static void query_job(int t) {
@@ -774,7 +783,6 @@ int main(void) {
   while (q < qend) {
     u32 s = read_u32(&q), t = read_u32(&q);
     ends[2 * query_count] = s, ends[2 * query_count + 1] = t, query_count++;
-    state[s] = state[t] = QUERIED;
   }
   // Bins: a grid of cells (bucket, piece), each with room for the expected fill and 8 standard deviations.
   buckets = ((n - 1) >> BUCKET_BITS) + 1;
@@ -790,23 +798,21 @@ int main(void) {
   cell_fill = small_region(buckets * PIECES * 4ul);
   rare_edges = small_region(m * sizeof(InputEdge));
   spill = small_region(m * 4ul);
-  row_work = small_region(workers * sizeof(RowWork *));
+  row_work = small_region(workers * sizeof(RowWork));
   zones = small_region(workers * sizeof(Zone));
-  crossings = small_region(workers * sizeof(Crossing));
-  for (int t = 0; t < workers; t++)
-    row_work[t] = small_region(sizeof(RowWork));
-  for (intptr_t t = 1; t < workers; t++) {
-    pthread_t id;
-    pthread_create(&id, 0, worker_main, (void *)t);
-  }
+  int same_process = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
+  for (intptr_t t = 1; t < workers; t++)
+    clone(worker_main, (u8 *)small_region(1 << 16) + (1 << 16), same_process, (void *)t);
   touch_pages(arena, PAGE2M + bins_bytes);
   all_workers(parse_job);
-  for (u32 b = 0; b < buckets; b += ROUND) {
-    round_next = b, round_end = b + ROUND < buckets ? b + ROUND : buckets;
+  for (u32 b = 0; b < buckets; b = round_end) {
+    // Each round reaches as far as the rows can go without touching a bin not yet read.
+    round_next = b, round_end = (PAGE2M + b * cell_bytes * PIECES) / (BUCKET_NODES * 16ul);
+    round_end = round_end < buckets ? round_end : buckets;
     all_workers(rows_job);
   }
-  if (rows_end < PAGE2M + bins_bytes)
-    madvise(arena + rows_end, PAGE2M + bins_bytes - rows_end, MADV_DONTNEED);
+  madvise(arena + rows_end, PAGE2M + bins_bytes - rows_end, MADV_DONTNEED);
+  madvise(row_work, workers * sizeof(RowWork), MADV_DONTNEED);
   all_workers(zones_job);
   for (int t = 0; t < workers; t++) {
     zones[t].id_base = new_n, zones[t].edge_base = new_m;
@@ -820,17 +826,17 @@ int main(void) {
   all_workers(ids_job);
   all_workers(rename_job);
   fwd_off[new_n] = new_m;
-  for (u32 i = 0; i < 2 * query_count; i++)
-    ends[i] = new_id[ends[i]];
   all_workers(release_zones_job);
   rev_off = new_id, rev_adj = rev_off + new_n + 2;
-  memset(rev_off, 0, (new_n + 2ul) * 4);
   size_t all_end = (u8 *)(rev_adj + new_m) - arena;
   touch_pages(arena + rows_end, all_end - rows_end);
+  rev_off[0] = rev_off[1] = 0;
   all_workers(rev_count_job);
   all_workers(rev_cross_count_job);
-  for (u32 i = 2; i < new_n + 2; i++)
-    rev_off[i] += rev_off[i - 1];
+  all_workers(rev_total_job);
+  for (int t = 1; t < workers; t++)
+    zones[t].rev_base = zones[t - 1].rev_base + zones[t - 1].rev_total;
+  all_workers(rev_sum_job);
   all_workers(rev_place_job);
   all_workers(rev_cross_place_job);
   answers = small_region(query_count * 8ul + 64);

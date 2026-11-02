@@ -191,3 +191,28 @@ Failed tries:
 - One reserved stretch per bucket, no growing and no free list: queries -0.44 ms and about 30 lines less, but the query phase's memory rose 6.4 MB and became the run's peak, with a page-table page per touched bucket on top. Recycled arrays stay.
 
 Official harness on box 1 for this code: D T 0.0627 s, M 60.31 MB, S 781, K 37.78; D-fresh T 0.0643 s, M 60.56 MB, K 37.27. Correct on D, D-fresh, 1, 4, 12 and 24 workers, the worked example, and generator seeds 11-15 at two scales.
+
+## d-42: the serial parts and the barriers
+
+The same interleaved rounds. Everything here is small; the point was what the main thread still did alone while eleven workers spun.
+
+- Workers started with plain `clone` on 64 KB stacks, and query endpoints marked by the workers at the start of the parse, since those writes are the first touches of the state pages: start-up 3.02 -> 2.34 ms.
+- A round of first rows reaches as far as the rows can go without touching a bin not yet read, instead of a fixed 12 buckets. Rounds grow from 15 buckets, so fewer barriers: rows 5.05 -> 4.55 ms.
+- Reverse rows: the slices are now the zones, the id map is cleared by the worker that counts into that slice, and the running sum goes by slices. Phase sum -0.48 ms.
+- Zone seeds claimed in chunks from a counter (zones -0.1 ms, and a stalled worker holds less), 16 nodes per front batch (zones 14.93 -> 14.72 ms), prefetch on id writes (ids 1.25 -> 1.08 ms).
+- Row scratch released before the zones: anonymous peak 54.0 -> 53.4 MB.
+
+Failed tries:
+
+- Prefetching ahead in the bins while building rows, and ahead of the write cursors in the parse: no change. The hardware prefetcher already follows these.
+- Front batches of 4 (zones +0.5 ms) and 32 (zones +0.2 ms).
+- Prefetching rows at push time, and pop prefetch distances of 12/6 and 6/3 against 8/4: no change. A second prefetch for the end of a row: queries +0.3 ms.
+- Label blocks of 128 and 512 entries against 256: queries +0.25 and +0.35 ms.
+- `MADV_POPULATE_READ` per parse piece: parse -0.09 ms, within noise. Dropped.
+- Compiler flags against `-O3`: `-O2` zones +0.4 ms; `-mtune=alderlake` and `-funroll-loops` no better; aligned loops and functions within noise.
+
+Unexplained: the parse phase sits near 7.1 or near 7.95 ms for a whole set of rounds, and rebuilding the same source can move it between the two. We did not find the cause, so parse results under 0.8 ms mean nothing unless both builds sit at the same level.
+
+The big-weight table was 54 % full on D and 53 % on D-fresh (17,788 and 17,292 of 32,768 slots), and it is reached by linear probing, so other seeds have room. Only 0.7 % of edges cross a slice in the reverse build.
+
+Official harness on box 1 for this code: D T 0.0612 s, M 59.90 MB, S 787, K 38.24; D-fresh T 0.0625 s, M 60.03 MB, K 37.84.
