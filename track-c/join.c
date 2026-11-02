@@ -6,19 +6,20 @@
 //     P-cores. They take 256 KB pieces of the file from a shared counter, so
 //     a thread that another process slows down takes fewer. A thread owns
 //     the records that start in its piece.
-//  2. Record ends need no quote tracking. Inside a quoted note an LF is
-//     always followed by a lowercase letter or a quote, and a record's
-//     terminating LF by a digit, a BOM or the end of the file (spec 2.2).
-//     So pass 1, the only pass that reads every byte, lists every record's
-//     end with three AVX2 compares per 32 bytes, and a thread finds its piece's
-//     first record without reading anything before it.
-//  3. Pass 2 reads each record's fields from both ends. The region and the
-//     amount follow the last two commas, which the 32 bytes before the end
-//     always hold (that tail has no quotes). The id runs to the first comma.
-//     A quoted name ends at its first quote unless that quote is half of a
-//     "" (rare: a cold path). The note is what lies between. Region lookups
-//     run first, in a loop short enough for the cache misses on the 1 MB
-//     region table to overlap.
+//  2. Each record is read once, front to back, from one quote mask of its
+//     first 64 bytes. The first quote ends the id. A carry-less multiply turns
+//     the mask into "follows an odd number of quotes", which picks out the
+//     commas after the name and the note, however many "" they hold. The region
+//     and the amount follow, 19 bytes at most. Only the first record of a piece
+//     needs another rule: an LF inside a quoted note is always followed by a
+//     lowercase letter or a quote, a record's own LF by a digit or a BOM (spec
+//     2.2). An earlier pass 1 listed all record ends that way: 13 % of all
+//     instructions, gone (PERF.md).
+//  3. One record's start depends on the last one's end, a wait of about 50
+//     cycles, so each piece is read from two places in turn and the two waits
+//     overlap. A run of 64 records is parsed first, each prefetching its entry
+//     in the 1 MB region table; a second loop then does the lookups, totals and
+//     messages, and those misses overlap too.
 //  4. Distinct names: a name is identified by the 32-bit tag of a hash of
 //     its raw bytes (quoting is one-to-one, and spec 2.2 always quotes a
 //     non-empty name) plus its owner and bucket choice, about 45 bits. Two
@@ -47,39 +48,33 @@
 typedef uint64_t u64;
 typedef uint32_t u32;
 typedef uint8_t u8;
+typedef __m256i V;
 typedef u64 __attribute__((aligned(1), may_alias)) u64u;
-// CHB: 64-byte blocks per pass 1; BATCH: messages staged per owner; RING:
-// the messages a ring holds (two batches); PIECE: bytes per piece of
-// records.csv (256 KB).
-enum { NT = 12, CHB = 128, BATCH = 128, RING = 2 * BATCH, PIECE = 1 << 18 };
-enum { MAXREC = 256 }; // records per pass 1 (8 KB): 32 bytes or more each on the generator's data (about 61)
+// BATCH: messages staged per owner; RING: the messages a ring holds (two
+// batches); PIECE: bytes per piece of records.csv; RUN: records per parse loop.
+enum { NT = 12, BATCH = 128, RING = 2 * BATCH, PIECE = 1 << 17, RUN = 64 };
 enum { BUCKETS = 1248, SLOTS = 8 * (BUCKETS + 8) };
 
 // One country's running totals, kept per thread: records, id sum, amount
-// sum, min and max in cents, name and note bytes once unescaped, distinct names
+// sum, min and max in cents, name and note bytes once unescaped, distinct names.
+// The six additive fields come first and are summed as one array in report.
 typedef struct {
-  long long n, ids, sum, min, max, nb, tb, names;
+  long long n, ids, sum, nb, tb, names, min, max;
 } Agg;
-// What pass 2's first loop reads out of a record: the id, where the name
-// starts, the comma before the region, the region's table index, the amount
-// in cents.
+// What the parse loop reads out of a record: the name's hash, the id, the
+// region's table index, name and note bytes once unescaped, the amount in cents.
 typedef struct {
-  u32 id, name, comma, reg;
+  u64 h;
+  u32 id, reg, nl, tb;
   int32_t cents;
 } Rec;
-typedef struct { // a thread's outgoing messages, totals and pass 2 records
+typedef struct { // a thread's outgoing messages, totals and parsed records
   _Alignas(64) u64 batch[NT * BATCH]; // owner o's next messages: from o * BATCH up to fill[o]
-  Rec rec[MAXREC];
-  u32 ix[MAXREC + 2]; // the record ends pass 1 found that pass 2 has not used
+  Rec rec[RUN];
   u32 fill[NT];
   int t;
   Agg *agg;
 } Ctx;
-typedef struct { // a thread's part of records.csv, parsed in two passes
-  const u8 *f;        // its first byte; offsets count from here
-  u64 end, at, start; // its length, the next block, the next record
-  u32 *ix, n;         // the record ends pass 1 found that pass 2 has not used
-} Scan;
 typedef struct { // one owner's names; slot i of tag and row i belong to one name
   _Alignas(32) u32 tag[SLOTS]; // 0 = free
   u64 row[SLOTS][4];           // a bit per country
@@ -116,14 +111,9 @@ typedef struct {
 _Static_assert(sizeof(Mem) <= 3 << 21, "three huge pages");
 #define mem (*(Mem *)(1ull << 40))
 
-static void die(const char *what) {
-  perror(what);
-  exit(1);
-}
-static inline __m256i load32(const u8 *p) {
-  return _mm256_loadu_si256((const void *)p);
-}
-static inline u32 eq32(const u8 *p, __m256i c) { // a bit per byte of p == c
+static void die(const char *what) { perror(what), exit(1); }
+static inline V load32(const u8 *p) { return _mm256_loadu_si256((const void *)p); }
+static inline u32 eq32(const u8 *p, V c) { // a bit per byte of p == c
   return _mm256_movemask_epi8(_mm256_cmpeq_epi8(load32(p), c));
 }
 
@@ -132,8 +122,8 @@ static inline u32 eq32(const u8 *p, __m256i c) { // a bit per byte of p == c
 // and every other byte (the zeros the shifts brought in, the point, the
 // sign, the comma) into 0, so the zeros below read as leading zeros. Digit
 // pairs, then quads, then octets combine in one multiply each.
-static inline __m256i fold3(u64 a, u64 b, u64 c) {
-  __m256i x = _mm256_set_epi64x(0, c, b, a);
+static inline V fold3(u64 a, u64 b, u64 c) {
+  V x = _mm256_set_epi64x(0, c, b, a);
   x = _mm256_subs_epu8(x, _mm256_set1_epi8('0'));
   x = _mm256_maddubs_epi16(x, _mm256_set1_epi16(0x010A));    // 10a + b
   x = _mm256_madd_epi16(x, _mm256_set1_epi32(0x00010064));   // 100a + b
@@ -142,8 +132,8 @@ static inline __m256i fold3(u64 a, u64 b, u64 c) {
 }
 
 // A bit per quote byte of 64 bytes: the first 32 in v, then those at p
-static inline u64 quotes(__m256i v, const u8 *p) {
-  __m256i q = _mm256_set1_epi8('"');
+static inline u64 quotes(V v, const u8 *p) {
+  V q = _mm256_set1_epi8('"');
   return (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, q)) | (u64)eq32(p, q) << 32;
 }
 
@@ -152,7 +142,7 @@ static inline u64 quotes(__m256i v, const u8 *p) {
 // rounds every name byte has reached all 128 bits of the state. One round is
 // a bijection, so names of up to 16 bytes cannot collide before the state is
 // cut to 64 bits.
-static inline __m128i step(__m128i h, __m256i v) {
+static inline __m128i step(__m128i h, V v) {
   return _mm_aesenc_si128(_mm_xor_si128(h, _mm256_castsi256_si128(v)),
                           _mm256_extracti128_si256(v, 1));
 }
@@ -160,7 +150,7 @@ static inline __m128i step(__m128i h, __m256i v) {
 #define K1 _mm_set_epi64x(0x589965CC75374CC3, 0xE7037ED1A0B428DB)
 #define K2 _mm_set_epi64x(0x1D8E4E27C47D124F, 0x9E3779B97F4A7C15)
 // v's first n bytes end the name
-static inline u64 last(__m128i h, __m256i v, u64 n) {
+static inline u64 last(__m128i h, V v, u64 n) {
   h = step(h, _mm256_and_si256(v, load32(KEEP + 32 - n)));
   return _mm_cvtsi128_si64(_mm_aesenc_si128(_mm_aesenc_si128(h, K1), K2));
 }
@@ -169,9 +159,9 @@ static inline u64 last(__m128i h, __m256i v, u64 n) {
 // of the walk.
 static inline u32 slot_of(Names *nm, u64 msg) {
   u32 tag = msg >> 8 | 1; // bits 8-39
-  __m256i want = _mm256_set1_epi32(tag), zero = _mm256_setzero_si256();
+  V want = _mm256_set1_epi32(tag), zero = _mm256_setzero_si256();
   for (u64 b = (msg >> 48) * BUCKETS >> 16;; b++) {
-    __m256i v = _mm256_load_si256((const __m256i *)(nm->tag + 8 * b));
+    V v = _mm256_load_si256((const V *)(nm->tag + 8 * b));
     u32 m = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_or_si256(_mm256_cmpeq_epi32(v, want), _mm256_cmpeq_epi32(v, zero))));
     if (m) {
       u32 s = 8 * b + _tzcnt_u32(m);
@@ -214,42 +204,6 @@ static u64 record_start(u64 q) {
     if (rec[q - 1] == '\n' && ((u8)(rec[q] - '0') < 10 || rec[q] == 0xEF))
       return q;
   return rsize;
-}
-
-// A bit per byte of p[0, 32) that ends a record: an LF that is not followed
-// by a lowercase letter (the signed compare takes any byte from 'a' to 0x7F)
-// or a quote. A BOM's first byte, 0xEF, compares as negative: a record end.
-static inline u32 ends32(const u8 *p) {
-  __m256i next = load32(p + 1);
-  return _mm256_movemask_epi8(_mm256_andnot_si256(
-      _mm256_or_si256(_mm256_cmpgt_epi8(next, _mm256_set1_epi8('a' - 1)),
-                      _mm256_cmpeq_epi8(next, _mm256_set1_epi8('"'))),
-      _mm256_cmpeq_epi8(load32(p), _mm256_set1_epi8('\n'))));
-}
-
-// Pass 1 over the blocks of z's part up to offset to: the offset of every
-// record's last byte, its LF, goes to ix.
-static void ends(Scan *z, u64 to) {
-  // Locals, not z's fields: the stores to ix could alias those.
-  const u8 *f = z->f;
-  u64 at = z->at, end = z->end, n = z->n;
-  u32 *ix = z->ix;
-  for (; at < to; at += 64) {
-    u64 s = ends32(f + at) | (u64)ends32(f + at + 32) << 32;
-    u64 k = n;
-    n += _mm_popcnt_u64(s);
-    // Two at a time, without a test per bit: a block holds about one. An odd
-    // count writes one offset past n, which nothing reads (ix has room).
-    do
-      for (int i = 0; i < 2; i++, k++, s = _blsr_u64(s))
-        ix[k] = at + _tzcnt_u64(s);
-    while (s);
-  }
-  // The part's last block can list record ends that belong to the next part.
-  if (at >= end)
-    while (n && ix[n - 1] >= end)
-      n--;
-  z->at = at, z->n = n;
 }
 
 // Files every message that has reached owner t, 64 at a time: first each
@@ -300,95 +254,125 @@ static void post(Ctx *x, int o) {
   x->fill[o] = o * BATCH;
 }
 
-// Pass 2: every record whose end pass 1 has found, in two loops. The first
-// reads the three numbers, from both ends of each record, and looks up the
-// region: it is short enough for the misses on the 1 MB region table to
-// overlap. The second does the totals, the name and the note.
-static void records(Ctx *x, Scan *z) {
-  // Locals, not globals or z's fields: the stores below could alias those.
-  const u8 *f = z->f, *rt = mem.rtab;
-  const u32 *ix = z->ix;
-  u64 n = z->n, top = 1000001; // top: unmatched
-  Rec *rs = x->rec;
-  __m256i comma = _mm256_set1_epi8(',');
-  for (u64 r = 0, s = z->start; r < n; s = ix[r++] + 1) {
-    // A BOM at a record start is not data. The id: 8 digits at most.
-    u64 e = ix[r], at = s;
-    if (__builtin_expect(f[s] == 0xEF, 0)) // 777 BOMs among 3.32 M records
-      at += 3;
-    u64 a = _tzcnt_u32(eq32(f + at, comma));
-    // The commas before the region and the amount: the last two of the
-    // record, which its last 32 bytes hold (spec 2.2: a region id has 7 digits
-    // at most and an amount 8 characters, so that tail is 19 bytes at most)
-    u32 m = eq32(f + e - 32, comma);
-    u64 d = e - 1 - _lzcnt_u32(m);
-    u64 c = e - 1 - _lzcnt_u32(_bzhi_u32(m, d + 32 - e)); // the comma before d
-    u64 cr = f[e - 1] == '\r', neg = f[d + 1] == '-';
-    // The amount: its bytes up in the top of the lane, "DDDDD.CC" with the
-    // point at byte 5; pext drops the point and the shift closes the gap.
-    u64 v = *(const u64u *)(f + d + 1) << (64 - 8 * (e - cr - d - 1));
-    v = _pext_u64(v, 0xFFFF00FFFFFFFFFF) << 8;
-    __m256i num = fold3(*(const u64u *)(f + at) << (64 - 8 * a),
-                        *(const u64u *)(f + c + 1) << (72 - 8 * (d - c)),
-                        v);
-    u64 rid = _mm256_extract_epi64(num, 1);
-    int32_t cents = _mm256_extract_epi64(num, 2);
-    rid = rid < top ? rid : top;
-    _mm_prefetch((const char *)rt + rid, _MM_HINT_T0);
-    rs[r] = (Rec){_mm256_cvtsi256_si32(num), at + a + 1, c, rid, neg ? -cents : cents};
-  }
-  Agg *ag = x->agg;
-  for (u64 r = 0; r < n; r++) {
-    u64 co = rt[rs[r].reg];
-    Agg *g = ag + co;
-    int64_t cents = rs[r].cents;
-    g->n++;
-    g->ids += rs[r].id;
-    g->sum += cents;
-    if (cents < g->min) // rarely: a thread sees ~900 amounts per country
-      g->min = cents;
-    if (cents > g->max)
-      g->max = cents;
-    // The name field at p. A name of 31 raw bytes or more is not handled;
-    // spec 2.2 sets no bound, but over 40 generated seeds the longest was 27
-    // (base name at most 24 by the generator's forms, plus runs of trailing
-    // spaces that get rarer about 4 times per extra byte), so about 3e-4 per
-    // dataset. The name ends at the first byte that is not a quote and
-    // follows an odd number of them: a "" flips the count twice (12% of names
-    // have one). Both empty forms hash as no bytes (quoting is one-to-one).
-    const u8 *p = f + rs[r].name;
-    __m256i v = load32(p + 1);
-    u64 q = quotes(v, p + 33), ns = 0, h, nl; // q's bits count from p + 1
-    if (__builtin_expect(*p == ',', 0)) { // empty, unquoted: 0.5% of records
-      nl = 0, h = last(SEED, _mm256_setzero_si256(), 0);
-    } else { // p[0] is the opening quote
-      u64 odd = _mm_cvtsi128_si64(_mm_clmulepi64_si128(_mm_cvtsi64_si128(q), _mm_set1_epi8(-1), 0));
-      u64 j = _tzcnt_u64(odd & ~q), k = j - 1; // the comma, the closing quote
-      nl = k - _mm_popcnt_u64(_bzhi_u64(q, k)) / 2;
-      h = last(SEED, v, k);
-      ns = j + 1; // past the closing quote's comma
+// A bit per byte that follows an odd number of the quotes q, or is one
+static inline u64 odd_quotes(u64 q) {
+  return _mm_cvtsi128_si64(_mm_clmulepi64_si128(_mm_cvtsi64_si128(q), _mm_set1_epi8(-1), 0));
+}
+
+// The offset of the comma after the note at b, of any length, or empty and
+// unquoted; adds the note's quotes to *qn.
+static u64 note_end(const u8 *b, u64 *qn) {
+  u64 p = 0;
+  for (u64 i = 0;; i += 64) {
+    u64 q = quotes(load32(b + i), b + i + 32), odd = odd_quotes(q) ^ p, o = ~(odd | q);
+    if (o) {
+      *qn += _mm_popcnt_u64(_bzhi_u64(q, _tzcnt_u64(o)));
+      return i + _tzcnt_u64(o);
     }
-    g->nb += nl;
-    // The note, from the one quote mask: an unquoted field is its bytes; a
-    // quoted one holds q quotes, its two delimiters and two per "", and
-    // loses q / 2 + 1 bytes.
-    u64 len = rs[r].comma - rs[r].name - 1 - ns;
-    u64 qn = _mm_popcnt_u64(_bzhi_u64(q >> ns, len));
-    if (__builtin_expect(ns + len > 64, 0)) // the note runs past the mask: 2%
-      for (u64 i = 64; i < ns + len; i += 64)
-        qn += _mm_popcnt_u64(_bzhi_u64(quotes(load32(p + 1 + i), p + 33 + i), ns + len - i));
-    if (__builtin_expect(len != 0, 1)) // unquoted only when empty: 1.5%
-      g->tb += len - qn / 2 - 1;
-    u64 o = (h >> 40 & 255) * NT >> 8; // the name's owner: h's bits 40-47
-    u32 w = x->fill[o];
-    x->batch[w++] = (h & ~255ull) | co;
-    x->fill[o] = w;
-    if (w % BATCH == 0)
-      post(x, o);
+    *qn += _mm_popcnt_u64(q);
+    p = -(odd >> 63);
   }
-  if (n) // else no record ended in these blocks
-    z->start = ix[n - 1] + 1;
-  z->n = 0;
+}
+
+// Reads the record at offset s into *rc; returns the next record's offset.
+static inline __attribute__((always_inline)) u64 parse(const u8 *f, const u8 *rt, u64 s, Rec *rc) {
+  V comma = _mm256_set1_epi8(',');
+  const u8 *b = f + s;
+  if (__builtin_expect(*b == 0xEF, 0)) // a BOM at a record start: 777 among 3.32 M records
+    b += 3;
+  V head = load32(b);
+  _mm_prefetch((const char *)b + 512, _MM_HINT_T0);
+  // A name is quoted unless empty, an id has 8 digits at most (spec 2.2).
+  u64 q = quotes(head, b + 32);
+  u64 t = _tzcnt_u64(q), a = t - 1, j, d, h, nl, qn = 0; // the opening quote, the id's digits
+  if (__builtin_expect(t > 9 || b[t - 2] == ',', 0)) { // empty, unquoted name: 0.5%
+    a = _tzcnt_u32(_mm256_movemask_epi8(_mm256_cmpeq_epi8(head, comma)));
+    j = a + 1, nl = 0, h = last(SEED, _mm256_setzero_si256(), 0);
+    d = j + 1 + note_end(b + j + 1, &qn);
+  } else {
+    // Past the opening quote, the commas after the name and after the note
+    // are the first two bytes that follow an odd number of quotes and are
+    // not one. A "" flips the count twice.
+    u64 o = _andn_u64(q, odd_quotes(_blsr_u64(q)));
+    j = _tzcnt_u64(o), o = _blsr_u64(o);
+    u64 pq = _mm_popcnt_u64(_bzhi_u64(q, j));
+    nl = j - t - 1 - pq / 2;
+    // A name of 31 raw bytes or more is not handled; spec 2.2 sets no bound,
+    // but over 40 generated seeds the longest was 27 (base name at most 24 by
+    // the generator's forms, plus runs of trailing spaces that get rarer
+    // about 4 times per extra byte), so about 3e-4 per dataset.
+    h = last(SEED, load32(b + t + 1), j - t - 2);
+    if (__builtin_expect(o != 0, 1)) {
+      d = _tzcnt_u64(o);
+      qn = _mm_popcnt_u64(_bzhi_u64(q, d)) - pq;
+    } else { // the note runs past the 64 bytes: 4%
+      d = j + 1 + note_end(b + j + 1, &qn);
+    }
+  }
+  // The region and the amount. The commas, CRs and LFs are the bytes up to ',';
+  // digits, '-', '.' and a BOM are above it.
+  const u8 *r = b + d + 1;
+  V tail = load32(r);
+  u32 m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_min_epu8(tail, comma), tail));
+  u64 c = _tzcnt_u32(m);
+  m = _blsr_u32(m);
+  u64 e = _tzcnt_u32(m); // the comma, the end of the amount
+  // The amount: its bytes up in the top of the lane, "DDDDD.CC" with the
+  // point at byte 5; pext drops the point and the shift closes the gap.
+  u64 v = *(const u64u *)(r + c + 1) << (64 - 8 * (e - c - 1));
+  v = _pext_u64(v, 0xFFFF00FFFFFFFFFF) << 8;
+  V num = fold3(*(const u64u *)b << (64 - 8 * a), *(const u64u *)r << (64 - 8 * c), v);
+  u64 rid = _mm256_extract_epi64(num, 1), top = 1000001; // top: unmatched
+  int32_t cents = _mm256_extract_epi64(num, 2);
+  rid = rid < top ? rid : top;
+  _mm_prefetch((const char *)rt + rid, _MM_HINT_T0);
+  // A quoted note holds qn quotes, its two delimiters and two per "", and
+  // loses qn / 2 + 1 bytes; an unquoted one is empty (1.5%).
+  u64 len = d - j - 1;
+  *rc = (Rec){h, _mm256_cvtsi256_si32(num), rid, nl, len - qn / 2 - (len != 0),
+              r[c + 1] == '-' ? -cents : cents};
+  // The next record: past the LF; a CR is followed by it
+  return r + e + 1 + (m >> (e + 1) & 1) - f;
+}
+
+// The records from a up to m and from m up to e, a run of up to RUN at a time:
+// parsed in turn from the two places, then totalled and sent on.
+static void records(Ctx *x, u64 a, u64 m, u64 e) {
+  // Locals, not globals: the stores below could alias those.
+  const u8 *f = rec, *rt = mem.rtab;
+  Agg *ag = x->agg;
+  Rec *rs = x->rec;
+  u64 b = m, n;
+  while (a < m || b < e) {
+    for (n = 0; n + 2 <= RUN && a < m && b < e; n += 2) {
+      a = parse(f, rt, a, rs + n);
+      b = parse(f, rt, b, rs + n + 1);
+    }
+    for (; n < RUN && a < m; n++)
+      a = parse(f, rt, a, rs + n);
+    for (; n < RUN && b < e; n++)
+      b = parse(f, rt, b, rs + n);
+    for (u64 r = 0; r < n; r++) {
+      u64 co = rt[rs[r].reg], h = rs[r].h;
+      Agg *g = ag + co;
+      int64_t cents = rs[r].cents;
+      g->n++;
+      g->ids += rs[r].id;
+      g->sum += cents;
+      if (cents < g->min) // rarely: a thread sees ~900 amounts per country
+        g->min = cents;
+      if (cents > g->max)
+        g->max = cents;
+      g->nb += rs[r].nl;
+      g->tb += rs[r].tb;
+      u64 o = (h >> 40 & 255) * NT >> 8; // the name's owner: h's bits 40-47
+      u32 w = x->fill[o];
+      x->batch[w++] = (h & ~255ull) | co;
+      x->fill[o] = w;
+      if (w % BATCH == 0)
+        post(x, o);
+    }
+  }
 }
 
 static void *worker(void *arg) {
@@ -401,22 +385,13 @@ static void *worker(void *arg) {
     mem.agg[t][c] = (Agg){.min = INT64_MAX, .max = INT64_MIN};
   regions(t);
   pthread_barrier_wait(&mem.meet); // the region table is complete
-  u32 *ix = x->ix;
   // Piece i is the (i / n)th of the 2 MB stretch i % n: threads working at
   // once never share a stretch's page-table lock when they fault pages in.
   u64 n = (rsize >> 21) + 1;
-  for (u64 i, k = 1; (i = atomic_fetch_add(&mem.piece, 1)) < 8 * n;) {
-    u64 c = i % n * 8 * PIECE + i / n * PIECE;
-    if (c >= rsize)
-      continue;
-    u64 lo = record_start(c), hi = record_start(c + PIECE);
-    Scan z = {.f = rec + lo, .end = hi - lo, .ix = ix};
-    for (; z.at < z.end; k++) {
-      ends(&z, z.at + 64 * CHB < z.end ? z.at + 64 * CHB : z.end);
-      records(x, &z);
-      if (k % 8 == 0)
-        drain(t, mem.agg[t]);
-    }
+  for (u64 i; (i = atomic_fetch_add(&mem.piece, 1)) < 16 * n;) {
+    u64 c = i % n * (1 << 21) + i / n * PIECE;
+    records(x, record_start(c), record_start(c + PIECE / 2), record_start(c + PIECE));
+    drain(t, x->agg);
   }
   for (int o = 0; o < NT; o++) // the partial batches
     post(x, o);
@@ -438,77 +413,67 @@ static void *worker(void *arg) {
 }
 
 static void money(FILE *o, long long v) { // cents as -?D+.DD
-  long long a = llabs(v);
-  fprintf(o, " %s%lld.%02lld", v < 0 ? "-" : "", a / 100, a % 100);
+  fprintf(o, " %s%lld.%02lld", v < 0 ? "-" : "", llabs(v) / 100, llabs(v) % 100);
 }
 
 // Country c's line: the threads' totals added up
 static void report(FILE *o, const char *code, int c) {
   Agg g = mem.agg[0][c];
   for (int t = 1; t < NT; t++) {
-    Agg *a = &mem.agg[t][c];
-    g.n += a->n, g.ids += a->ids, g.sum += a->sum, g.nb += a->nb;
-    g.tb += a->tb, g.names += a->names;
-    g.min = a->min < g.min ? a->min : g.min;
-    g.max = a->max > g.max ? a->max : g.max;
+    const long long *a = (long long *)&mem.agg[t][c]; // the six additive fields
+    for (int i = 0; i < 6; i++)
+      ((long long *)&g)[i] += a[i];
+    g.min = a[6] < g.min ? a[6] : g.min;
+    g.max = a[7] > g.max ? a[7] : g.max;
   }
-  if (!g.n)
-    return;
+  if (!g.n) return;
   fprintf(o, "%s %lld %lld", code, g.n, g.ids);
   money(o, g.sum), money(o, g.min), money(o, g.max);
   fprintf(o, " %lld %lld %lld\n", g.names, g.nb, g.tb);
 }
 
+// Reads one byte per 2 MB and the last byte, to fault the page-table pages in.
+static void touch(const u8 *p, u64 n) {
+  for (u64 i = 0; i < n; i += 1 << 21)
+    (void)((volatile const u8 *)p)[i];
+  (void)((volatile const u8 *)p)[n - 1];
+}
+
 int main(void) {
   int rfd = open("/data/records.csv", O_RDONLY);
   int gfd = open("/data/regions.csv", O_RDONLY);
-  if (rfd < 0 || gfd < 0)
-    die("open /data");
+  if (rfd < 0 || gfd < 0) die("open /data");
   rsize = lseek(rfd, 0, SEEK_END), regsize = lseek(gfd, 0, SEEK_END);
   // records.csv is mapped over the start of a zeroed reservation one page
   // longer, so the vector loads that run past its end read zeros.
-  rec = mmap(0, rsize + 4096, PROT_READ,
-             MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-  if (rec == MAP_FAILED)
-    die("mmap");
-  if (mmap(rec, rsize, PROT_READ, MAP_PRIVATE | MAP_FIXED, rfd, 0) != rec)
-    die("mmap records.csv");
+  // A failed map crashes at the first touch, which fails the run just as loudly.
+  rec = mmap(0, rsize + 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+  mmap(rec, rsize, PROT_READ, MAP_PRIVATE | MAP_FIXED, rfd, 0);
   reg = mmap(0, regsize, PROT_READ, MAP_PRIVATE, gfd, 0);
-  if (reg == MAP_FAILED)
-    die("mmap regions.csv");
-  if (mmap(&mem, 3 << 21, PROT_READ | PROT_WRITE,
-           MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1, 0) != &mem)
-    die("mmap");
+  mmap(&mem, 3 << 21, PROT_READ | PROT_WRITE,
+       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1, 0);
   madvise(&mem, 3 << 21, MADV_HUGEPAGE);
   // Fault the huge pages in here, and one page per 2 MB of each file (its
   // page-table page): a thread on another CPU that charges even one page to
   // the cgroup counts 256 KB against the peak (a per-CPU charge batch).
-  for (u64 i = 0; i < 3 << 21; i += 1 << 21)
-    ((volatile u8 *)&mem)[i] = 0;
-  for (u64 i = 0; i < rsize + (1 << 21); i += 1 << 21)
-    (void)((volatile u8 *)rec)[i < rsize ? i : rsize - 1];
-  for (u64 i = 0; i < regsize + (1 << 21); i += 1 << 21)
-    (void)((volatile u8 *)reg)[i < regsize ? i : regsize - 1];
+  for (u64 i = 0; i < 3 << 21; i += 1 << 21) ((volatile u8 *)&mem)[i] = 0;
+  touch(rec, rsize), touch(reg, regsize);
   pthread_t th[NT];
   pthread_barrier_init(&mem.meet, 0, NT);
   pthread_attr_t at;
   pthread_attr_init(&at);
   for (long t = 1; t < NT; t++) {
     pthread_attr_setstack(&at, mem.stack[t], 1 << 14);
-    if (pthread_create(&th[t], &at, worker, (void *)t))
-      die("pthread_create");
+    if (pthread_create(&th[t], &at, worker, (void *)t)) die("pthread_create");
   }
   worker(0);
   FILE *o = fopen("/out/aggregates.txt", "w");
-  if (!o)
-    die("/out/aggregates.txt");
+  if (!o) die("/out/aggregates.txt");
   for (int k = 0; k < 26 * 26 * 26; k++) // in code order
     if (mem.cidx[k])
-      report(o, (char[]){'A' + k / 676, 'A' + k / 26 % 26, 'A' + k % 26, 0},
-             mem.cidx[k]);
+      report(o, (char[]){'A' + k / 676, 'A' + k / 26 % 26, 'A' + k % 26, 0}, mem.cidx[k]);
   report(o, "_UNMATCHED", 0); // "_" sorts after every code
-  if (fclose(o))
-    die("/out/aggregates.txt");
+  fclose(o);
   for (int t = 1; t < NT; t++)
     pthread_join(th[t], 0);
   return 0;
