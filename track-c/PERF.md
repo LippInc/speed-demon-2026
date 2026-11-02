@@ -4,11 +4,11 @@ How join.c got to its speed, with the measurement behind each step. Rows named b
 
 ## Where it ended
 
-The final code is v65. It reads records.csv once per record with no pass 1, keeps each thread's state on three huge pages faulted in by main and one helper, and identifies distinct names by owner threads exchanging 8-byte messages (join.c's header walks the design). The board run run-6d3cdfadd754 measured T 14.32 ms, M 8.07 MB, S 373, K 56.60; the reference takes 14.44 s, K 1. That run is the submission named in both this file and README.md. A quiet box reads lower than a busy board: until the final runs the board shares its machine, T moves with the load and M with what ran in the cgroup before us (section 6).
+The final code is v66. It reads records.csv once per record with no pass 1, keeps each thread's state on three huge pages faulted in by main and one helper, and identifies distinct names by owner threads exchanging 8-byte messages (join.c's header walks the design). The board run run-f0e57703613f measured T 15.995 ms, M 10.02 MB, S 382, K 51.10; the reference takes 14.44 s, K 1. That run is the submission named in both this file and README.md. v66 is v65 with its layout and comments cleaned for reading and mmap failures checked: the same hot loops, which also read T 14.32 ms, K 56.60 as v65 (run-6d3cdfadd754). A quiet box reads lower than a busy board: until the final runs the board shares its machine, T moves with the load and M with what ran in the cgroup before us (section 6).
 
 ## Where it stands
 
-The reads of v56 and v59 to v62 are listed under the table by commit: our saved board reads hold no run ID for them.
+The reads of v54, v56 and v60 to v62 are listed under the table by commit: our saved board reads hold no run ID for them.
 
 | Version | Commit | Board run | T | M | S | K |
 |---|---|---|---|---|---|---|
@@ -16,13 +16,18 @@ The reads of v56 and v59 to v62 are listed under the table by commit: our saved 
 | join.c v49 | 4e793b1 | run-be7fc43b744a | 21.31 ms | 10.51 MB | 417 | 43.27 |
 | join.c v49 | 8442d94 | run-5e3b2bc95cec | 21.16 ms | 9.89 MB | 417 | 43.97 |
 | join.c v53 (v49's code, waits that sleep) | 55c6a91 | run-739c6cea137d (a busy board) | 27.31 ms | 10.27 MB | 418 | 38.39 |
+| v59 | 397ee86 | run-02bcdc588c09 | 16.48 ms | 7.92 MB | 392 | 52.56 |
+| v59 (same code) | bfcd0c7 | run-591a67a034d0 | 17.02 ms | 7.86 MB | 392 | 51.79 |
+| v58 (a slow read) | fd2350d | run-84ebbf3d52b8 | 21.65 ms | 9.24 MB | 382 | 44.65 |
 | v63 | a2b2bdd | run-a5c4d0536268 | 14.754 ms | 7.80 MB | 377 | 56.05 |
 | v63 (same code) | a9af0b7 | run-aeb5ee4b7a28 | 14.921 ms | 8.29 MB | 377 | 55.05 |
 | v65 | 6cafc7e | run-6d3cdfadd754 | 14.32 ms | 8.07 MB | 373 | 56.60 |
 | v65 (same code) | 3fa85cb | run-ec315dedca74 | 14.446 ms | 7.92 MB | 373 | 56.56 |
+| v65 (same code, a busy board) | 3d9eece | run-f269418aae73 | 17.674 ms | 7.90 MB | 373 | 51.17 |
+| v66 | aaffcdd | run-f0e57703613f | 15.995 ms | 10.02 MB | 382 | 51.10 |
 
+- v54: commit 4ba13ab, T 21.19 ms, M 7.91 MB, S 389, K 46.42.
 - v56: commit db1bb02, K 47.82.
-- v59: T 16.48 ms, M 7.92 MB, S 392, K 52.56.
 - v60: commit 78587c9, T 16.23 ms, M 7.89 MB, S 394, K 52.96.
 - v61: commit 73fcc4e, T 16.17 ms, M 10.24 MB (spike, section 6), S 369, K 50.88.
 - v62: commit 6ca940a, T 15.53 ms, M 8.01 MB, S 371, K 54.48.
@@ -32,7 +37,8 @@ The reference takes 14.44 s, K 1. M is the maximum of the board's 5 runs, which 
 ## Measuring
 
 - **abn.sh**, the local A/B runner: alternates the binaries over 15 to 31 rounds, deletes the output file before each run and checks its SHA, so a crash or a wrong output leaves no number (a bad run is logged with its exit code). Its wall time includes loop overhead: an empty static binary reads 2.93 ms in the same loop, and the program's own timeline accounts for all but 0.33 ms of the rest. Noise about +-0.1 ms at 15 to 31 rounds; code-layout luck up to 0.2 ms.
-- **icount.sh**: user instructions and cycles (perf), stable to 0.1 %.
+- **icount.sh**: user instructions and cycles (perf), stable to 0.1 %. Not while another job runs on the box: it once read 825 M for a 752 M binary. Then we compare with abn only.
+- **A trap we hit**: a 13-run check passed a program that crashed in 0.6 % of its runs (section 7). Each variant now also gets 100 runs.
 - **Board figures**: T is the mean of the middle three of 5 runs (fastest and slowest dropped), M the maximum of the 5.
 - **K** = (Tref/T)^.5 (Mref/M)^.2 (Sref/S)^.15; M stops paying at 7.35 MB, so there is no reward below that.
 - **S** is code lines counted after clang-format LLVM (merging lines does nothing; wraps caused by trailing comments do count).
@@ -73,17 +79,19 @@ Board rows carry their run ID; rows without one are local. Rows marked "box 2 on
 
 Today (box 1 unless a run ID is given):
 
-- v54 (4ba13ab): built with gcc 16, -0.3 ms on the local loop. Board: T 21.19 ms, M 7.91, S 389, K 46.42.
-- v56 (db1bb02), the redesign: no pass 1, one read per record from a 64-byte quote mask, two cursors per piece, 16-tag buckets, threads fill the region table while main faults the huge pages. 865 M instructions, abn 21.3 against v53's 23.5. In order of what moved T (each an A/B): the BOM test as a branch, not cmov, -0.68; pointers instead of offsets, -0.5; threads fill the region table while main faults, with a spin barrier, -0.35; two cursors with Rec staging and region prefetch, -0.8 against v56; 16-tag buckets, -0.22; owner from the hash's low byte, -0.17; the mask window at b + 6, -0.15; the low fixed address, -0.15; two prefetches, -0.08.
-- v57 (61a43ce): abn 20.8.
-- v58 (fd2350d): abn 18.91.
-- v59: abn 18.43; board T 16.48 ms, M 7.92, S 392, K 52.56.
+- v54 (4ba13ab): all thread memory on three huge pages at a fixed address, faulted in before any thread starts; raw reads in the number chain; gcc 16 (the compiler alone, -0.3 ms on the local loop). Board: T 21.19 ms, M 7.91, S 389, K 46.42.
+- v55 (1b57343): one quote mask for name and note; the amount read after its comma, its point dropped by pext; no per-block bound test in pass 1.
+- v56 (db1bb02): one load for the name's hash and the quote mask, a flat staging index, a branch for the rare unquoted empty note. 865 M instructions, abn 21.3 against v53's 23.5. Board K 47.82.
+- v57 (61a43ce), the redesign: each record read once front to back from one quote mask, two places per piece in turn so the waits overlap, no pass over record ends. abn 20.8. In its own A/B, two cursors with Rec staging and the region prefetch were -0.8 against v56. (A/B figures here and below come from their own rounds of 15 to 21, so they do not add up exactly to the next abn.)
+- v58 (fd2350d): abn 18.91. In separate A/Bs: the BOM test a branch, not a cmov, so its load leaves the chain between records, -0.68; pointers as cursors instead of offsets, -0.5; threads fill the region table while main faults memory in, with a spin barrier, -0.35; the low fixed address, -0.15.
+- v59 (397ee86): abn 18.43. In separate A/Bs: 16-tag buckets tested for a hit first, -0.22; the owner from the hash's low byte, -0.17; the quote mask from b + 6, so 97 % of notes end inside it, -0.15; two prefetches, -0.08. No hash seed; one signed compare for the tail. Board run-02bcdc588c09: T 16.48 ms, M 7.92, S 392, K 52.56; the same code again as bfcd0c7, run-591a67a034d0: T 17.02 ms, M 7.86, K 51.79.
 - v60 (78587c9): the crash fix (section 7, map moved to 3 << 29), memory constants, build flags. Board T 16.23 ms, M 7.89, S 394, K 52.96.
 - v61 (73fcc4e): plain clone threads on 4 KB stacks, BUCKETS 652, an atomic_flag lock that uses the sleeping wait, meet() replaces join, no -pthread. abn 17.99; board T 16.17 ms, M 10.24 (the spike, section 6), S 369, K 50.88.
 - v62 (6ca940a): the cold test from the mask, a vector min for the amount cap, the id stored first, the tag read straight from the message. 680 M instructions, abn 17.49; board T 15.53 ms, M 8.01, S 371, K 54.48.
 - v63 (a2b2bdd), instructions 680.0 M to 614.0 M, abn 17.45 to 16.55, in order: the amount's decimal point skipped by per-lane multipliers instead of pext (666.6 M, 17.41 to 17.16); the next record found by a carry through the run of low bytes, so no BOM test in parse (653.3 M, 16.88); the id's length kept per cursor, because spec 2.2 says ids only grow (643.7 M); bit test and count with bts and sbb (634.2 M, 16.65); the bucket from the message's top two bytes (cycles 340.2 M to 336.1 M); name and note bytes added as one 64-bit field (616.3 M with the rest). Board run-a5c4d0536268: T 14.754 ms, M 7.80, S 377, K 56.05; the same code again as a9af0b7, run-aeb5ee4b7a28: T 14.921 ms, M 8.29, K 55.05.
 - v64: the timeline of v63 (timestamps in a copy of the program) showed 11 threads idle for 0.75 ms while main alone faulted memory in: main's first huge page 0.24 ms, the clones 0.11, huge pages 2 and 3 0.55, the page-table pages 0.30; regions done at 0.49; parse ends 13.0, drained 13.09, report 13.39, all done 13.54. One helper thread (thread 11) now faults the third huge page and half the file's page-table pages. abn 16.66 to 16.34 (31 rounds). Memory: another CPU that charges a page costs a 256 KB batch, and the page-table pages use that batch up: median of 15 runs 7.57 to 7.67 MB. Error checks are back on open, clone and close.
-- v65: start-up balance. The helper is now cloned first, so it starts ahead of main, which still has the other clones to do, and it takes 5/8 of the file's page-table pages: 61 of 98, inside its 64-page charge batch, so little of the batch is left over. abn 16.29 to 16.23 (25 rounds), memory peak 7.50 to 7.40 MB, no lines added. Board run-6d3cdfadd754: T 14.32 ms, M 8.07, S 373, K 56.60; the same code again as 3fa85cb, run-ec315dedca74: T 14.446 ms, M 7.92, K 56.56.
+- v65: start-up balance. The helper is now cloned first, so it starts ahead of main, which still has the other clones to do, and it takes 5/8 of the file's page-table pages: 61 of 98, inside its 64-page charge batch, so little of the batch is left over. abn 16.29 to 16.23 (25 rounds), memory peak 7.50 to 7.40 MB, no lines added. Board run-6d3cdfadd754: T 14.32 ms, M 8.07, S 373, K 56.60; the same code as 3fa85cb, run-ec315dedca74: T 14.446 ms, M 7.92, K 56.56; and as 3d9eece on a busy board, run-f269418aae73: T 17.674 ms, M 7.90, K 51.17.
+- v66 (aaffcdd): no speed work, for reading. The source now stands in clang-format's own layout (S counts that form anyway), comments above their lines and true to the code, clearer field names, and mmap failures stop the program with an error. The comments-and-names build has the same machine code as v65 (.text SHA compared). The mmap checks: S +6, abn 16.31 against 16.30 (25 rounds), all checks clean. S +8 in all, about 0.3 % of K given up on purpose. Board run-f0e57703613f: T 15.995 ms, M 10.02, S 382, K 51.10.
 
 ## Other processes on the scoring box
 
@@ -98,7 +106,7 @@ A busy loop on one CPU for the whole run made v24 25 times slower (546 ms). v43'
 
 - Board reads vary with load: while the board was busy, other teams' latest runs read 2 to 4 ms over their best. The final runs have the machine to themselves.
 - M spikes on the same code with T unaffected: 7.80 and 8.29 MB for v63, 10.24 for v61. Our hypothesis, not proven: per-CPU 256 KB charge batches left by processes that ran in the cgroup before the program; only main and the helper charge in our design, so nothing consumes them. A quiet box stays at 7.8 to 8.05.
-- Stress test of the final code (box 1, medians of 15): quiet 16.7 ms, one hog on a CPU 22.4, two hogs 24.6.
+- Stress test of v65, the same hot loops as the final code (box 1, medians of 15): quiet 16.7 ms, one hog on a CPU 22.4, two hogs 24.6.
 
 ## A crash found and fixed
 
