@@ -1,10 +1,10 @@
 //! Track A: per (hour, endpoint) request count, nearest-rank p50/p95/p99 latency and 5xx rate.
 //! The threads claim an mmap of /data/requests.log in 256 KiB blocks, in file order, and write each line as a 32-bit
-//! row into its hour's region. An hour is finished (counted, selected, formatted) as soon as the registered prefix of
+//! row into its hour's region. An hour is finished (counted, sorted, formatted) as soon as the registered prefix of
 //! the file holds a line two hours later, while other threads keep parsing; its text is written over its rows, placed
 //! in hour order and written at its offset, and the region pooled for a later hour: only a few hours' rows are alive at
-//! once. Main tricks: parse and line (a-56, a-57), Table (a-10, a-40, a-57), finish and select_ranks (a-58), Rows (a-59,
-//! a-60), the pipeline (a-55).
+//! once. Main tricks: parse and line (a-56, a-57), Table (a-10, a-40, a-57), finish and deal (a-61), Rows (a-59, a-60),
+//! the pipeline (a-55).
 use std::arch::x86_64::*;
 use std::sync::atomic::{AtomicUsize, Ordering::*};
 use std::sync::{Condvar, Mutex};
@@ -469,162 +469,17 @@ impl Rows {
     }
 }
 
-/// Row m: the lanes whose bit is set in m, in order, then the clear lanes, in order; one byte per lane.
-const fn perms() -> [u64; 256] {
-    let (mut t, mut m) = ([0u64; 256], 0);
-    while m < 256 {
-        let (mut j, mut n) = (0, 0);
-        while j < 16 {
-            if (m >> (j & 7) & 1 == 1) == (j < 8) {
-                t[m] |= ((j & 7) as u64) << (8 * n);
-                n += 1;
-            }
-            j += 1;
-        }
-        m += 1;
+/// One stable counting pass: src to dst in the order of the 10 bits at `shift`, whose counts are in hist.
+fn deal(src: &[u32], dst: &mut [u32], hist: &mut [u32; 1024], shift: u32) {
+    let mut at = 0;
+    for c in hist.iter_mut() {
+        (*c, at) = (at, at + *c);
     }
-    t
-}
-static PERM: [u64; 256] = perms();
-
-/// out[i] = the value at 0-based position ranks[i] of a once sorted ascending. ranks is ascending (repeats allowed)
-/// and each rank is below a.len(); a is reordered freely; b is scratch of at least a.len().
-fn select_ranks(a: &mut [i32], b: &mut [i32], ranks: &[u32], out: &mut [i32]) {
-    debug_assert!(b.len() >= a.len() && ranks.iter().all(|&r| (r as usize) < a.len()));
-    // Safety: go reads and writes only a[..len] and b[..len].
-    unsafe { go(a.as_mut_ptr(), b.as_mut_ptr(), 0, a.len(), ranks, out) }
-}
-
-/// Quickselect on src[lo..hi), partitioning into dst; the two swap roles at each level.
-unsafe fn go(src: *mut i32, dst: *mut i32, lo: usize, hi: usize, ranks: &[u32], out: &mut [i32]) {
-    if ranks.is_empty() {
-        return;
-    }
-    let n = hi - lo;
-    unsafe {
-        if n <= 16 {
-            let mut x = [0i32; 16];
-            let (s0, s1) = small(src.add(lo), n);
-            _mm256_storeu_si256(x.as_mut_ptr() as *mut __m256i, s0);
-            _mm256_storeu_si256(x.as_mut_ptr().add(8) as *mut __m256i, s1);
-            for (o, &r) in out.iter_mut().zip(ranks) {
-                *o = x[r as usize - lo];
-            }
-            return;
-        }
-        let pivot = median3(*src.add(lo), *src.add(lo + n / 2), *src.add(hi - 1));
-        let cut = partition(src, dst, lo, hi, pivot);
-        if cut == lo {
-            // The pivot is the range's minimum: split off every value equal to it.
-            if pivot == i32::MAX {
-                out.fill(i32::MAX);
-                return;
-            }
-            let cut = partition(src, dst, lo, hi, pivot + 1);
-            let k = ranks.partition_point(|&r| (r as usize) < cut);
-            out[..k].fill(pivot);
-            return go(dst, src, cut, hi, &ranks[k..], &mut out[k..]);
-        }
-        let k = ranks.partition_point(|&r| (r as usize) < cut);
-        let (below, above) = out.split_at_mut(k);
-        go(dst, src, lo, cut, &ranks[..k], below);
-        go(dst, src, cut, hi, &ranks[k..], above);
-    }
-}
-
-fn median3(a: i32, b: i32, c: i32) -> i32 {
-    a.max(b).min(c.max(a.min(b)))
-}
-
-/// Partitions src[lo..hi) by pivot into dst[lo..hi): values below it from lo up, the rest from hi down; returns the cut.
-unsafe fn partition(src: *const i32, dst: *mut i32, lo: usize, hi: usize, pivot: i32) -> usize {
-    let (mut l, mut r, mut t) = (lo, hi, lo);
-    unsafe {
-        let pv = _mm256_set1_epi32(pivot);
-        // r - l == hi - t throughout, so with 16 or more values unread both 8-lane stores land inside dst[l..r) apart.
-        while hi - t >= 16 {
-            let v = _mm256_loadu_si256(src.add(t) as *const __m256i);
-            let m = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(pv, v))) as usize;
-            let p = _mm256_permutevar8x32_epi32(
-                v,
-                _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(PERM[m] as i64)),
-            );
-            let c = m.count_ones() as usize;
-            _mm256_storeu_si256(dst.add(l) as *mut __m256i, p);
-            _mm256_storeu_si256(dst.add(r - 8) as *mut __m256i, p);
-            l += c;
-            r -= 8 - c;
-            t += 8;
-        }
-        while t < hi {
-            let v = *src.add(t);
-            *dst.add(l) = v;
-            *dst.add(r - 1) = v;
-            l += (v < pivot) as usize;
-            r -= (v >= pivot) as usize;
-            t += 1;
-        }
-    }
-    l
-}
-
-/// v and its lanes permuted by p, compared: the lanes set in M take the larger value.
-#[inline(always)]
-unsafe fn cx<const M: i32>(v: __m256i, p: __m256i) -> __m256i {
-    unsafe {
-        let w = _mm256_permutevar8x32_epi32(v, p);
-        _mm256_blend_epi32::<M>(_mm256_min_epi32(v, w), _mm256_max_epi32(v, w))
-    }
-}
-
-#[inline(always)]
-unsafe fn idx(a: [i32; 8]) -> __m256i {
-    unsafe { _mm256_loadu_si256(a.as_ptr() as *const __m256i) }
-}
-
-/// A bitonic register sorted ascending.
-#[inline(always)]
-unsafe fn clean8(v: __m256i) -> __m256i {
-    unsafe {
-        let v = cx::<0xF0>(v, idx([4, 5, 6, 7, 0, 1, 2, 3]));
-        let v = cx::<0xCC>(v, idx([2, 3, 0, 1, 6, 7, 4, 5]));
-        cx::<0xAA>(v, idx([1, 0, 3, 2, 5, 4, 7, 6]))
-    }
-}
-
-/// One register sorted ascending.
-#[inline(always)]
-unsafe fn sort8(v: __m256i) -> __m256i {
-    unsafe {
-        let p1 = idx([1, 0, 3, 2, 5, 4, 7, 6]);
-        let v = cx::<0xAA>(v, p1);
-        let v = cx::<0xCC>(v, idx([3, 2, 1, 0, 7, 6, 5, 4]));
-        let v = cx::<0xAA>(v, p1);
-        clean8(cx::<0xF0>(v, idx([7, 6, 5, 4, 3, 2, 1, 0])))
-    }
-}
-
-/// The n <= 16 values at p, padded with i32::MAX and sorted ascending across two registers.
-#[inline(always)]
-unsafe fn small(p: *const i32, n: usize) -> (__m256i, __m256i) {
-    unsafe {
-        let (max, n) = (_mm256_set1_epi32(i32::MAX), _mm256_set1_epi32(n as i32));
-        let m0 = _mm256_cmpgt_epi32(n, idx([0, 1, 2, 3, 4, 5, 6, 7]));
-        let v0 = sort8(_mm256_blendv_epi8(max, _mm256_maskload_epi32(p, m0), m0));
-        if _mm256_testz_si256(_mm256_cmpgt_epi32(n, _mm256_set1_epi32(8)), max) != 0 {
-            return (v0, max);
-        }
-        let m1 = _mm256_cmpgt_epi32(n, idx([8, 9, 10, 11, 12, 13, 14, 15]));
-        let v1 = sort8(_mm256_blendv_epi8(
-            max,
-            _mm256_maskload_epi32(p.add(8), m1),
-            m1,
-        ));
-        let w = _mm256_permutevar8x32_epi32(v1, idx([7, 6, 5, 4, 3, 2, 1, 0]));
-        (
-            clean8(_mm256_min_epi32(v0, w)),
-            clean8(_mm256_max_epi32(v0, w)),
-        )
+    for &r in src {
+        let b = &mut hist[(r >> shift & 1023) as usize];
+        // Safety: the counts add up to src.len(), which dst holds.
+        unsafe { *dst.get_unchecked_mut(*b as usize) = r };
+        *b += 1;
     }
 }
 
@@ -691,10 +546,7 @@ impl Job<'_> {
             slots: Box::new([0; SLOTS]),
             synced: 0,
         };
-        let (mut cur, mut scratch) = (
-            [(std::ptr::null_mut(), std::ptr::null_mut()); HOURS],
-            Vec::new(),
-        );
+        let mut cur = [(std::ptr::null_mut(), std::ptr::null_mut()); HOURS];
         let mut s = self.state.lock().unwrap();
         while !s.late {
             if s.next_hour == HOURS {
@@ -705,7 +557,7 @@ impl Job<'_> {
                 s.next_hour += 1;
                 drop(s);
                 self.ready.notify_all();
-                self.emit(h, self.finish(h, &mut scratch));
+                self.emit(h, self.finish(h));
             } else if s.next_block < nblocks && s.next_block < s.watermark + 2 * workers {
                 let b = s.next_block;
                 s.next_block += 1;
@@ -722,10 +574,10 @@ impl Job<'_> {
         }
     }
 
-    /// Hour h's output lines in endpoint byte order (spec 4). The rows are counted per endpoint and their latencies
-    /// copied to each endpoint's span in byte order; p50, p95 and p99 come from one quickselect per span for all three
-    /// ranks: two passes over the rows and no sort. The text is written over the rows, in the hour's region.
-    fn finish(&self, h: usize, scratch: &mut Vec<i32>) -> &'static [u8] {
+    /// Hour h's output lines in endpoint byte order (spec 4). The rows are counted per endpoint, sorted by latency in two
+    /// counting passes and dealt to each endpoint's span in byte order, so every span is sorted and p50, p95 and p99 are
+    /// read off by rank. The text is written over the rows, in the hour's region.
+    fn finish(&self, h: usize) -> &'static [u8] {
         let order = self.dict.order();
         let (claimed, longs) = (
             self.rows.claimed[h].load(Relaxed),
@@ -737,39 +589,45 @@ impl Job<'_> {
             unsafe { std::slice::from_raw_parts_mut(self.rows.region(h), self.rows.stride) };
         let (region, long) = region.split_at_mut(self.rows.long_at);
         let (head, values) = region.split_at_mut(claimed.max(SPARE));
-        // Safety: u32 and i32 share size and alignment; the select reads the spans as i32.
-        let values = unsafe {
-            std::slice::from_raw_parts_mut(values.as_mut_ptr() as *mut i32, values.len())
-        };
-        let (rows, long) = (&head[..claimed], &long[..longs]);
+        // Safety: the long area holds (row, latency) pairs from an even offset of a page-aligned region, so as u64s
+        // (little-endian) they order by latency.
+        let long =
+            unsafe { std::slice::from_raw_parts_mut(long.as_mut_ptr() as *mut u64, longs / 2) };
+        let rows = &mut head[..claimed];
         let mut count = [0u32; 2 * IDS]; // by (id + 1) << 1 | 5xx; a free slot counts at 0
-        for &r in rows.iter().chain(long.iter().step_by(2)) {
+        let mut hist = [[0u32; 1024]; 2]; // by latency bits 0-9, 10-19
+        for &r in rows.iter() {
             count[(r >> 20) as usize] += 1;
+            hist[0][(r & 1023) as usize] += 1;
+            hist[1][(r >> 10 & 1023) as usize] += 1;
+        }
+        for &p in long.iter() {
+            count[(p as u32 >> 20) as usize] += 1;
         }
         // By id + 1; start[0] is a trash slot past every span, where the free slots go.
-        let (mut start, mut sum, mut big) = ([0u32; IDS], 0, 0);
+        let (mut start, mut sum) = ([0u32; IDS], 0);
         for &id in &order {
             let k = id as usize + 1;
-            let n = count[2 * k] + count[2 * k + 1];
-            (start[k], sum, big) = (sum, sum + n, big.max(n));
+            (start[k], sum) = (sum, sum + count[2 * k] + count[2 * k + 1]);
         }
         start[0] = sum;
         let mut next = start;
-        for &r in rows {
+        // Sorted by latency (values is scratch here), then dealt to the spans in that order: each span is sorted, the
+        // long latencies (all ESCAPE or more) last, sorted among themselves.
+        deal(rows, values, &mut hist[0], 0);
+        deal(&values[..claimed], rows, &mut hist[1], 10);
+        for &r in rows.iter() {
             let k = (r >> 21) as usize;
             // Safety: an endpoint's slots run from its start to its start plus its count, all below sum, and the trash
-            // slot is sum, all inside values (a row per line past head). The top bit is flipped so the select's i32
-            // order is the latencies' u32 order.
-            unsafe { *values.get_unchecked_mut(next[k] as usize) = (r & ESCAPE ^ 1 << 31) as i32 };
+            // slot is sum, all inside values (a row per line past head).
+            unsafe { *values.get_unchecked_mut(next[k] as usize) = r & ESCAPE };
             next[k] += (k != 0) as u32;
         }
-        for pair in long.chunks_exact(2) {
-            let k = (pair[0] >> 21) as usize;
-            values[next[k] as usize] = (pair[1] ^ 1 << 31) as i32;
+        long.sort_unstable();
+        for &p in long.iter() {
+            let k = (p as u32 >> 21) as usize;
+            values[next[k] as usize] = (p >> 32) as u32;
             next[k] += 1;
-        }
-        if scratch.len() < big as usize {
-            scratch.resize(big as usize, 0);
         }
 
         let mut label = [b' '; 32];
@@ -785,15 +643,8 @@ impl Job<'_> {
                 continue;
             }
             // Spec 3.4: 0-based index of rank ceil(p * n / 100).
-            let rank = |p: usize| ((p * n as usize + 99) / 100 - 1) as u32;
-            let mut at = [0i32; 3];
-            select_ranks(
-                &mut values[start[k] as usize..][..n as usize],
-                scratch,
-                &[rank(50), rank(95), rank(99)],
-                &mut at,
-            );
-            let [p50, p95, p99] = at.map(|v| v as u32 ^ 1 << 31);
+            let at = |p: usize| values[start[k] as usize + (p * n as usize + 99) / 100 - 1];
+            let (p50, p95, p99) = (at(50), at(95), at(99));
             // Spec 3.6: error_ppm = floor(errors * 1000000 / count), in 64 bits.
             let ppm = (errors as u64 * 1_000_000 / n as u64) as u32;
             let name = self.dict.name(id);

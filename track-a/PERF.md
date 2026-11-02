@@ -283,6 +283,16 @@ Experiments measured on our bench box only, with no board run (their box status 
     that lost the race pushed its untouched fresh region into the pool, so the pool started full of empty regions.
   - LOST: each hour falling back to its own region of the reservation (no fresh counter): peak +0.5 MB.
 - a-59 board: `3a7daea run-ee832571a339 | K 47.91 | T 18.59 ms | M 16.5 MB | S 673 | 84.02 points` (a-58: K 44.00).
+- a-61 (OURS), kept: the finish by radix, on a-60. One pass counts the rows per endpoint and builds two histograms
+  of the latency's 10-bit halves; two stable counting passes sort the hour's rows by latency (the region past the rows
+  is the other buffer); the deal to the endpoint spans keeps that order, so each span is sorted and the ranks are read
+  off. Long latencies: their (row, latency) pairs read as u64s order by latency, one sort_unstable, appended to their
+  spans. The AVX2 quickselect, its permutation table and the bitonic base case go (S 698 -> 566). Box, 12 interleaved
+  rounds: `a-60 med 17.12 | a-61 18.07`; peak over 4 runs: a-60 17.2-17.8, a-61 16.2-16.9 MB (no select scratch per
+  thread); perf stat: user instructions 671 -> 676 M, page faults 6.75 K -> 8.38 K, task-clock 182 -> 192 ms.
+  Expected K: T -2.7 %, M +1.2 %, S +3.2 %: +1.6 %. Hash checked at 1, 4, 12 and 24 workers (seed 1 has 0.24 % long
+  latencies, so the long path runs).
+  - LOST: four 5-bit passes instead of two 10-bit ones (32 buckets stay in L1): 19.29 ms, user instructions 754 M.
 
 ## Decisions
 
