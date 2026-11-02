@@ -128,6 +128,7 @@ unsafe fn ep_hash(p: *const u8, len: usize) -> u64 {
         x = _mm256_aesenc_epi128(x, load(p.add(len - 64)));
     }
     x = _mm256_aesenc_epi128(x, _mm256_zextsi128_si256(_mm_cvtsi64_si128(len as i64)));
+    // The last round key has no structure to cancel with the input (Knuth's MMIX multiplier; any odd constant would do).
     x = _mm256_aesenc_epi128(x, _mm256_set1_epi64x(0x5851_f42d_4c95_7f2d));
     let x = _mm_xor_si128(_mm256_castsi256_si128(x), _mm256_extracti128_si256::<1>(x));
     _mm_cvtsi128_si64(x) as u64
@@ -143,7 +144,7 @@ type Chunk = (*mut u32, *mut u32);
 /// The run's shared progress, under one lock. Each thread takes, in this order: an hour that is safe to finish, else the
 /// next block, at most two per thread past the oldest unparsed one, so few rows wait; else, once the input is parsed, the
 /// text of the next hour whose place is known; else it spins a moment and looks again (a sleep costs a wake-up, about
-/// 130 us on the box). Every 8th look it does sleep: its CPU goes idle, and an idle CPU takes over a thread that another
+/// 130 us on the box, an idle state's exit, PERF.md "Floors and budgets"). Every 8th look it does sleep: its CPU goes idle, and an idle CPU takes over a thread that another
 /// process has pushed off its own (a-70: 22.0 -> 15.1 ms beside one busy process; spinning threads leave that thread
 /// waiting for its turn, 3 ms or more). Measured effect: PERF.md a-55, a-67, a-69, a-70.
 #[derive(Default)]
@@ -184,6 +185,8 @@ static NAMES: Mutex<(Vec<Name>, Vec<u16>)> = Mutex::new((Vec::new(), Vec::new())
 fn insert(i: usize, h: u64, p: *const u8, len: usize) {
     let mut names = NAMES.lock().unwrap();
     if TABLE[i].load(Relaxed) == 0 {
+        // An id + 1 must fit its 11 bits and the Vec must not move (spec 2: 1,842 endpoints).
+        assert!(names.0.len() + 1 < IDS);
         // Safety: the endpoint is the len bytes at p, in the input's mapping, which is never unmapped.
         names.0.push(unsafe { from_raw_parts(p, len) });
         TABLE[i].store(h >> 11 << 11 | names.0.len() as u64, Relaxed);
@@ -358,7 +361,9 @@ fn text(h: usize, (offset, size): (usize, usize), out: *mut u8, cells: *mut Cell
     let (day, hour) = (DAYS[(h + 18) / 24], (h + 18) % 24);
     let label = format!("{day}T{hour:02}:00:00Z{:12}", "");
     let mut tmp = [0u8; 512];
-    // finish's arrays, unused below this frame, give their pages back (MADV_DONTNEED 4).
+    // finish's arrays give their pages back (MADV_DONTNEED 4): finish and text are called from the same frame in work, and
+    // finish is not inlined, so its arrays (about 49 KiB) lie in the 128 KiB below this frame. If they did not, only the peak
+    // would suffer: nothing in that range is in use.
     let below = (tmp.as_ptr() as usize & !4095) - 4096;
     unsafe { madvise((below - (1 << 17)) as *const u8, 1 << 17, 4) };
     // Safety: the output is mapped past every hour's place, the names as in finish; each copy reads only its own
@@ -508,10 +513,11 @@ extern "C" fn holder(_: *mut u8) -> i32 {
 
 /// Thread i of a run starts threads 2i and 2i + 1: the last one is up after four spawns, not eleven.
 fn go<'s, 'e>(s: &'s Scope<'s, 'e>, i: usize, job: (&'static [u8], usize, usize, usize, usize)) {
-    for c in [2 * i, 2 * i + 1].into_iter().filter(|&c| c <= job.3) {
+    let (data, out, cells, workers, lag) = job;
+    for c in [2 * i, 2 * i + 1].into_iter().filter(|&c| c <= workers) {
         s.spawn(move || go(s, c, job));
     }
-    work(job.0, job.1, job.2, job.3, job.4);
+    work(data, out, cells, workers, lag);
 }
 
 #[unsafe(no_mangle)]
