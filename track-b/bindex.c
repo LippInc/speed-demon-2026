@@ -29,7 +29,7 @@ static inline __m128i ld128(const void *p) { return _mm_loadu_si128((const __m12
 
 #define PHDOCS 63000      // docs per phase at most, so a phase-local doc number fits a u16 below the 0xFFFF sentinel
 #define SH 10             // term shards: 1 << SH terms each
-#define SCAP (1u << 20)   // entries per worker per shard, address space only
+static uint32_t SCAP;     // entries per worker per shard (address space only), set in main: 2^20 / workers
 #define PCAP (1u << 22)   // list entries per shard, address space only
 #define QB 64             // queries per claim
 #define MAXTOK 65536      // tokens per doc; the spec's longest doc (999 units) has ~10,000
@@ -63,7 +63,7 @@ typedef struct { u64 sum; u32 cnt, nid, top[10]; } Tally;   // a query's answer 
 // words per bitmap row.
 typedef struct {
     _Alignas(64) u64 *keys, *bt, *sa, *sb;
-    u32 *ids, *aps, *dl, *rl, *sbase, *sp[65], *sdf, nsd, nhit, hcap, cnt[3];
+    u8 *sdf; u32 *ids, *aps, *dl, *rl, *sbase, *sp[65], nsd, nhit, hcap, cnt[3];
     u16 *la, *lb;
     u8 *db;
     Hit *hit;
@@ -76,7 +76,7 @@ static const u8 *doc, *qtxt;
 static size_t dlen, qlen, qs[WMAX + 1], *pstart;
 static u32 ndocs, nq, ndense, nsparse, nterms, qcount[WMAX], qbase[WMAX + 1], *pfirst;
 static u8 *qkind, *qk, *qop, bflag[NSLOT];     // query q: terms at qterm[8q..], op before term i at qop[8q+i]
-static u32 *qterm, *sdfs, *sampdf, *newid, *aoff, *aq, *aj, *an;
+static u8 *sdfs; static u32 *qterm, *sampdf, *newid, *aoff, *aq, *aj, *an;
 static size_t sdfsize;
 static u64 *bm;                                // the phase's bitmap rows, W64 words each
 static u32 *off, *end, W64, bclaim[256], qclaim[256];   // a list term's list: post[off[s] .. end[s])
@@ -238,13 +238,13 @@ static void parse(const u8 *p, const u8 *e, u32 q) {
 static void sample(Worker *me, int w) {
     int p = w;
     const u8 *q = doc + pstart[p], *end = q + (pstart[p + 1] - pstart[p]) / SAMPLE_DIV;
-    u32 d = 0, n, *sdf = me->sdf = sdfs + (size_t)w * NSLOT;
+    u32 d = 0, n; u8 *sdf = me->sdf = sdfs + (size_t)w * NSLOT;
     while (q < end) {
         q = tokenize(skip_id(q), me->keys, &n);
         d++;
         for (u32 i = 0; i < n; i++) {
             u32 v = lookup(me->keys[i]);
-            if (v != MISS && sdf[v] >> 16 != d) sdf[v] = d << 16 | ((sdf[v] + 1) & 0xFFFF);
+            if (v != MISS) sdf[v] += sdf[v] < 255;
         }
     }
     me->nsd = d;
@@ -311,6 +311,7 @@ static _Alignas(32) u32 PACK[256][8];
 #ifndef AHEAD
 #define AHEAD 12
 #endif
+#define RING 512
 static void scan_part(Worker *me, int p) {
     const u32 ND = ndense, NS = nsparse, DW = ND / 64 + 1, pf = pfirst[p / nw * nw], d0 = pfirst[p] - pf, de = pfirst[p + 1] - pf;
     u64 *bt = me->bt, *K = me->keys;
@@ -323,7 +324,7 @@ static void scan_part(Worker *me, int p) {
     for (u32 d = d0; d < de; d++) {
         // the current doc's hashes sit at K + a, the next doc's right after them,
         // so the prefetch ahead needs no choice of buffer
-        if (a > 8192) { memmove(K, K + a, (size_t)n * 8); a = 0; }   // keep the touched memory small
+        if (a > RING) { memmove(K, K + a, (size_t)n * 8); a = 0; }   // keep the touched memory small
         const u64 *cur = K + a;
         if (d + 1 < de) q = tokenize(skip_id(q), K + a + n, &nn);
         u32 na = 0, ndh = 0, nr = 0;
@@ -521,6 +522,13 @@ static void eval_range(Worker *me, u32 lo, u32 hi, u32 first) {
                 t->cnt += cn; t->sum += cs + (u64)cn * first;
                 goto next_query;
             }
+            if (!rb && o == OR && rn + xn > 128) {
+                memset(db, 0, (size_t)W64 * 8);
+                for (u32 k = 0; k < rn; k++) db[rl[k] >> 6] |= 1ull << (rl[k] & 63);
+                for (u32 k = 0; k < xn; k++) db[xl[k] >> 6] |= 1ull << (xl[k] & 63);
+                rb = db;
+                continue;
+            }
             if (!rb) {
                 rn = o == OR ? unite(rl, rn, xl, xn, dl) : filt(rl, rn, xl, xn, dl, o == AND);
                 rl = dl;
@@ -595,7 +603,7 @@ static void *worker(void *arg) {
     thr /= DENSE_DIV;
     for (u32 s = lo; s < hi; s++) {
         u32 t = 0;
-        for (int i = 0; i < nw; i++) t += wk[i].sdf[s] & 0xFFFF;
+        for (int i = 0; i < nw; i++) t += wk[i].sdf[s];
         sampdf[s] = t;
         if (tab[s >> 3].tag[s & 7]) me->cnt[cls(s, thr)]++;
     }
@@ -682,6 +690,7 @@ int main(int argc, char **argv) {
     sched_getaffinity(0, sizeof cs, &cs);
     nw = getenv("SD_WORKERS") ? atoi(getenv("SD_WORKERS")) : CPU_COUNT(&cs);
     if (nw < 1 || nw > WMAX) nw = nw < 1 ? 1 : WMAX;
+    SCAP = (1u << 20) / nw;
     doc = map_file(in, "docs.txt", &dlen);
     qtxt = map_file(in, "queries.txt", &qlen);
     for (int w = 0; w <= nw; w++) {            // query shares: byte ranges cut at line starts
@@ -693,8 +702,8 @@ int main(int argc, char **argv) {
     tab = huge(sizeof(Bucket) << BBITS);
     for (u32 b = 0; b <= BMASK; b++) tab[b].val[7] = MISS;
     for (u32 L = 0; L <= 16; L++) memset(LM[L], 0xFF, L);
-    sdfs = huge(sdfsize = (size_t)(nw + 2) * NSLOT * 4);   // each worker's sample counts, their sums, the new ids
-    sampdf = sdfs + (size_t)nw * NSLOT; newid = sampdf + NSLOT;
+    sdfs = huge(sdfsize = (size_t)(nw + 8) * NSLOT);   // each worker's sample counts, their sums, the new ids
+    sampdf = (u32 *)(sdfs + (size_t)nw * NSLOT); newid = sampdf + NSLOT;
     aoff = arena((size_t)NSLOT * 4 + 4); aq = arena(maxq * 4); aj = arena(maxq * 4); an = arena(maxq * 4);
     qterm = arena(maxq * 32); qop = arena(maxq * 8); qk = arena(maxq); qkind = arena(maxq);
     size_t t = dlen - 1;
