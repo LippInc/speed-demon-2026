@@ -3,7 +3,8 @@
 // possible. The clock covers the whole process, so the build matters as much as
 // the queries.
 //
-// Phases, in order, each run on all workers between spin barriers:
+// Phases, in order. All but the output run on all workers, between spin
+// barriers:
 // 1. Parse: read the edge file in 48 pieces, pack edges into a grid of cells.
 // 2. First rows: four edge slots per node, written over the finished cells.
 // 3. Zones: breadth-first zones that contract roads while they order nodes.
@@ -13,8 +14,8 @@
 //
 // Three ideas the rest of the file leans on:
 // - Road contraction during the breadth-first pass: a node with at most two
-//   ways out and no query on it is not a decision point, so an edge walks
-//   through it.
+//   ways out and no query on it is walked through when only one way is not the
+//   way the walk came from. With two such ways it stays a real node.
 // - 4-byte edges with a small table for large weights: head and an 11-bit
 //   weight fit 32 bits, and the rare larger weight waits in a lock-free hash
 //   table.
@@ -113,6 +114,7 @@ static void touch_job(int t) {
   for (u32 i; (i = BUMP(&touch_next, 1)) < touch_count;)
     *(volatile u8 *)(touch_from + i * PAGE2M) = 0;
 }
+// Fault one address range in, a huge page at a time, on all workers.
 static void touch_pages(u8 *from, size_t bytes) {
   touch_from = from, touch_next = 0;
   touch_count = (bytes + PAGE2M - 1) / PAGE2M;
@@ -123,6 +125,7 @@ static void touch_pages(u8 *from, size_t bytes) {
 // for every kind of edge index.
 
 enum { RAW_KIND = 1, FWD_KIND, REV_KIND, ZONE_KIND, TABLE_SLOTS = 1 << 15 };
+// Key 0 marks an empty slot, which is why the kinds start at 1.
 static struct {
   u64 key, value;
 } *heavy_table;
@@ -133,7 +136,8 @@ INLINE u64 heavy_slot(u64 key) { return (key * 0x9E3779B97F4A7C15ull) >> 49; }
 
 // Lock-free insert with linear probing. The table runs about half full at this
 // scale (see PERF.md), so probes stay short. The kind bits in the key let every
-// edge layout share one table.
+// edge layout share one table. There is no full check: more keys than slots
+// would spin here forever, which the README lists as a limit.
 static void heavy_put(u32 kind, u64 index, u64 value) {
   u64 key = (u64)kind << 48 | index;
   for (u64 i = heavy_slot(key);; i = (i + 1) % TABLE_SLOTS) {
@@ -289,8 +293,8 @@ static void parse_piece(int p, u8 **cursor) {
     for (; i + 3 < have && sp[i] + 1 < piece_bytes; i += 3) {
       u32 e[3];
       read_line(a, sp + i, e);
-      // A weight at or above 16,383 does not fit the record's 14-bit field, so
-      // the edge is parked here and joined to its bucket in the rows phase.
+      // Weights of 16,383 and above are kept out of the record's 14-bit field,
+      // so the edge is parked here and joined to its bucket in the rows phase.
       if (UNLIKELY(e[2] >= 16383)) {
         rare_edges[BUMP(&rare_count, 1)] = (InputEdge){e[0], e[1], e[2]};
         continue;
@@ -322,6 +326,8 @@ static void parse_piece(int p, u8 **cursor) {
 // spreads the first touches of the state pages over all workers.
 INLINE u32 ends_cut(int t) { return 2 * query_count * t / workers; }
 
+// One worker's parse: its share of the endpoint marks, then pieces until none
+// are left.
 static void parse_job(int t) {
   // Endpoints must carry the QUERIED flag before the rows phase decides which
   // nodes are leaves, or a query node could be contracted away into a road.
@@ -345,6 +351,8 @@ static u32 spill_top = 1, round_next, round_end;
 // node, and flat staging lists for the fifth and later edges before they are
 // spilled.
 typedef struct {
+  // A byte per node: a node with 256 or more input edges would lose edges. The
+  // README lists this as a limit; road-like graphs stay far below it.
   u8 fill[BUCKET_NODES];
   u32 next[BUCKET_NODES];
   u32 extra_low[1 << 16], extra_edge[1 << 16];
@@ -776,6 +784,7 @@ static __attribute__((noinline)) void bucket_grow(Searcher *s, Bucket *b) {
   if (fresh)
     s->spare[k] = *(u32 **)fresh;
   else
+    // The 16 extra entries are the slack for the read-ahead in drain.
     fresh = (u32 *)s->pool, s->pool += (cap + 16) * 4ul;
   u32 count = b->count;
   if (count) {
@@ -795,6 +804,8 @@ static __attribute__((noinline)) u32 new_block(Front *f, u32 v) {
   return at;
 }
 
+// A node's label on this side, or FAR if its block was never handed out: the
+// directory then gives block 0, which stays blank, so no check is needed.
 INLINE u32 seen(const Front *f, u32 v) {
   return f->labels[(size_t)f->dir[v >> BLOCK_BITS] << BLOCK_BITS |
                    (v & (BLOCK - 1))];
@@ -844,6 +855,10 @@ INLINE void drain(Searcher *s, int side, const u32 *off, const u32 *adj,
     const u32 *p = cb->entry;
     u32 pass_end = cb->count, improved = 0;
     for (; k < pass_end; k++) {
+      // Prefetch the offsets 8 entries ahead and the row 4 ahead. Near the end
+      // of the list these read past count: bucket_grow leaves 16 spare entries,
+      // a stale value is masked to the node range, and that part of the arena
+      // is mapped, so the worst case is a useless prefetch.
       fetch(&off[p[k + 8] & NODE_MASK]);
       fetch(&adj[off[p[k + 4] & NODE_MASK]]);
       u32 u = p[k] & NODE_MASK, d = base | p[k] >> NODE_BITS;
@@ -943,8 +958,8 @@ static u64 wide_search(u32 src, u32 dst) {
       heap[at] = item;
     }
   }
-  // These two arrays are the biggest per-query memory; the pages rebuild
-  // themselves if another wide query needs them, so they are handed back here.
+  // These two arrays are the biggest per-query memory. Each wide query takes a
+  // new range, so these pages are never used again and go back here.
   u64 answer = dist[dst] - 1; // INF when never reached
   madvise(dist, new_n * 8ul, MADV_DONTNEED);
   madvise(heap, new_m * 16ul, MADV_DONTNEED);
@@ -960,7 +975,7 @@ static u64 search(Searcher *s, u32 src, u32 dst, u64 limit) {
   if (rev_off[src] == rev_off[src + 1]) {
     // No path returns to src, so its distance is the best first edge plus a
     // search from there. These sources have first edges near 2^32 (spec section
-    // 5), which would otherwise send a long way to the 64-bit search.
+    // 2), which would otherwise send a long way to the 64-bit search.
     u64 shortest = limit, lowest = INF;
     for (u32 i = fwd_off[src]; i < fwd_off[src + 1]; i++)
       lowest = fwd_weight(i) < lowest ? fwd_weight(i) : lowest;
@@ -1008,6 +1023,8 @@ static u64 *answers;
 // node that side has not seen returns FAR with no separate check.
 static void query_job(int t) {
   Searcher *s = small_region(sizeof(Searcher));
+  // 64 MB of address space for bucket arrays, with no bounds check: recycling
+  // keeps a thread far below this. The README lists it as a limit.
   s->pool = small_region(1ul << 26);
   s->improved = small_region(new_m * 8ul);
   for (int side = 0; side < 2; side++) {
@@ -1030,6 +1047,8 @@ static void release_zones_job(int t) {
   madvise(z->edges, m * 4ul, MADV_DONTNEED);
 }
 
+// The phases in order: each all_workers call is one phase, with the main thread
+// as worker 0 and the serial work between phases kept as small as possible.
 int main(void) {
   const char *pg = "/data/graph.txt", *pq = "/data/queries.txt",
              *po = "/out/distances.txt";
@@ -1084,7 +1103,8 @@ int main(void) {
   all_workers(parse_job);
   for (u32 b = 0; b < buckets; b = round_end) {
     // Each round reaches as far as the rows can go without touching a bin not
-    // yet read.
+    // yet read. That advances only while a bucket's bins are larger than its
+    // rows (128 KB); at full scale they are about 198 KB.
     round_next = b,
     round_end = (PAGE2M + b * cell_bytes * PIECES) / (BUCKET_NODES * 16ul);
     round_end = round_end < buckets ? round_end : buckets;
