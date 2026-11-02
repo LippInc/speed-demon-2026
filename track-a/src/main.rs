@@ -2,12 +2,11 @@
 //! The threads claim an mmap of /data/requests.log in 256 KiB blocks, in file order, and write each line as a 32-bit
 //! row into its hour's region. An hour is finished (counted, selected, formatted) as soon as the registered prefix of
 //! the file holds a line two hours later, while other threads keep parsing; its text is written over its rows, placed
-//! in hour order and written at its offset, and the region given back: only a few hours' rows are alive at once.
-//! Main tricks: parse and line (a-56, a-57), Table (a-10, a-40, a-57), finish and select_ranks (a-58), Rows (a-59), the
-//! pipeline (a-55).
-
+//! in hour order and written at its offset, and the region pooled for a later hour: only a few hours' rows are alive at
+//! once. Main tricks: parse and line (a-56, a-57), Table (a-10, a-40, a-57), finish and select_ranks (a-58), Rows (a-59,
+//! a-60), the pipeline (a-55).
 use std::arch::x86_64::*;
-use std::sync::atomic::{AtomicUsize, Ordering::Acquire, Ordering::Relaxed, Ordering::Release};
+use std::sync::atomic::{AtomicUsize, Ordering::*};
 use std::sync::{Condvar, Mutex};
 use std::{
     cell::UnsafeCell, collections::BTreeMap, fs::File, os::fd::AsRawFd, os::unix::fs::FileExt,
@@ -256,8 +255,9 @@ impl Table {
         if let Some(id) = self.find(dict, p, ep.len(), hash) {
             return id;
         }
-        let id = self.synced; // == published, which only the lock holder moves
-        // Safety: only the holder of `adding` writes, and no thread reads names[id] before the Release below.
+        // id = synced = published, which only the lock holder moves. Safety: only the holder of `adding` writes, and no
+        // thread reads names[id] before the Release below.
+        let id = self.synced;
         let name = unsafe { &mut (*dict.names[id].get()).0 };
         name[..ep.len()].copy_from_slice(ep);
         name[127] = ep.len() as u8;
@@ -373,19 +373,27 @@ unsafe fn put(w: *mut u8, v: u32) -> *mut u8 {
 /// A row is (endpoint id + 1) << 21 | 5xx << 20 | latency, 0 for a slot no line took; a line with a latency of ESCAPE
 /// or more (0.24 pct on seed 1) goes to its hour's long area instead, as the row without the latency, then the latency.
 const ESCAPE: u32 = (1 << 20) - 1;
+/// Regions the pool keeps; past that a region is given back (MADV_DONTNEED). In the steady state one hour's region
+/// goes in as the next hour's comes out, so one keeps nearly every page fault away (box, page faults: none 13.9K, one
+/// 6.98K, unbounded 6.50K) for ~+0.6 MB of peak, where an unbounded pool grows to 11 regions and +3.8 MB.
+const POOL: usize = 1;
 /// Rows a thread claims in one hour's region at a time.
 const CLAIM: usize = 256;
 /// An hour's text is written over its rows, so the latencies the finish copies out start at least this many rows
 /// (512 KiB) in: past the longest text (spec 2: 1,842 endpoints of at most 213 bytes a line).
 const SPARE: usize = 1 << 17;
 
-/// Every hour's rows: one region each in an anonymous reservation (MAP_NORESERVE), of which only the pages touched
+/// Every hour's rows: a region each, from an anonymous reservation (MAP_NORESERVE) of which only the pages touched
 /// cost memory. Threads claim CLAIM rows at a time, so a row needs no atomic; an hour's region holds its rows, then
-/// its latencies grouped by endpoint, then at long_at its long area, and is given back once its text is written.
+/// its latencies grouped by endpoint, then at long_at its long area. Once its text is written the region goes to the
+/// pool (up to POOL) and a later hour takes it, pages already faulted in: a fresh region per hour cost 7.8K page
+/// faults (a-59).
 struct Rows {
     base: *mut u32,
     stride: usize,
     long_at: usize,
+    regions: [AtomicUsize; HOURS],    // 0 until the hour takes one
+    pool: Mutex<(Vec<usize>, usize)>, // finished regions; regions taken from the reservation
     claimed: [AtomicUsize; HOURS],
     longs: [AtomicUsize; HOURS],
 }
@@ -409,21 +417,43 @@ impl Rows {
             base: base as *mut u32,
             stride,
             long_at: stride - 2 * lines,
+            regions: [const { AtomicUsize::new(0) }; HOURS],
+            pool: Mutex::default(),
             claimed: [const { AtomicUsize::new(0) }; HOURS],
             longs: [const { AtomicUsize::new(0) }; HOURS],
         }
     }
 
-    /// Hour h's region.
+    /// Hour h's region; the first thread to ask gives it one.
     fn region(&self, h: usize) -> *mut u32 {
-        self.base.wrapping_add(h * self.stride)
+        match self.regions[h].load(Acquire) {
+            0 => self.take(h),
+            r => r as *mut u32,
+        }
     }
 
-    /// A new chunk of hour h: its first row and its end.
+    /// Under the pool's lock, which every write of `regions` holds: a pooled region, else the reservation's next one
+    /// (a run touches ~11 of them; an hour's own region at h * stride touched all 72, +0.4 MB of page tables).
+    #[cold]
+    fn take(&self, h: usize) -> *mut u32 {
+        let mut pool = self.pool.lock().unwrap();
+        if self.regions[h].load(Relaxed) == 0 {
+            let fresh = self.base.wrapping_add(pool.1 * self.stride) as usize;
+            let r = pool.0.pop().unwrap_or(fresh);
+            pool.1 += (r == fresh) as usize;
+            self.regions[h].store(r, Release);
+        }
+        self.regions[h].load(Relaxed) as *mut u32
+    }
+
+    /// A new chunk of hour h: its first row and its end. A pooled region holds an older hour's bytes, and a row no
+    /// line takes must read 0, so the chunk is zeroed first.
     fn claim(&self, h: usize) -> (*mut u32, *mut u32) {
         let at = self
             .region(h)
             .wrapping_add(self.claimed[h].fetch_add(CLAIM, Relaxed));
+        // Safety: the chunk lies inside the region (stride holds a row per line plus a chunk per thread).
+        unsafe { at.write_bytes(0, CLAIM) };
         (at, at.wrapping_add(CLAIM))
     }
 
@@ -702,7 +732,7 @@ impl Job<'_> {
             self.rows.longs[h].load(Relaxed),
         );
         // Safety: the region is stride rows; its rows are all written (their blocks are registered) and no other thread
-        // touches it until it is given back.
+        // touches it until it goes to the pool.
         let region =
             unsafe { std::slice::from_raw_parts_mut(self.rows.region(h), self.rows.stride) };
         let (region, long) = region.split_at_mut(self.rows.long_at);
@@ -786,7 +816,7 @@ impl Job<'_> {
     }
 
     /// Hands over hour h's text, places every hour that is ready in order, and writes those at their offsets, so
-    /// threads write at once; each region is given back once its text is out.
+    /// threads write at once; each region goes to the pool, or back to the kernel, once its text is out.
     fn emit(&self, h: usize, text: &'static [u8]) {
         let mut ready = Vec::new();
         {
@@ -800,8 +830,13 @@ impl Job<'_> {
         }
         for (h, offset, t) in ready {
             self.file.write_all_at(t, offset).expect("write output");
-            // Safety: the region is the hour's, page-aligned, and nothing reads it any more; 4 is MADV_DONTNEED.
-            unsafe { madvise(self.rows.region(h) as *const u8, self.rows.stride * 4, 4) };
+            let mut pool = self.rows.pool.lock().unwrap();
+            if pool.0.len() < POOL {
+                pool.0.push(self.rows.regions[h].load(Relaxed));
+            } else {
+                // Safety: the region is page-aligned and nothing reads it any more; 4 is MADV_DONTNEED.
+                unsafe { madvise(self.rows.region(h) as *const u8, self.rows.stride * 4, 4) };
+            }
         }
     }
 

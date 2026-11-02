@@ -271,6 +271,18 @@ Experiments measured on our bench box only, with no board run (their box status 
   - without PR_SET_THP_DISABLE: 47 ms and a 42 MB peak (the box runs THP always: each hour's first row took a 2 MiB
     page).
   - LOST: the span buffer per thread instead of in the region (v26c): 20.13 ms and +3 MB (malloc's per-thread arenas).
+- a-60 (OURS), kept: a pool of finished regions, on a-59. a-59's fresh region per hour faulted in every page of every
+  hour (page faults 6.1 K -> 13.9 K against a-58, task-clock 172 -> 195 ms). Now a region whose text is written goes
+  to a pool and a later hour takes it, its pages already faulted in; a chunk is zeroed when claimed, since a pooled
+  region holds an older hour's bytes. Pool size, box (perf stat 10 runs; peak one run each): none 13.9 K faults,
+  19.20 ms, 16.67 MB; two 6.97 K, 17.62 ms, 16.94 MB; four 6.75 K, 17.71 ms, 18.28 MB; unbounded 6.50 K, 17.84 ms,
+  20.48 MB (11 regions). Sizes 1, 2 and 3 measure level within the noise (T 17.1-17.4 ms, peak medians 17.4-17.9
+  MB); kept one. 20 interleaved rounds: `a-59 med 18.27 | a-60 17.12`; peak over 6 runs (median): a-59 16.8, a-60
+  17.4 MB. Expected K +2.0 % (T +3.3 %, M -0.7 %, S 673 -> 698: -0.5 %). Hash checked at 1, 4, 12 and 24 workers.
+  - first cut (a CAS per hour, a separate fresh counter): S 714; its lower peak came from an accident: a thread
+    that lost the race pushed its untouched fresh region into the pool, so the pool started full of empty regions.
+  - LOST: each hour falling back to its own region of the reservation (no fresh counter): peak +0.5 MB.
+- a-59 board: `3a7daea run-ee832571a339 | K 47.91 | T 18.59 ms | M 16.5 MB | S 673 | 84.02 points` (a-58: K 44.00).
 
 ## Decisions
 
