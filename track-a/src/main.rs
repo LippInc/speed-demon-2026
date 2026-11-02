@@ -22,10 +22,10 @@ use std::{thread::Scope, time::Duration};
 // Spec 2: every timestamp lies in the same 72 hours for every seed and scale, 2026-10-30T18:00Z to 2026-11-02T17:59Z.
 const HOURS: usize = 72;
 const DAYS: [&str; 4] = ["2026-10-30", "2026-10-31", "2026-11-01", "2026-11-02"];
-// Spec 2: exactly 1,842 distinct endpoints per seed, so global ids stay below 2,048 (11 bits).
+// Spec 2: exactly 1,842 distinct endpoints per seed, and 2,047 ids at most fit their 11 bits (insert asserts it).
 const IDS: usize = 2048;
-// 1 MiB: two blocks share a 2 MiB page table, so at most two threads fault in its pages under its lock at once (256 KiB
-// blocks: eight; that lock took 16-18 pct of the kernel's cycles, box 16.29 -> 15.42 ms, a-64).
+// 1 MiB: two blocks share a 2 MiB page table, so at most two threads fault in its pages under its lock at once (with 256 KiB
+// blocks, eight threads did; that lock took 16-18 pct of the kernel's cycles, box 16.29 -> 15.42 ms, a-64).
 const BLOCK: usize = 1 << 20;
 // An hour is finished once the parsed prefix of the file reaches a line LAG hours later. Spec 2 promises no bound on how
 // far a line is out of order (generated files: at most one hour behind the latest hour before it), so a line that comes
@@ -167,7 +167,7 @@ static POOL: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 static CLAIMED: [AtomicUsize; HOURS] = [const { AtomicUsize::new(0) }; HOURS];
 /// How many lines of each hour are on its long list.
 static LONG: [AtomicUsize; HOURS] = [const { AtomicUsize::new(0) }; HOURS];
-/// How far each mapping's range has been given back at the end of the run.
+/// How far each range has been given back at the end of the run: the input past its first 8 MiB, those 8 MiB, the output.
 static RELEASED: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
 /// Every endpoint met so far, one table for all threads, open addressing with linear probing. A slot is the hash's top
 /// 53 bits and the id + 1 in the low 11, 0 when empty: the hash alone is an endpoint's identity, and for 1,842 of them
@@ -537,6 +537,7 @@ extern "C" fn main() -> i32 {
     unsafe { mallopt(-8, 1) };
     // No transparent huge pages (PR_SET_THP_DISABLE 41): with THP on, an hour's first row would charge 2 MiB.
     unsafe { prctl(41, 1usize, 0usize, 0usize, 0usize) };
+    // Safety, for this function's system calls: they take constants, descriptors and mappings made here, no Rust data.
     let map = |len, prot, flags, fd| unsafe { mmap(null_mut(), len, prot, flags, fd, 0) };
     let file = File::open("/data/requests.log").expect("open input");
     let len = file.metadata().expect("stat input").len() as usize;
@@ -559,12 +560,13 @@ extern "C" fn main() -> i32 {
     let cells = map(HOURS * IDS * size_of::<Cell>(), 3, 0x4022, -1) as usize;
     NAMES.lock().unwrap().0.reserve(IDS);
     let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
+    // The redo below runs with an argument: no hour is finished early.
     let lag = [LAG, HOURS][(std::env::args().len() > 1) as usize];
     std::thread::scope(|s| go(s, 1, (data, out, cells, workers, lag)));
     let st = STATE.lock().unwrap();
     if st.late {
         // A line came after its hour was finished. Nothing is written yet: again, with no hour finished before every
-        // block is parsed, so the output is exact for any line order.
+        // block is parsed, so the output is exact for any line order. exec returns only if it failed.
         panic!("{}", Command::new("/proc/self/exe").arg("redo").exec());
     }
     let last = st.places[HOURS - 1];

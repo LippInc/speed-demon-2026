@@ -2,7 +2,7 @@
 
 Every step from the reference to our final version, with every live-board run we read that measured it.
 
-Where it ended (a-71): best board run of this code run-3191e8227293, K 58.10, T 15.65 ms, M 14.92 MB (14.23 MiB), S 401 (397 lines of Rust and 4 of Dockerfile), D 1. It has this one board reading so far (row 136). Box: T 14.16 ms (median of interleaved rounds), peak mean 13.72 and highest of 40 14.54 MiB. Three more seeds at full scale: hash 9/9 against the reference, T 13.97-14.26 ms. The reference: T 32,047 ms, M 228 MB. The earlier code with the holder process read K 62.50 (a-70, run-a2177c230402, T 13.87 ms, M 14,258,176 bytes, S 392), and the team's best on the board still comes from that code (run-bc60b2aae6a7, commit 61c1200, K 62.50). This code, without it, is the entry; a-71 says why.
+Where it ended (a-71): best board run of this code run-cf37373cc5d6, K 58.20, T 15.52 ms, M 15.10 MB (14.40 MiB), S 401 (397 lines of Rust and 4 of Dockerfile), D 1. The same code on the board also read T 15.65 to 18.17 ms (row 136-138). Box: T 14.16 ms (median of interleaved rounds), peak mean 13.72 and highest of 40 14.54 MiB. Three more seeds at full scale: hash 9/9 against the reference, T 13.97-14.26 ms. The reference: T 32,047 ms, M 228 MB. The earlier code with the holder process read K 62.50 (a-70, run-a2177c230402, T 13.87 ms, M 14,258,176 bytes, S 392), and the team's best on the board still comes from that code (run-bc60b2aae6a7, commit 61c1200, K 62.50). This code, without it, is the entry; a-71 says why.
 
 Terms used below:
 
@@ -16,7 +16,7 @@ Terms used below:
 - The "rule 30 kit" is our own correctness check: the output's hash at 1, 4, 12 and 24 workers on the official data. The "full local kit" (481 cases) adds inputs outside the spec, such as more than 2,048 endpoints, and the 58 that a-66 fails are all of that kind.
 - "A rank 5" is our place on the track A board when that run landed.
 
-| Step | Change | Run ID (every board run of the code) | T (ms) | M (MB) | Points | KNOWN/OURS | Spread (box T) | Kept/reverted |
+| Step | Change | Run ID (every board run of the code we read; where none was saved the row says so and the box is the evidence) | T (ms) | M (MB) | Points | KNOWN/OURS | Spread (box T) | Kept/reverted |
 |---|---|---|---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 32047.0 | 228.0 | 0 | - | - | - |
 | 1 | a-1, the floor | f15421b · Track A (run-b0eb3a208c93) | 156.8 | 45.4 | 59.3 | KNOWN | - | kept, part replaced (a-4) |
@@ -84,7 +84,7 @@ Terms used below:
 | 63-68 | a-56: the forward line walk (kit 538b841) | 85ba2e7 · Track A (run-ae665535dd56); 172a905 · Track A (run-00e07ffcc7bc); 8d3d412 · Track A (run-e9a9abef1d45); ad8a046 · Track A (run-fbad22dfe0ba); 2306aa9 · Track A (run-a40151211d38); 81fcaa9 · Track A (run-e164be93bbcd) | 25.5-27.2 | 20.6-21.7 | 80.3-80.9 | OURS | 22-23 ms | kept |
 | 69-98 | a-56 with cold functions compacted, S 464 → 451, the same work (kit a85da0e) | 09f081f · Track A (run-ac61b19f1e99); 5bcd2df · Track A (run-c0264a2ab8de); 7450b2c · Track A (run-baa506e0f979); 9b9d3c0 · Track A (run-f42a57164dd7); dfcd820 · Track A (run-4645b5b37f42); e733519 · Track A (run-5c2823471e01); and 24 board runs whose IDs we did not save, one per push from 2b5dbbc (11-01 12:10Z) to e733519 (11-01 22:24Z) | 23.8-27.6 | 20.2-21.5 | 80.3-81.7 | OURS | 22-23 ms | kept |
 | 99 | a-57: the CPU cut, finish by two counting passes and a deal, CRC32 lookup | f0b3b86 · Track A (run-9eeff87230e9) | 19.5 | 25.3 | 82.5 | OURS + KNOWN | - | kept |
-| 100 | a-58: finish by one quickselect per endpoint span | 4f9b0f5 · Track A (run-62d88f26d2ed) | 20.5 | 21.1 | 82.2 | OURS + KNOWN | - | kept |
+| 100 | a-58: finish by one quickselect per endpoint span | 4f9b0f5 · Track A (run-62d88f26d2ed) | 20.5 | 21.1 | 82.2 | OURS + KNOWN | - | kept; this one board reading went the wrong way, the box decided (see Terms) |
 | 101 | a-59: 32-bit rows in per-hour regions of one reserved mapping | 3a7daea · Track A (run-ee832571a339) | 18.6 | 17.3 | 84.0 | OURS | - | kept |
 | 102 | a-60: a one-region pool of finished hours' regions | e566598 · Track A (board run of 11-02 00:49Z; ID not saved) | 20.8 | 17.9 | 82.5 | OURS | A/B 20 rounds: a-59 18.27 → a-60 17.12 ms; the box is the evidence for this step | kept |
 | 103 | a-61: the finish by radix, two stable 10-bit counting passes | 4c54723 · Track A (run-210a1ffa297a) | 18.3 | 17.4 | 84.7 | KNOWN | - | kept |
@@ -92,7 +92,7 @@ Terms used below:
 | 105 | a-63: one shared endpoint table keyed by a 64-bit AES hash | f173813 · Track A (run-e1ffe83193a9) | 17.2 | 17.5 | 85.9 | OURS | A/B 11 rounds: a-62 16.47 → 16.27 ms | kept |
 | 106 | a-64: 1 MiB blocks, at most two threads faulting the input under one lock | bc73e3c · Track A (run-760e0ef7d853) | 16.1 | 17.4 | 87.0 | OURS | A/B 15 rounds: a-63 16.24 → 15.49 ms | kept |
 | 107-109 | a-65: the finish's radix split 9 / 11 bits | 0ca2530 · Track A (board run of 11-02 02:26Z; ID not saved); 8875804 · Track A (run-8cffec26c59b); 846449f · Track A (run-ffd993386390) | 15.6-18.9 | 17.1-17.4 | 85.3-87.4 | OURS | A/B 15 rounds: a-64 15.43 → 9/11 15.07 ms | kept |
-| 110 | a-66: a shorter program with the same work (S 430 → 393) | a517db7 · Track A (run-0814c130face) | 18.8 | 18.9 | 85.3 | OURS | A/B 15 rounds: 15.29 → 15.29 ms (level) | kept for S 430 → 393 at level box T; run-0814c130face read K 50.70; rows 111-115 re-ran at 15.4-16.5 |
+| 110 | a-66: a shorter program with the same work (S 430 → 393) | a517db7 · Track A (run-0814c130face) | 18.8 | 18.9 | 85.3 | OURS | A/B 15 rounds: 15.29 → 15.29 ms (level) | kept for S 430 → 393 at level box T; this one board reading went the wrong way (K 50.70), the box decided; rows 111-115 re-ran at 15.4-16.5 |
 | 111-115 | a-66 with the input mapping's result checked (S 393 → 394) | 43bc63a · Track A (run-09f11a65e004); 70462d0 · Track A (run-f1787b62faff); 2311c16 · Track A (run-d0ece92f742e); 55c6a91 · Track A (run-f3f6446cea6b); e216ed8 · Track A (run-f3114ad69b74) | 15.4-16.5 | 17.3-17.6 | 87.0-87.8 | OURS | - | kept |
 | 116 | a-67: late text (hours keep compact cells, all text goes into the output's pages at the end) and the holder (a second process in this address space, so the mappings' teardown falls after the timed exit); S 394 → 465 | 2166c29 · Track A (run-8aad14f168bb) | 14.8 | 14.9 | 88.3 | KNOWN (late text), OURS (holder) | box: 14.67-14.78 against the tip's 14.88-15.01 ms | late text kept; holder taken out in a-71 |
 | 117-119 | a-68: plain statics and free functions, single-stage image (S 465 → 411) | 554e334 · Track A (run-3cec091fa462); c037e19 · Track A (run-1c43d50006eb); e4619c7 · Track A (run-ee4ddef3eda6) | 14.9-15.1 | 14.8-15.1 | 88.4-88.7 | OURS | A/B: 14.74 → 14.59 ms | kept |
@@ -102,7 +102,7 @@ Terms used below:
 | - | a-70: threads start in a tree; no bound on blocks; idle threads sleep a moment (S 383 → 392) | 69b7719 · Track A (no run ID saved; the box is the evidence for this step) | - | - | - | OURS | A/B: 13.53 → 13.37 ms (tree); beside one busy process 22.03 → 15.92 ms | bound put back in the next row |
 | 125-133 | a-70: bound of 2 blocks per thread back in, sleep every 8th idle look, built for the scoring CPU (from bfcd0c7 on with clearer local names, same behaviour) | e1cb148 · Track A (run-a2177c230402); 9954430 · Track A (run-383ff1e5ced7); fd2350d · Track A (run-f2a1f84d9027); 397ee86 · Track A (run-8d0ad0b0dcdb); bfcd0c7 · Track A (run-de811643c07d); 26559ad · Track A (run-b32bf8eac1af); 78587c9 · Track A (run-40cbe318d7e2); 73fcc4e · Track A (run-fe7b9847afa7); d25bbb9 · Track A (run-9e3c3fadf7bd) | 13.8-17.3 | 14.1-15.0 | 87.3-89.8 | OURS | box 13.31 ms; beside one busy process 15.05 | kept |
 | 134-135 | a-70: the endpoint cap's assert, named job fields at the thread start, comments (S 392 → 394) | c8dd92c · Track A (run-64956b117017); a2b2bdd · Track A (run-d87b83a859ae) | 14.6-15.4 | 14.0-14.1 | 88.7-89.3 | OURS | box 13.29 ms | kept in a-71 |
-| 136 | a-71: the holder out; at the end the threads give the input's and the output's pages back in shared steps (S 394 → 401) | a9af0b7 · Track A (run-3191e8227293) | 15.7-15.7 | 14.9-14.9 | 88.2-88.2 | OURS | A/B 21 rounds: no holder 16.54 → 14.16 ms; with the holder 13.29 | kept |
+| 136-138 | a-71: the holder out; at the end the threads give the input's and the output's pages back in shared steps (S 394 → 401) | a9af0b7 · Track A (run-3191e8227293); c77c4dd · Track A (run-cf37373cc5d6); 9399ebb · Track A (run-ce80ff538c06) | 15.5-18.2 | 13.9-15.1 | 86.9-88.2 | OURS | A/B 21 rounds: no holder 16.54 → 14.16 ms; with the holder 13.29 | kept |
 
 ## What each push carried
 
@@ -158,18 +158,18 @@ The board re-runs the same code on every push, so several rows can carry one exp
   - Built for the scoring CPU (target-cpu=alderlake; the harness README names the i5-13500 and the board allows it): 13.36 → 13.27 ms alone.
 - Holdout check for a-70: seeds 52719364, 248057911 and 7 at full scale (generated on the box): the hash matches the reference 9 of 9 on each, T 13.17, 13.15 and 13.37 ms against seed 1's 13.32, no redo, peak 13.05-14.47 MiB.
 - The redo's cost, on seed 1's lines shuffled, so a late line appears at once and the run starts over with no early finishing: 17.6-18.0 ms, hash 9/9.
-- a-71 takes the holder out. It removed no work, it only moved the teardown past the timer, and we want T to say how fast the program is. The teardown now happens inside the timed run, faster.
+- a-71 takes the holder out (the gain below is box-measured: the board has only run this form). It removed no work, it only moved the teardown past the timer, and we want T to say how fast the program is. The teardown now happens inside the timed run, faster.
   - Box, 21 rounds: with the holder 13.29 ms; no holder and no other change 16.54 ms (the exit tears down the input's 58 K page-table entries on one CPU, about 56 ns each); this code 14.16 ms.
   - Once all is claimed, the threads give pages back in shared steps: the input in 8 MiB steps, its first 8 MiB last since the names are there, and the output in 1 MiB steps up to 2 MiB before its end. A page still in use just faults in again, so the release can only cost time, and the output's hash checks that.
   - What is left of the gap, measured before the last two trims: the holder with this release reads 13.85 against 13.28, so the release costs about 0.57 ms in the threads and the rest of the exit about 0.52. In the profile the teardown's symbols are all real work: unmap_page_range 1.3 %, folio_remove_rmap_ptes 0.7 %, folios_put_refs 0.6 %.
   - Checks on this code: 55 of 55 cases; seeds 52719364, 248057911 and 7 hash 9/9 each, T 13.97, 13.98 and 14.26 ms; shuffled lines 19.2-19.6 ms, hash 9/9; beside one busy process 15.95 ms (with the holder 15.04); peak mean 13.72, highest of 40 14.54 MiB.
-  - The cost: T 13.30 → 14.16 ms and S 394 → 401, about 3.4 % of K.
+  - The cost: T 13.29 → 14.16 ms and S 394 → 401, about 3.5 % of K.
 
 Floors and budgets behind these steps (box, never lifted):
 
 - Timeline of a-66 (ms from spawn): main 0.38, first worker 0.70, last worker 1.04, first block 1.82, last block 13.30, last write 14.44, exit starts 14.54, reaped 14.83. A trivial static binary, spawn to reaped: 0.30.
 - Floor of the bare reading, 12 threads touching every byte of the 238.8 MB input: mmap 5.84 ms, with prefetch 5.85, MADV_POPULATE_READ per block 6.57, pread of 1 MiB 11.20, 256 KiB 7.19, 64 KiB 6.60; thread start and exit alone 0.26. So about 40 GB/s, on DDR4-3200 in two channels. About 100 of a line's 120 cycles across 12 threads are this floor.
-- CPU of a-70 (perf, cycles): parse and text 55 %, finish 20 %, kernel 23 %, the kernel's largest single symbols under 2.4 % each. All 12 threads are busy in nearly every millisecond (timeline at 20 kHz); 9.99 CPUs utilised over the elapsed time. Text in late-text form: 17.75 ms of CPU, format 9.1, shared page faults about 8.6 (2,500 pages at 3.4 us).
+- CPU of a-70 (perf, cycles; a-71's release adds about 4 % to the kernel's share): parse and text 55 %, finish 20 %, kernel 23 %, the kernel's largest single symbols under 2.4 % each. All 12 threads are busy in nearly every millisecond (timeline at 20 kHz); 9.99 CPUs utilised over the elapsed time. Text in late-text form: 17.75 ms of CPU, format 9.1, shared page faults about 8.6 (2,500 pages at 3.4 us).
 - Wake-up from idle, the sleep's cost in main.rs: the box's cpuidle table gives C2 an exit latency of 127 us and C3 1,048 us.
 - Page faults, 9.5 K a run: input 3.7 K, text 2.5 K, regions 2.4 K, cells and stacks 0.9 K.
 - Peak, at the very end of the run (dump at exit, a-69): output in shmem 9.64 MiB, anonymous memory 0.6, kernel 0.95 including page tables 0.67 (0.45 for the input), the memory cgroup's per-CPU charge stock 1.3-1.9; the peak itself is 0.4-1.5 above that end state. M of a batch is the highest of five peaks.
