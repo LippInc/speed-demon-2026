@@ -10,14 +10,10 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 // No Rust runtime set-up before main: no signal stack per thread, which is five system calls each.
 #![no_main]
-use std::arch::x86_64::*;
-use std::os::{fd::AsRawFd, unix::process::CommandExt};
-use std::ptr::{copy_nonoverlapping as copy, null_mut};
-use std::slice::{from_raw_parts, from_raw_parts_mut};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::*};
-use std::sync::{LazyLock, Mutex, OnceLock};
-use std::{collections::*, fs::File, process::Command};
-use std::{thread::Scope, time::Duration};
+use std::{arch::x86_64::*, collections::*, process::Command, sync::OnceLock, thread::Scope};
+use std::{fs::File, os::fd::AsRawFd, os::unix::process::CommandExt, sync::LazyLock, sync::Mutex};
+use std::{ptr::copy_nonoverlapping as copy, slice::from_raw_parts, slice::from_raw_parts_mut};
 
 // Spec 2: every timestamp lies in the same 72 hours for every seed and scale, 2026-10-30T18:00Z to 2026-11-02T17:59Z.
 const HOURS: usize = 72;
@@ -74,7 +70,6 @@ unsafe fn digits8(v: u64) -> u64 {
 /// the 3-digit status follows, its first digit '5' exactly for a 5xx, then the latency, whose digits one 8-byte load
 /// finds up to its LF. Read forward, the next line's start comes out of the latency's length: no LF search first.
 /// Safety: d + p..d + p + 128 must be readable, and so must the line's end + 32.
-#[inline(always)]
 unsafe fn line(d: *const u8, p: usize) -> (usize, usize, u32, usize) {
     let mut at = p + 28;
     let spaces = mask32(d.add(at), b' ') as u64 | (mask32(d.add(at + 32), b' ') as u64) << 32;
@@ -90,20 +85,15 @@ unsafe fn line(d: *const u8, p: usize) -> (usize, usize, u32, usize) {
     // After the xor a byte is a digit exactly when it is below 10; adding 0x76 sets the top bit of every other one.
     let other = (digits.wrapping_add(0x7676_7676_7676_7676) | digits) & 0x8080_8080_8080_8080;
     let n = other.trailing_zeros() as usize / 8;
-    let (latency, next) = if other == 0 {
-        // 8 digits or more (spec 2: at most 10): the rest one by one.
-        // The latency starts at end + 5 and digits8 read 8 digits, so the rest start at end + 13.
-        let (mut latency, mut q) = (digits8(digits), end + 13);
-        while *d.add(q) != b'\n' {
-            latency = latency * 10 + (*d.add(q) - b'0') as u64;
-            q += 1;
-        }
-        (latency, q + 1)
-    } else {
-        // n digits from end + 5, then the LF: the next line starts at end + 6 + n.
-        (digits8(digits << (64 - 8 * n)), end + 6 + n)
-    };
-    (ep, end - ep, latency as u32, next)
+    // n digits from end + 5, then the LF; with no other byte in the load n is 8, and any rest (spec 2: at most 10 digits)
+    // comes one by one.
+    let mut latency = digits8(digits << (64 - 8 * n));
+    let mut q = end + 5 + n;
+    while n == 8 && *d.add(q) != b'\n' {
+        latency = latency * 10 + (*d.add(q) - b'0') as u64;
+        q += 1;
+    }
+    (ep, end - ep, latency as u32, q + 1)
 }
 
 /// A 64-bit hash of the whole len-byte endpoint at p: its first and last 32 bytes, each cut to the endpoint, and from 65
@@ -111,7 +101,6 @@ unsafe fn line(d: *const u8, p: usize) -> (usize, usize, u32, usize) {
 /// work on both 16-byte halves at once, the length a round key. Two rounds follow the last input, which spreads every
 /// input bit over the whole half. Safety: p - 32..p + 128 must be readable. It is: an endpoint starts at byte 32 or later
 /// (a 27-byte timestamp, a method of 3 to 7 bytes, two spaces; spec 2), and the mapping has 4 KiB of zeros after the input.
-#[inline(always)]
 unsafe fn ep_hash(p: *const u8, len: usize) -> u64 {
     let load = |at: *const u8| _mm256_loadu_si256(at as _);
     // The lane numbers 0 to 31 (a constant once compiled) and the length, to cut a load to the endpoint's bytes.
@@ -132,12 +121,8 @@ unsafe fn ep_hash(p: *const u8, len: usize) -> u64 {
     _mm_cvtsi128_si64(x) as u64
 }
 
-/// An endpoint's bytes, where the line that first had it lies in the input's mapping: 128 bytes can be read from its start.
-type Name = &'static [u8];
 /// An hour's result for one endpoint: count, p50, p95, p99, errors, error_ppm (count 0: no line).
 type Cell = [u32; 6];
-/// A thread's open chunk of an hour's rows: next row, chunk end.
-type Chunk = (*mut u32, *mut u32);
 
 /// The run's shared progress, under one lock. Each thread takes, in this order: an hour that is safe to finish, else the
 /// next block, at most two per thread past the oldest unparsed one, so few rows wait; else, once the input is parsed, the
@@ -176,12 +161,12 @@ static RELEASED: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
 /// cache. A slot carries its id, so its load needs no ordering.
 static TABLE: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
 /// The names, by id, pushed under the lock into room for IDS made up front, so the Vec never moves and a name, once
-/// pushed, is never written again: readers keep a pointer to them. Then the ids in byte order, as last asked for.
-static NAMES: Mutex<(Vec<Name>, Vec<u16>)> = Mutex::new((Vec::new(), Vec::new()));
+/// pushed, is never written again: readers keep a pointer to them. A name is the endpoint's bytes where the line that first
+/// had it lies in the input's mapping: 128 bytes can be read from its start. Then the ids in byte order, as last asked for.
+static NAMES: Mutex<(Vec<&[u8]>, Vec<u16>)> = Mutex::new((Vec::new(), Vec::new()));
 
 /// A new endpoint for slot i, unless another thread just filled it.
 #[cold]
-#[inline(never)]
 fn insert(i: usize, h: u64, p: *const u8, len: usize) {
     let mut names = NAMES.lock().unwrap();
     if TABLE[i].load(Relaxed) == 0 {
@@ -194,7 +179,6 @@ fn insert(i: usize, h: u64, p: *const u8, len: usize) {
 }
 
 /// The id of the len-byte endpoint at p, a new one the first time it is met; p - 32..p + 128 must be readable.
-#[inline(always)]
 fn id(p: *const u8, len: usize) -> u32 {
     // Bit 11 set: no hash matches an empty slot. Safety: as the caller promises.
     let h = unsafe { ep_hash(p, len) } | 1 << 11;
@@ -210,7 +194,7 @@ fn id(p: *const u8, len: usize) -> u32 {
 
 /// The id of every endpoint met, in byte order (spec 4), and the names by id: the ids new since the last call are
 /// appended and sorted in, a stable sort that finds the sorted prefix as one run.
-fn order() -> (Vec<u16>, *const Name) {
+fn order() -> (Vec<u16>, *const &'static [u8]) {
     let mut guard = NAMES.lock().unwrap();
     let (names, order) = &mut *guard;
     if order.len() < names.len() {
@@ -244,7 +228,7 @@ fn hour_at(data: &[u8], p: usize) -> usize {
 /// Writes a row for every line starting in data[start..end] into its hour's region, through cur, this thread's open
 /// chunk per hour (next row, chunk end), and returns the lowest hour met. Reads may pass the input's end by up to 128
 /// bytes (main maps zeros there) and start up to 32 bytes before an endpoint, inside its line.
-fn parse(data: &[u8], (start, end): (usize, usize), cur: &mut [Chunk; HOURS]) -> usize {
+fn parse(data: &[u8], start: usize, end: usize, cur: &mut [(*mut u32, *mut u32); HOURS]) -> usize {
     let d = data.as_ptr();
     let (mut prev_prefix, mut p, mut h, mut low) = (u64::MAX, start, 0, HOURS);
     let mut chunk = cur[0]; // hour h's chunk (h starts at 0)
@@ -439,7 +423,7 @@ fn deal<const N: usize>(src: &[u32], dst: &mut [u32], hist: &mut [u32; N], shift
 /// One of the run's threads; out and cells are the output's and the cells' mappings, as addresses.
 fn work(data: &[u8], out: usize, cells: usize, workers: usize, lag: usize) {
     let nblocks = data.len().div_ceil(BLOCK);
-    let mut cur = [(null_mut(), null_mut()); HOURS];
+    let mut cur = [(std::ptr::null_mut(), std::ptr::null_mut()); HOURS];
     let mut idle = 0;
     let mut s = STATE.lock().unwrap();
     while !s.late && s.next_text < HOURS {
@@ -470,7 +454,7 @@ fn work(data: &[u8], out: usize, cells: usize, workers: usize, lag: usize) {
             let b = s.next_block;
             s.next_block += 1;
             drop(s);
-            let low = parse(data, (align(data, b), align(data, b + 1)), &mut cur);
+            let low = parse(data, align(data, b), align(data, b + 1), &mut cur);
             // A line of an hour already claimed marks the run late.
             s = STATE.lock().unwrap();
             let st = &mut *s;
@@ -496,7 +480,7 @@ fn work(data: &[u8], out: usize, cells: usize, workers: usize, lag: usize) {
             drop(s);
             idle += 1;
             if idle % 8 == 0 {
-                std::thread::sleep(Duration::from_micros(1));
+                std::thread::sleep(std::time::Duration::from_micros(1));
             }
             (0..64).for_each(|_| std::hint::spin_loop());
         }
@@ -515,10 +499,9 @@ fn work(data: &[u8], out: usize, cells: usize, workers: usize, lag: usize) {
             unsafe { madvise(start.add(at), step.min(len - at), 4) };
         }
     };
-    const NAMES_IN: usize = 8 << 20;
-    let rest = data.len().saturating_sub(NAMES_IN);
-    give_back(0, data.as_ptr().wrapping_add(NAMES_IN), rest, NAMES_IN);
-    give_back(1, data.as_ptr(), data.len().min(NAMES_IN), NAMES_IN);
+    let (start, len, step) = (data.as_ptr(), data.len(), 8 << 20);
+    give_back(0, start.wrapping_add(step), len.saturating_sub(step), step);
+    give_back(1, start, len.min(step), step);
     give_back(2, out as *const u8, end.saturating_sub(2 << 20), 1 << 20);
 }
 
@@ -538,7 +521,7 @@ extern "C" fn main() -> i32 {
     // No transparent huge pages (PR_SET_THP_DISABLE 41): with THP on, an hour's first row would charge 2 MiB.
     unsafe { prctl(41, 1usize, 0usize, 0usize, 0usize) };
     // Safety, for this function's system calls: they take constants, descriptors and mappings made here, no Rust data.
-    let map = |len, prot, flags, fd| unsafe { mmap(null_mut(), len, prot, flags, fd, 0) };
+    let map = |len, prot, flags, fd| unsafe { mmap(std::ptr::null_mut(), len, prot, flags, fd, 0) };
     let file = File::open("/data/requests.log").expect("open input");
     let len = file.metadata().expect("stat input").len() as usize;
     // Map the file read-only over an anonymous reservation 4 KiB longer (PROT_READ 1; MAP_PRIVATE | MAP_ANONYMOUS
