@@ -358,15 +358,20 @@ static u64 drain(int t, Agg *a) {
   return done;
 }
 
+// One step of a wait: a pause, and every 128th a 10 us sleep. A thread that
+// another process has pushed off its CPU then gets the CPU this one frees;
+// waits that only spin ran 15 times slower beside one busy process (PERF.md).
+static void rest(int *w) { ++*w % 128 ? _mm_pause() : (void)usleep(10); }
+
 // Sends x's batch for owner o. While the ring is full the sender files the
 // messages sent to it, so two threads that wait on each other both advance.
 // Every batch but a thread's last is whole, so none wraps the ring.
 static void post(Ctx *x, int o) {
   Ring *r = &ring[x->t][o];
   u64 n = x->fill[o], t = r->tail;
-  while (t + n - r->head > RING)
+  for (int w = 0; t + n - r->head > RING;)
     if (!drain(x->t, x->agg))
-      _mm_pause();
+      rest(&w);
   memcpy(r->m + t % RING, x->batch[o], 8 * n);
   atomic_store_explicit(&r->tail, t + n, memory_order_release);
   x->fill[o] = 0;
@@ -464,9 +469,9 @@ static void *worker(void *arg) {
     post(x, o);
   // After every send, so the last drain sees all
   atomic_fetch_add(&finished, 1);
-  while (finished < NT)
+  for (int w = 0; finished < NT;)
     if (!drain(t, x->agg))
-      _mm_pause();
+      rest(&w);
   drain(t, x->agg);
   // Every total is final: main writes them out meanwhile
   pthread_barrier_wait(&meet);

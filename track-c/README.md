@@ -28,7 +28,7 @@ None. The C standard library and POSIX threads, linked statically. Built by the 
 
 - **One pass instead of two (v51, measured on the last day).** Reading each record from its start, finding the note's end with the same quote-parity multiply as the name, removes pass 1. It ran 14 % fewer instructions (905 M against 1,048 M) but 9 % more cycles, because each record's start now waits for the previous record's end and instruction fetch stalled more (top-down: fetch latency 429 M against 251 M slots). Two to eight interleaved streams per thread (v52) did not recover it. Finding that stall is the most promising lead we have.
 - **The region table.** Its lookups cost about 1.6 ms. A 256 KB compressed table recovered only 0.55 ms; a layout that keeps the hot regions together might do better.
-- **The board gap.** The board measures us 0.5 to 1.7 ms slower than our copy of the scoring box. The earlier, larger gap matched another process sharing the L3 cache (PERF.md, "Other processes on the scoring box"). The final runs have the machine to themselves.
+- **The board gap.** The board measures us 0.5 to 1.7 ms slower than our copy of the scoring box. The earlier, larger gap matched another process sharing the L3 cache (PERF.md, "Other processes on the scoring box"). The final runs have the machine to themselves. One board run of unchanged code took 326.8 ms, 15 times the usual: a process holding one CPU stalls threads that only spin. Since v53 a waiting thread sleeps 10 us after every 128 pauses: 30.0 ms instead of 331 ms beside a busy loop, the same speed on a quiet box (PERF.md, "Other processes on the scoring box").
 
 ## Reproduce
 

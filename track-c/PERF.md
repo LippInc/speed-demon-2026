@@ -66,6 +66,7 @@ Box 2, fast loop, median T, then the live board's T for the same code. On 2026-1
 - v39, 20.64 ms, board 21.6 ms (run-33798317abda): one malloc arena.
 - v42, 20.45 ms: a new minimum or maximum amount is a branch, not a compare and store per record (a thread sees ~900 amounts per country, so the branch is almost never taken): -0.17 ms. `pthread_barrier_wait` instead of a spinning barrier: same speed, 7 fewer lines.
 - v43, 20.31 ms, board 21.3 ms as v49, the same code with its comments fixed (run-be7fc43b744a): each record's region table index lives in its record entry, not in an array of its own: one base register fewer in the first loop, which had kept 5 values on the stack (now 2). 1.02 G instructions.
+- v53, the same speed on a quiet box: every wait spins 128 pauses, then sleeps 10 us. On 2026-11-02 the board ran v43's unchanged code at 326.8 ms (run-2a0d82be6829), 15 times its usual 21 ms, while the teams' runs just before and after ours were normal. One busy loop on a CPU in 0-11 reproduces it (below).
 
 Wall time with parts switched off (v39): pass 1 alone 6.4 ms; then the numbers and region index +3.5, per-country totals +1.6, name hash +1.55, note lengths +1.55, sending names +1.5 (owners that take messages off the ring without filing them: 16.15 ms), owners filing them +4.5. Filing costs 59 instructions and 37 cycles per message. The same at v21: pass 1 alone 7.25 ms, the same as reading and scanning the file with nothing else (7.6 ms); then parsing and per-country sums +7.7, note lengths +0.8, name hash +0.85, sending names +3.0, owners filing them +4.5.
 
@@ -82,9 +83,20 @@ With a busy loop on one of CPUs 0-11 for 1 ms in every 5 (box 2, fast loop, medi
 
 A busy loop on one CPU for the whole run made v24 25 times slower (546 ms) and v26 8 times (172 to 192 ms).
 
+v43's code does the same: 331 ms with a busy loop on CPU 3 for the whole run, 439 ms with two loops anywhere in 0-11, against 23.3 ms quiet (our i5-13500 bench machine, static build under `taskset 0-11`, 40 interleaved rounds, medians). The board met it once, run-2a0d82be6829 at 326.8 ms. Every thread waits on every other, so the threads that only spin keep all twelve CPUs busy, and the thread that shares a CPU with the loop runs only in its turns of a few milliseconds while the rest wait for it. v53 sleeps 10 us after every 128 pauses of a wait: the freed CPU takes the stalled thread. Same rounds:
+
+| Wait | Quiet | 1 busy loop | 2 busy loops |
+|---|---|---|---|
+| spin only (v43) | 23.3 ms | 331 ms | 439 ms |
+| 128 pauses, then 10 us (v53) | 23.3 ms | 30.0 ms | 32.9 ms |
+| 256 pauses, then 20 us | 23.3 ms | 31.0 ms | 34.2 ms |
+| 512 pauses, then 20 us | 23.4 ms | 32.3 ms | 36.3 ms |
+
+Two longer settings, 20 rounds: 1,024 pauses then 50 us, 35.8 and 41.4 ms; 4,096 then 100 us, 58.0 and 70.7 ms. The output matched on seed 1 and a fresh seed, and with the program held to 1, 4 and 12 CPUs.
+
 On a quiet box, v27 and v39 each had 9 slow runs in 800 (more than 1.2 times the median), 4 or 5 of them between 60 and 180 ms: a thread that loses its CPU holds up the threads that send to it, with or without the overflow queue. The harness drops the slowest of 5 runs and repeats a batch whose middle three differ by more than 50 ms.
 
-v27 did not close the board gap: 3.8 ms slower on the board than on box 2, against 3.3 ms for v21, which had no defence against this noise. What matches the gap is another process using the shared L3: a cache-bound loop on the E-cores (CPUs 12-19) made v27 and the Rust version 3.3 to 3.8 ms slower alike, while a memory-bandwidth loop there cost nothing. Until the freeze the board's runs share the scoring machine; the final runs have it to themselves (organisers' FAQ), so v39 keeps the 2 ms it wins on a quiet box.
+v27 did not close the board gap: 3.8 ms slower on the board than on box 2, against 3.3 ms for v21, which had no defence against this noise. What matches the gap is another process using the shared L3: a cache-bound loop on the E-cores (CPUs 12-19) made v27 and the Rust version 3.3 to 3.8 ms slower alike, while a memory-bandwidth loop there cost nothing. Until the freeze the board's runs share the scoring machine; the final runs have it to themselves (organisers' FAQ), so v39 keeps the 2 ms it wins on a quiet box. v53 is for a stray process during the final runs: one would cost it 7 ms, not 300.
 
 ## What did not work (box 2)
 
