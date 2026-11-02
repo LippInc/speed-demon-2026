@@ -5,7 +5,7 @@ Reads 3,100,000 HTTP request log lines and, for every hour and endpoint that saw
 ## For the judges, in one minute
 
 - **The code:** one file, [src/main.rs](src/main.rs), Rust with the standard library only: 397 code lines, 401 with the Dockerfile's 4 (S). Its top comment describes the pipeline, and each function's comment says why it is shaped the way it is.
-- **The result:** 32.05 s → 14.2 ms on the box. The board reading follows when this commit has run.
+- **The result:** 32.05 s → 15.7 ms (about 2,050×), 228 MB → 14.9 MB. The best board run of this code, run-3191e8227293: T 15.65 ms, M 14.92 MB (14.23 MiB), S 401, D 1, K 58.10. It has this one board reading so far.
 - **Box against board:** on our copy of the scoring box (same CPU, 12 workers, a fresh tmpfs /out per run, interleaved rounds) this code reads T 14.16 ms and a peak of 13.72 MiB on average, 14.54 MiB at most over 40 runs. Its fastest round reads 14.02 ms and its medians stay at 14.16 to 14.21 ms. We see nothing else on the board's machine, so we read the board's higher and wider T as other work there, without proof. What supports it: beside one busy process the box reads 15.95 ms.
 - **Other seeds:** seeds 52719364, 248057911 and 7 at full scale match the reference's hash on 9 of 9 runs each, at T 13.97 to 14.26 ms, with no redo. A shuffled full file, which forces the redo, takes 19.2 to 19.6 ms, hash 9 of 9.
 - **Where each criterion's evidence is:** code quality in main.rs's comments; technique in the table below, each trick linked to its lines and its PERF step; the optimisation log in [PERF.md](PERF.md), with the board runs in its table and every failed experiment with its numbers.
