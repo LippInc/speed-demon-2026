@@ -95,7 +95,6 @@ static const u8 KEEP[64] = {[0 ... 31] = 0xFF}; // KEEP + 32 - n: n bytes kept
 // anonymous memory. A fixed address: an aligned static object would put the
 // small variables around it on two more huge pages.
 typedef struct {
-  Names names[NT];
   Ring ring[NT][NT];
   _Alignas(64) Agg agg[NT][256];
   Ctx ctx[NT];
@@ -104,12 +103,13 @@ typedef struct {
   int ncountry;
   pthread_mutex_t cmu; // zero bytes are an unlocked mutex
   atomic_int finished;
-  pthread_barrier_t meet; // all NT threads
+  atomic_int ready; // arrivals at the two meeting points
   _Alignas(64) _Atomic u64 piece; // the next piece of records.csv to parse
   _Alignas(4096) u8 stack[NT][1 << 14]; // the worker threads' stacks (the least pthreads takes)
+  Names names[NT]; // the rest of Mem fits the first huge page
 } Mem;
 _Static_assert(sizeof(Mem) <= 3 << 21, "three huge pages");
-#define mem (*(Mem *)(1ull << 40))
+#define mem (*(Mem *)(1ull << 30))
 
 static void die(const char *what) { perror(what), exit(1); }
 static inline V load32(const u8 *p) { return _mm256_loadu_si256((const void *)p); }
@@ -182,10 +182,11 @@ static int country(const u8 *p) { // numbers countries in order of first sight
   return c;
 }
 
-// The lines that start in this thread's twelfth of regions.csv (thread 0's
-// first line, the header, starts at 0 and is skipped).
+// The lines that start in this thread's eleventh of regions.csv (thread 1's
+// first line, the header, starts at 0 and is skipped). Thread 0, main, has none:
+// it is still faulting memory in.
 static void regions(int t) {
-  u64 p = t ? regsize * t / NT : 1, e = regsize * (t + 1) / NT;
+  u64 p = t > 1 ? regsize * (t - 1) / (NT - 1) : 1, e = regsize * t / (NT - 1);
   while (p < e && reg[p - 1] != '\n')
     p++;
   while (p < e) { // "id,CCC\n": plain ASCII, spec 2.3
@@ -240,6 +241,13 @@ static u64 drain(int t, Agg *a) {
 // waits that only spin ran 15 times slower beside one busy process (PERF.md).
 static void rest(int *w) { ++*w % 128 ? _mm_pause() : (void)usleep(10); }
 
+// Waits until n arrivals in all have reached the meeting points.
+static void meet(int n) {
+  atomic_fetch_add(&mem.ready, 1);
+  for (int w = 0; mem.ready < n;)
+    rest(&w);
+}
+
 // Sends x's batch for owner o. While the ring is full the sender files the
 // messages sent to it, so two threads that wait on each other both advance.
 // Every batch but a thread's last is whole, so none wraps the ring.
@@ -274,12 +282,13 @@ static u64 note_end(const u8 *b, u64 *qn) {
   }
 }
 
-// Reads the record at offset s into *rc; returns the next record's offset.
-static inline __attribute__((always_inline)) u64 parse(const u8 *f, const u8 *rt, u64 s, Rec *rc) {
+// Reads the record at b into *rc; returns the next record's start.
+static inline __attribute__((always_inline)) const u8 *parse(const u8 *b, const u8 *rt, Rec *rc) {
   V comma = _mm256_set1_epi8(',');
-  const u8 *b = f + s;
-  if (__builtin_expect(*b == 0xEF, 0)) // a BOM at a record start: 777 among 3.32 M records
+  if (__builtin_expect(*b == 0xEF, 0)) { // a BOM at a record start: 777 among 3.32 M records
     b += 3;
+    __asm__(""); // stays a branch: a cmov would put this load on the way to the next record
+  }
   V head = load32(b);
   _mm_prefetch((const char *)b + 512, _MM_HINT_T0);
   // A name is quoted unless empty, an id has 8 digits at most (spec 2.2).
@@ -309,19 +318,20 @@ static inline __attribute__((always_inline)) u64 parse(const u8 *f, const u8 *rt
       d = j + 1 + note_end(b + j + 1, &qn);
     }
   }
+  u64 idb = *(const u64u *)b << (64 - 8 * a);
   // The region and the amount. The commas, CRs and LFs are the bytes up to ',';
   // digits, '-', '.' and a BOM are above it.
   const u8 *r = b + d + 1;
   V tail = load32(r);
-  u32 m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_min_epu8(tail, comma), tail));
-  u64 c = _tzcnt_u32(m);
-  m = _blsr_u32(m);
-  u64 e = _tzcnt_u32(m); // the comma, the end of the amount
+  u64 m = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_min_epu8(tail, comma), tail));
+  u64 c = _tzcnt_u64(m);
+  m = _blsr_u64(m);
+  u64 e = _tzcnt_u64(m); // the comma, the end of the amount
   // The amount: its bytes up in the top of the lane, "DDDDD.CC" with the
   // point at byte 5; pext drops the point and the shift closes the gap.
   u64 v = *(const u64u *)(r + c + 1) << (64 - 8 * (e - c - 1));
   v = _pext_u64(v, 0xFFFF00FFFFFFFFFF) << 8;
-  V num = fold3(*(const u64u *)b << (64 - 8 * a), *(const u64u *)r << (64 - 8 * c), v);
+  V num = fold3(idb, *(const u64u *)r << (64 - 8 * c), v);
   u64 rid = _mm256_extract_epi64(num, 1), top = 1000001; // top: unmatched
   int32_t cents = _mm256_extract_epi64(num, 2);
   rid = rid < top ? rid : top;
@@ -332,26 +342,26 @@ static inline __attribute__((always_inline)) u64 parse(const u8 *f, const u8 *rt
   *rc = (Rec){h, _mm256_cvtsi256_si32(num), rid, nl, len - qn / 2 - (len != 0),
               r[c + 1] == '-' ? -cents : cents};
   // The next record: past the LF; a CR is followed by it
-  return r + e + 1 + (m >> (e + 1) & 1) - f;
+  return r + e + 1 + (m >> (e + 1) & 1);
 }
 
 // The records from a up to m and from m up to e, a run of up to RUN at a time:
 // parsed in turn from the two places, then totalled and sent on.
-static void records(Ctx *x, u64 a, u64 m, u64 e) {
+static void records(Ctx *x, const u8 *a, const u8 *m, const u8 *e) {
   // Locals, not globals: the stores below could alias those.
-  const u8 *f = rec, *rt = mem.rtab;
+  const u8 *rt = mem.rtab, *b = m;
   Agg *ag = x->agg;
   Rec *rs = x->rec;
-  u64 b = m, n;
+  u64 n;
   while (a < m || b < e) {
     for (n = 0; n + 2 <= RUN && a < m && b < e; n += 2) {
-      a = parse(f, rt, a, rs + n);
-      b = parse(f, rt, b, rs + n + 1);
+      a = parse(a, rt, rs + n);
+      b = parse(b, rt, rs + n + 1);
     }
     for (; n < RUN && a < m; n++)
-      a = parse(f, rt, a, rs + n);
+      a = parse(a, rt, rs + n);
     for (; n < RUN && b < e; n++)
-      b = parse(f, rt, b, rs + n);
+      b = parse(b, rt, rs + n);
     for (u64 r = 0; r < n; r++) {
       u64 co = rt[rs[r].reg], h = rs[r].h;
       Agg *g = ag + co;
@@ -384,13 +394,13 @@ static void *worker(void *arg) {
   for (int c = 0; c < 256; c++)
     mem.agg[t][c] = (Agg){.min = INT64_MAX, .max = INT64_MIN};
   regions(t);
-  pthread_barrier_wait(&mem.meet); // the region table is complete
+  meet(NT); // the region table is complete
   // Piece i is the (i / n)th of the 2 MB stretch i % n: threads working at
   // once never share a stretch's page-table lock when they fault pages in.
   u64 n = (rsize >> 21) + 1;
   for (u64 i; (i = atomic_fetch_add(&mem.piece, 1)) < 16 * n;) {
     u64 c = i % n * (1 << 21) + i / n * PIECE;
-    records(x, record_start(c), record_start(c + PIECE / 2), record_start(c + PIECE));
+    records(x, rec + record_start(c), rec + record_start(c + PIECE / 2), rec + record_start(c + PIECE));
     drain(t, x->agg);
   }
   for (int o = 0; o < NT; o++) // the partial batches
@@ -402,7 +412,7 @@ static void *worker(void *arg) {
       rest(&w);
   drain(t, x->agg);
   // Every total is final: main writes them out meanwhile
-  pthread_barrier_wait(&mem.meet);
+  meet(2 * NT);
   // Every record is parsed: the other threads drop an eleventh of the
   // mapping each, or exit tears down all 49,000 page-table entries on one CPU.
   if (t) {
@@ -456,16 +466,19 @@ int main(void) {
   // Fault the huge pages in here, and one page per 2 MB of each file (its
   // page-table page): a thread on another CPU that charges even one page to
   // the cgroup counts 256 KB against the peak (a per-CPU charge batch).
-  for (u64 i = 0; i < 3 << 21; i += 1 << 21) ((volatile u8 *)&mem)[i] = 0;
-  touch(rec, rsize), touch(reg, regsize);
+  *(volatile u8 *)&mem = 0;
+  touch(reg, regsize);
   pthread_t th[NT];
-  pthread_barrier_init(&mem.meet, 0, NT);
   pthread_attr_t at;
   pthread_attr_init(&at);
   for (long t = 1; t < NT; t++) {
     pthread_attr_setstack(&at, mem.stack[t], 1 << 14);
     if (pthread_create(&th[t], &at, worker, (void *)t)) die("pthread_create");
   }
+  // The threads fill the region table meanwhile: all they touch before the
+  // barrier lies on the first huge page.
+  for (u64 i = 1 << 21; i < 3 << 21; i += 1 << 21) ((volatile u8 *)&mem)[i] = 0;
+  touch(rec, rsize);
   worker(0);
   FILE *o = fopen("/out/aggregates.txt", "w");
   if (!o) die("/out/aggregates.txt");
