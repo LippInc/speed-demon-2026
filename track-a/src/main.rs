@@ -56,7 +56,7 @@ unsafe extern "C" {
 
 /// Byte mask of `byte` in the 32 bytes at p, one bit per byte. Safety: p..p + 32 must be readable.
 unsafe fn mask32(p: *const u8, byte: u8) -> u32 {
-    // AVX2 is enabled at compile time (x86-64-v3).
+    // AVX2 is enabled at compile time (target-cpu=alderlake, the scoring box's i5-13500).
     let v = _mm256_loadu_si256(p as _);
     _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(byte as i8))) as u32
 }
@@ -64,7 +64,7 @@ unsafe fn mask32(p: *const u8, byte: u8) -> u32 {
 /// The value of 8 decimal digits, one per byte (0 to 9), the most significant in the low byte: two multiply-add steps
 /// fold digit pairs, then 2-digit pairs, into two 4-digit halves.
 unsafe fn digits8(v: u64) -> u64 {
-    // SSE2 and SSSE3 are part of the x86-64-v3 baseline.
+    // SSE2 and SSSE3 are enabled at compile time too.
     let pairs = _mm_maddubs_epi16(_mm_cvtsi64_si128(v as i64), _mm_set1_epi16(0x010a));
     let r = _mm_cvtsi128_si64(_mm_madd_epi16(pairs, _mm_set1_epi32(0x0001_0064))) as u64;
     (r & 0xffff_ffff) * 10_000 + (r >> 32)
@@ -141,10 +141,11 @@ type Cell = [u32; 6];
 type Chunk = (*mut u32, *mut u32);
 
 /// The run's shared progress, under one lock. Each thread takes, in this order: an hour that is safe to finish, else the
-/// next block; else, once the input is parsed, the text of the next hour whose place is known; else it spins a moment and
-/// looks again (a sleep costs a wake-up, about 130 us on the box). Every 32nd look it does sleep: its CPU goes idle, and an
-/// idle CPU takes over a thread that another process has pushed off its own (a-70: 22.0 -> 15.9 ms beside one busy process;
-/// spinning threads leave it waiting for its turn, 3 ms or more). Measured effect: PERF.md a-55, a-67, a-69.
+/// next block, at most two per thread past the oldest unparsed one, so few rows wait; else, once the input is parsed, the
+/// text of the next hour whose place is known; else it spins a moment and looks again (a sleep costs a wake-up, about
+/// 130 us on the box). Every 8th look it does sleep: its CPU goes idle, and an idle CPU takes over a thread that another
+/// process has pushed off its own (a-70: 22.0 -> 15.1 ms beside one busy process; spinning threads leave that thread
+/// waiting for its turn, 3 ms or more). Measured effect: PERF.md a-55, a-67, a-69, a-70.
 #[derive(Default)]
 struct State {
     next_block: usize,
@@ -430,7 +431,7 @@ fn deal<const N: usize>(src: &[u32], dst: &mut [u32], hist: &mut [u32; N], shift
 }
 
 /// One of the run's threads; out and cells are the output's and the cells' mappings, as addresses.
-fn work(data: &[u8], out: usize, cells: usize, lag: usize) {
+fn work(data: &[u8], out: usize, cells: usize, workers: usize, lag: usize) {
     let nblocks = data.len().div_ceil(BLOCK);
     let mut cur = [(null_mut(), null_mut()); HOURS];
     let mut idle = 0;
@@ -459,7 +460,7 @@ fn work(data: &[u8], out: usize, cells: usize, lag: usize) {
             drop(s);
             // Safety: nothing reads the region now.
             unsafe { madvise(r, STRIDE * parsed as usize, 4) };
-        } else if s.next_block < nblocks {
+        } else if s.next_block < nblocks && s.next_block < s.watermark + 2 * workers {
             let b = s.next_block;
             s.next_block += 1;
             drop(s);
@@ -488,7 +489,7 @@ fn work(data: &[u8], out: usize, cells: usize, lag: usize) {
         } else {
             drop(s);
             idle += 1;
-            if idle % 32 == 0 {
+            if idle % 8 == 0 {
                 std::thread::sleep(Duration::from_micros(1));
             }
             (0..64).for_each(|_| std::hint::spin_loop());
@@ -510,7 +511,7 @@ fn go<'s, 'e>(s: &'s Scope<'s, 'e>, i: usize, job: (&'static [u8], usize, usize,
     for c in [2 * i, 2 * i + 1].into_iter().filter(|&c| c <= job.3) {
         s.spawn(move || go(s, c, job));
     }
-    work(job.0, job.1, job.2, job.4);
+    work(job.0, job.1, job.2, job.3, job.4);
 }
 
 #[unsafe(no_mangle)]
