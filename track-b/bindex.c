@@ -84,7 +84,7 @@ static u8 *sdfs; static u32 *qterm, *sampdf, *newid, *aoff, *aq, *aj, *an;
 static size_t sdfsize;
 static u64 *bm;                                // the phase's bitmap rows, W64 words each
 // a list term's list: post[off[s] .. end[s])
-static u32 *off, *end, W64, bclaim[256], qclaim[256];
+static u32 *off, *end, W64, bclaim[256], qclaim[256], pcur[256];
 static u16 *post;
 static Tally *tally;
 static pthread_barrier_t bar;
@@ -92,6 +92,7 @@ static pthread_barrier_t bar;
 // n bytes; on 2 MB-aligned huge pages when hp. Regular pages ask for NOHUGEPAGE:
 // a huge page would charge its untouched rest to peak memory.
 #define MF (MAP_PRIVATE | MAP_ANONYMOUS)
+#define HPV ((size_t)1 << 29)
 static void *arena(size_t n, int hp) {
     size_t a = hp ? (size_t)2 << 20 : 64;
     u8 *p = mmap(NULL, n + a, PROT_READ | PROT_WRITE, MF, -1, 0);
@@ -396,12 +397,16 @@ static void scan_part(Worker *me, int p) {
 // The lists of shard c: counted, then filled in worker order, which is document
 // order. Each list follows a 0xFFFF sentinel, so a repeat of a doc is dropped by
 // comparing with the last.
-static void build(u32 c) {
-    u32 lo = c << SH, hi = (c + 1) << SH, o = c * PCAP;
+static void build(u32 c, int k) {
+    u32 lo = c << SH, hi = (c + 1) << SH, o = 0;
     if (hi > nsparse) hi = nsparse;
     memset(end + lo, 0, (hi - lo) * 4);
-    for (int w = 0; w < nw; w++)
-        for (const u32 *e = wk[w].sbase + c * SCAP, *x = wk[w].sp[c]; e < x; e++) end[*e >> 16]++;
+    for (int w = 0; w < nw; w++) {
+        const u32 *e = wk[w].sbase + c * SCAP, *x = wk[w].sp[c];
+        o += (u32)(x - e);
+        for (; e < x; e++) end[*e >> 16]++;
+    }
+    o = __atomic_fetch_add(&pcur[k], o + hi - lo, __ATOMIC_RELAXED);
     for (u32 s = lo; s < hi; s++) { post[o] = 0xFFFF; off[s] = ++o; o += end[s]; end[s] = off[s]; }
     for (int w = 0; w < nw; w++)
         for (const u32 *e = wk[w].sbase + c * SCAP, *x = wk[w].sp[c]; e < x; e++) {
@@ -662,19 +667,19 @@ static void *worker(void *arg) {
     me->la = take(&h, maxnd * 2 + 64), me->lb = take(&h, maxnd * 2 + 64);
     me->sbase = arena((size_t)((65536 >> SH) + 1) * SCAP * 4, 0);
     if (!w) {
-        W64 = W, bm = arena((size_t)ndense * W * 8, 0);
-        off = arena(nsparse * 4, 0), end = arena(nsparse * 4, 0);
-        post = arena(33 * PCAP * 2, 0), tally = arena(nq * sizeof(Tally), 0);
+        size_t bs = (size_t)ndense * W * 8, ts = nq * sizeof(Tally), n = bs + ts + 8 * (size_t)nsparse + 33 * (size_t)PCAP * 2;
+        W64 = W, bm = n > HPV ? arena(n, 1) : (u64 *)sdfs;   // the samples' huge pages, already faulted in
+        tally = (Tally *)((u8 *)bm + bs), off = (u32 *)(tally + nq), end = off + nsparse, post = (u16 *)(end + nsparse);
     }
     pthread_barrier_wait(&bar);
-    w || munmap(sdfs, sdfsize);
+    memset(tally + (size_t)nq * w / nw, 0, ((size_t)nq * (w + 1) / nw - (size_t)nq * w / nw) * sizeof(Tally));
     for (int k = 0; k < PH; k++) {
         int p = k * nw + w;
         me->nhit = 0, scan_part(me, p);
         uintptr_t a = ((uintptr_t)doc + pstart[p] + 4095) & ~(uintptr_t)4095, b = ((uintptr_t)doc + pstart[p + 1]) & ~(uintptr_t)4095;
         if (a < b) madvise((void *)a, b - a, MADV_DONTNEED);   // the text's page-table entries, dropped in parallel, not at exit
         pthread_barrier_wait(&bar);
-        for (u32 c; (c = claim(&bclaim[k])) < ((nsparse + (1u << SH) - 1) >> SH);) build(c);
+        for (u32 c; (c = claim(&bclaim[k])) < ((nsparse + (1u << SH) - 1) >> SH);) build(c, k);
         pthread_barrier_wait(&bar);
         if (!w)                                // phrase matches, each worker's ascending, the workers in doc order
             for (int v = 0; v < nw; v++)
@@ -710,7 +715,7 @@ int main(int argc, char **argv) {
     for (u32 b = 0; b <= BMASK; b++) _mm256_store_si256((__m256i *)tab[b].val, _mm256_set1_epi32((int)MISS));
     for (u32 L = 0; L < 129; L++) memset(LM[L], 0xFF, L < 16 ? L : 16);
     // each worker's sample counts, their sums, the new ids
-    sdfs = arena(sdfsize = (size_t)(nw + 8) * NSLOT, 1);
+    sdfs = arena(HPV, 1), sdfsize = dlen / 21;
     sampdf = (u32 *)(sdfs + (size_t)nw * NSLOT), newid = sampdf + NSLOT;
     aoff = arena((size_t)NSLOT * 4 + 4, 0);
     aq = arena(maxq * 4, 0), aj = arena(maxq * 4, 0), an = arena(maxq * 4, 0);
