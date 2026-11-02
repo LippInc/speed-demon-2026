@@ -4,7 +4,7 @@ How join.c got to its speed, with the measurement behind each step. Rows named b
 
 ## Where it ended
 
-The final code is v66. It reads records.csv once per record with no pass 1, keeps each thread's state on three huge pages faulted in by main and one helper, and identifies distinct names by owner threads exchanging 8-byte messages (join.c's header walks the design). The board run run-f0e57703613f measured T 15.995 ms, M 10.02 MB, S 382, K 51.10; the reference takes 14.44 s, K 1. That run is the submission named in both this file and README.md. v66 is v65 with its layout and comments cleaned for reading and mmap failures checked: the same hot loops, which also read T 14.32 ms, K 56.60 as v65 (run-6d3cdfadd754). A quiet box reads lower than a busy board: until the final runs the board shares its machine, T moves with the load and M with what ran in the cgroup before us (section 6).
+The final code is v66. It reads records.csv once per record with no pass 1, keeps each thread's state on three huge pages faulted in by main and one helper, and identifies distinct names by owner threads exchanging 8-byte messages (join.c's header walks the design). The board run run-a1188d6eeb3d measured T 14.75 ms, M 8.10 MB, S 382, K 55.53; the reference takes 14.44 s, K 1. That run is the submission named in both this file and README.md. v66 is v65 with its layout and comments cleaned for reading and mmap failures checked: the same hot loops, which also read T 14.32 ms, K 56.60 as v65 (run-6d3cdfadd754). A quiet box reads lower than a busy board: until the final runs the board shares its machine, T moves with the load and M with what ran in the cgroup before us (section 6).
 
 ## Where it stands
 
@@ -24,7 +24,8 @@ The reads of v54, v56 and v60 to v62 are listed under the table by commit: our s
 | v65 | 6cafc7e | run-6d3cdfadd754 | 14.32 ms | 8.07 MB | 373 | 56.60 |
 | v65 (same code) | 3fa85cb | run-ec315dedca74 | 14.446 ms | 7.92 MB | 373 | 56.56 |
 | v65 (same code, a busy board) | 3d9eece | run-f269418aae73 | 17.674 ms | 7.90 MB | 373 | 51.17 |
-| v66 | aaffcdd | run-f0e57703613f | 15.995 ms | 10.02 MB | 382 | 51.10 |
+| v66 | 69e21a6 | run-a1188d6eeb3d | 14.75 ms | 8.10 MB | 382 | 55.53 |
+| v66 (same code, a memory spike) | aaffcdd | run-f0e57703613f | 15.995 ms | 10.02 MB | 382 | 51.10 |
 
 - v54: commit 4ba13ab, T 21.19 ms, M 7.91 MB, S 389, K 46.42.
 - v56: commit db1bb02, K 47.82.
@@ -91,7 +92,7 @@ Today (box 1 unless a run ID is given):
 - v63 (a2b2bdd), instructions 680.0 M to 614.0 M, abn 17.45 to 16.55, in order: the amount's decimal point skipped by per-lane multipliers instead of pext (666.6 M, 17.41 to 17.16); the next record found by a carry through the run of low bytes, so no BOM test in parse (653.3 M, 16.88); the id's length kept per cursor, because spec 2.2 says ids only grow (643.7 M); bit test and count with bts and sbb (634.2 M, 16.65); the bucket from the message's top two bytes (cycles 340.2 M to 336.1 M); name and note bytes added as one 64-bit field (616.3 M with the rest). Board run-a5c4d0536268: T 14.754 ms, M 7.80, S 377, K 56.05; the same code again as a9af0b7, run-aeb5ee4b7a28: T 14.921 ms, M 8.29, K 55.05.
 - v64: the timeline of v63 (timestamps in a copy of the program) showed 11 threads idle for 0.75 ms while main alone faulted memory in: main's first huge page 0.24 ms, the clones 0.11, huge pages 2 and 3 0.55, the page-table pages 0.30; regions done at 0.49; parse ends 13.0, drained 13.09, report 13.39, all done 13.54. One helper thread (thread 11) now faults the third huge page and half the file's page-table pages. abn 16.66 to 16.34 (31 rounds). Memory: another CPU that charges a page costs a 256 KB batch, and the page-table pages use that batch up: median of 15 runs 7.57 to 7.67 MB. Error checks are back on open, clone and close.
 - v65: start-up balance. The helper is now cloned first, so it starts ahead of main, which still has the other clones to do, and it takes 5/8 of the file's page-table pages: 61 of 98, inside its 64-page charge batch, so little of the batch is left over. abn 16.29 to 16.23 (25 rounds), memory peak 7.50 to 7.40 MB, no lines added. Board run-6d3cdfadd754: T 14.32 ms, M 8.07, S 373, K 56.60; the same code as 3fa85cb, run-ec315dedca74: T 14.446 ms, M 7.92, K 56.56; and as 3d9eece on a busy board, run-f269418aae73: T 17.674 ms, M 7.90, K 51.17.
-- v66 (aaffcdd): no speed work, for reading. The source now stands in clang-format's own layout (S counts that form anyway), comments above their lines and true to the code, clearer field names, and mmap failures stop the program with an error. The comments-and-names build has the same machine code as v65 (.text SHA compared). The mmap checks: S +6, abn 16.31 against 16.30 (25 rounds), all checks clean. S +8 in all, about 0.3 % of K given up on purpose. Board run-f0e57703613f: T 15.995 ms, M 10.02, S 382, K 51.10.
+- v66 (69e21a6): no speed work, for reading. The source now stands in clang-format's own layout (S counts that form anyway), comments above their lines and true to the code, clearer field names, and mmap failures stop the program with an error. The comments-and-names build has the same machine code as v65 (.text SHA compared). The mmap checks: S +6, abn 16.31 against 16.30 (25 rounds), all checks clean. S +8 in all, about 0.3 % of K given up on purpose. Board run-a1188d6eeb3d: T 14.75 ms, M 8.10, S 382, K 55.53; the same code as aaffcdd, run-f0e57703613f: T 15.995 ms, M 10.02, K 51.10 (a memory spike, section 6).
 
 ## Other processes on the scoring box
 

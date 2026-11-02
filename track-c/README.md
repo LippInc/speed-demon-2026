@@ -4,7 +4,7 @@ records.csv (202 MB, 3.32 M records with quoted and escaped name and note fields
 
 ## For the judges, in one minute
 
-- **The result:** 14.44 s (the reference) to 15.995 ms, about 900 times faster. Board run run-f0e57703613f (commit aaffcdd): T 15.995 ms, M 10.02 MB, S 382, K 51.10. This run is the submission named in [PERF.md](PERF.md). The same hot loops also read T 14.32 ms, K 56.60 (v65, run-6d3cdfadd754), and 17.67 ms while the board was busy (run-f269418aae73).
+- **The result:** 14.44 s (the reference) to 14.75 ms, about 1,000 times faster. Board run run-a1188d6eeb3d (commit 69e21a6): T 14.75 ms, M 8.10 MB, S 382, K 55.53. This run is the submission named in [PERF.md](PERF.md). The same hot loops also read T 14.32 ms, K 56.60 (v65, run-6d3cdfadd754), and 17.67 ms while the board was busy (run-f269418aae73).
 - **Reproduce:** from the repository root, `python3 check.py c --data data/c --expected d8088b1cd42ba1338b1345b107b55db7b96ef1f5066f3ff64fd26a8912a0f536` builds the image, runs it and checks the output's SHA.
 - **The honest limits:** a name is a hash of about 45 bits, so two of the ~100,000 names merge with odds of about 1.4e-4 per run. A name of over 30 raw bytes is not handled, about 3e-4 per dataset. A dataset with far more names than the generator's ~100,000 would overrun the name table, which is not checked. join.c has the reasoning.
 - **The code:** one file, [join.c](join.c), C with GNU extensions and no dependencies, in clang-format's LLVM style, so the lines you read are the lines S counts. Its top comment gives the design, and the comments say why each part has its shape. A failed open, mmap, clone or close stops the program and names what failed.
