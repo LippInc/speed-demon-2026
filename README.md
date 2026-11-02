@@ -11,7 +11,7 @@ Four programs, one per track. Each produces byte-identical output to the organis
 | [C: Join](track-c/README.md) | 202 MB of quoted CSV joined to its regions and aggregated per country | C | 14.44 s | 14.475 ms | 8.15 MB | 55.68 | run-b73db7cdb927 |
 | [D: Traverse](track-d/README.md) | 2,000 shortest-path queries on a 5 M-edge weighted graph | C | 72.69 s | 61.7 ms | 59.96 MB | 38.09 | run-39b97637f319 |
 
-Each number is a [live-board](https://speeddemon.dev/board) run of the code that ships; each track's README gives its spread, since the board is noisy while its queue is busy.
+Each number is a [live-board](https://speeddemon.dev/board) run of the code that ships, except that B's last change, a third hash round added after its run, costs about 0.8 ms; each track's README gives its spread, since the board is noisy while its queue is busy.
 
 ## For the judges
 
@@ -35,7 +35,7 @@ python3 check.py d --data data/d --expected a23dbdf0a3e49cc8901310a9ee1dc6a9a569
 ## Honest limits
 
 - **A:** more than 2,047 distinct endpoints abort on an assert (the spec says exactly 1,842), and timestamps outside the spec's 72-hour window are not handled.
-- **B:** a token is matched by a hash, not its text, so about 1 dataset in 3,200 would get a wrong answer (counted on real data; neither of ours does).
+- **B:** a token is matched by a hash, not its text, so about 1 dataset in 3,000 would get a wrong answer (counted on real data; all 9 we ran match the reference).
 - **C:** a name is identified by about 45 bits of hash, so two names can merge with odds of about 1.4e-4 per run, and a name over 30 raw bytes is not handled, about 3e-4 per dataset.
 - **D:** built for this generator's shape and scale: node ids must stay below 1,835,008, and parse cells have room for the expected fill plus 8 standard deviations with no bounds check.
 

@@ -203,13 +203,15 @@ static const u8 *map_file(const char *dir, const char *name, size_t *len) {
 }
 
 // ---------------------------------------------------------------- term table
-// A token's key is an AES hash of its lowercased bytes: two AES rounds over up
-// to 32 bytes. Bits 6..20 of the key are its bucket's byte offset, the high
-// half its tag. The text is never compared: a token that is no query term
-// passes for one only if its 32-bit tag equals a tag in its bucket. With about
-// 610,000 distinct tokens and 2.3 terms per bucket that is about 1 dataset in
-// 3,200, and the longest token in the data is 17 bytes, well inside what the
-// hash reads. A bucket holds 7 tags and their values in one cache line, plus an
+// A token's key is an AES hash of its lowercased bytes: three AES rounds over
+// up to 32 bytes. Two are not enough: words that differ on one AES diagonal
+// stay in one column after a round, and brestjex and brostjedo got equal 64
+// bits. Bits 6..20 of the key are its bucket's byte offset, the high half its
+// tag. The text is never compared: a token that is no query term passes for one
+// only if its 32-bit tag equals a tag in its bucket. With about 610,000
+// distinct tokens and 2.3 terms per bucket that is about 1 dataset in 3,000,
+// and the longest token in the data is 17 bytes, well inside what the hash
+// reads. A bucket holds 7 tags and their values in one cache line, plus an
 // eighth value that answers a miss: MISS, or PROBE once a term was placed past
 // the bucket. A lookup compares all eight tags at once and reads val[index of
 // the match, or 7], so a hit and a miss take the same path. tag[7] stays 0. A
@@ -248,9 +250,9 @@ static inline u64 hash_at(const u8 *p, u64 L) {
                              _mm_load_si128((const __m128i *)(M + L - 256))),
                _mm_set1_epi32(0x3C6EF372)));
   const __m128i K = _mm_set_epi64x(0x9E3779B97F4A7C15ll, 0x243F6A8885A308D3ll);
-  return (u64)_mm_cvtsi128_si64(
-      _mm_and_si128(_mm_aesenc_si128(_mm_aesenc_si128(x, K), K),
-                    _mm_set_epi64x(0, (long long)(BOFF | ~(u64)0 << 32))));
+  return (u64)_mm_cvtsi128_si64(_mm_and_si128(
+      _mm_aesenc_si128(_mm_aesenc_si128(_mm_aesenc_si128(x, K), K), K),
+      _mm_set_epi64x(0, (long long)(BOFF | ~(u64)0 << 32))));
 }
 
 // A lookup read PROBE: the tag may sit in a later bucket.

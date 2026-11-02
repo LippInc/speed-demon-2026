@@ -16,7 +16,7 @@ static u64 key(const u8 *p, u64 L) {
 #ifdef BAD
   return (u64)_mm_cvtsi128_si64(x);
 #else
-  return (u64)_mm_cvtsi128_si64(_mm_aesenc_si128(_mm_aesenc_si128(x, K), K));
+  return (u64)_mm_cvtsi128_si64(_mm_aesenc_si128(_mm_aesenc_si128(_mm_aesenc_si128(x, K), K), K));
 #endif
 }
 static u8 *rd(const char *d, const char *n, size_t *l) {
