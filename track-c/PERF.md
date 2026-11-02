@@ -107,51 +107,49 @@ Symptom: one bad run in about 900 in the A/B loop (0.6 % of runs), a segfault at
 
 ## What did not work
 
-Rows without a note are box 1. "Older" rows are box 2, kept short.
+Local tries with no board run of their own: box 1, except the "Older" ones, which are box 2 and kept short.
 
-| What | Result | Why dropped |
-|---|---|---|
-| Hand-written report with no stdio | 16.74 vs 16.68 ms, S +8 | the report is 0.3 ms of a phase the unmapping sets anyway |
-| Free-slot test moved out of line | 2.2 fewer instructions per record, no time, S +11 | not worth the lines |
-| AES keys as memory operands | +3.2 M instructions | the compiler uses the freed registers worse |
-| Two plain bound tests instead of one | +8.4 M instructions | slower |
-| Shift counts mod 64 | +6.5 M instructions | slower |
-| Rows by pointer in drain | no gain | kept the index form |
-| Dropping the agg field from Ctx | S -1, +0.07 ms | not worth it |
-| Plain pieces in file order, not stretch order | S -2, +0.03 ms | kept the stretch order |
-| 18 compiler flag sets (live-range shrinkage, IRA regions, scheduling, alignments and more) | cycles 337 to 342 M against 339.6 M | none clear of noise |
-| PGO trained on the full data | 16.92 vs 16.72 ms | no gain now (it gave -0.24 at v53) |
-| RUN 32, 48, 96, 128 | 16.82, 16.81, 16.86, 16.95 vs 16.72 at 64 | 64 stays |
-| Prefetch distance 384, 640, 768; one prefetch | 16.76, 16.82, 16.82, 16.84 vs 16.72 at 512 | 512 and two prefetches stay |
-| BATCH 64 | 24.45 ms | the rings fill |
-| RING 3 batches, 630 buckets to fit | 16.43 vs 16.27 ms | the ring was not the limit |
-| Senders write straight into the ring, no batch and no memcpy (RING 3 batches, same memory) | 16.38 vs 16.27 ms, 2.6 M fewer instructions, 1.1 M more cycles | the copy was only 1 % |
-| The same with RING 2 batches, 672 buckets | 21.25 ms | the rings fill |
-| Clone order reversed, page-table split unchanged | 16.29 vs 16.29 ms, M unchanged | only with the new split (v65) |
-| One pass with no Rec staging | +2.2 ms | load stalls hitting L3 on the region table |
-| Cursors kept in arrays | +0.7 ms | memory-carried positions |
-| Three cursors per piece | no gain | complexity for nothing |
-| PIECE 256 KB | +0.8 ms, fewer cycles | rings fill: 293 context switches vs 40 |
-| -mtune=alderlake/znver4, -march=alderlake | +0.3 to +0.45 ms | kept x86-64-v3 |
-| MADV_POPULATE_READ per piece | +0.2 ms | |
-| -fno-tree-slp-vectorize | +0.25 ms | |
-| Drain in one loop without its prefetch | +0.2 ms, S -4 | not taken |
-| BUCKETS 590 | +0.38 ms | |
-| Pinning main after thread start | M unchanged | |
-| Threads parsing while main faults, drains gated (v29) | 17.99 vs 18.01 ms, +5 lines | dropped |
-| -O2, -fno-gcse, -fsched-pressure, -fira-loop-pressure, -fno-ivopts | 18.26 to 18.35 vs 18.24 | no gain over -frename-registers |
-| Prefetch in the old pass 1 | -0.2 to 0 ms, cycles flat | unclear, dropped |
-| Pinning threads | +0.2 ms | worse |
-| Merging the scan state into Ctx | +0.3 ms | rejected, though it saves 6 lines |
-| Vector per-country totals | no gain | |
-| Shared already-sent cache | dead: 90 % of messages are new | |
-| Older: pread instead of mapping (v22) | 25.0 vs 24.1 ms, board 25.8 | the kernel's copy cost 80 M cycles vs 53 M |
-| Older: MADV_POPULATE_READ up front | 28 ms | threads queue on the mapping lock |
-| Older: v44 to v48, winning back the per-CPU charge batches | best M 7.9 to 8.2 MB, T 20.8 to 22.2 | M saved cost more T than it paid in K |
-| Older: counting quotes in pass 1 (v40) | +35 M instructions, +0.27 ms | |
-| Older: region ids read 8 digits at a time | +0.4 ms | each line's start waits on a vector compare |
-| Older: v50, shared name ids, one intern table | 23.00 vs 20.35 ms | kernel cycles nearly doubled |
-| Older: v51, one pass, records read from their start | 22.95 ms, 14 % fewer instructions, more cycles | each record's start waits on the last one's end |
-| Older: v52, two to eight interleaved streams | 23.8 to 25.7 ms | did not recover v51 |
+- Hand-written report with no stdio: 16.74 vs 16.68 ms, S +8; the report is 0.3 ms of a phase the unmapping sets anyway.
+- Free-slot test moved out of line: 2.2 fewer instructions per record, no time, S +11; not worth the lines.
+- AES keys as memory operands: +3.2 M instructions; the compiler uses the freed registers worse.
+- Two plain bound tests instead of one: +8.4 M instructions; slower.
+- Shift counts mod 64: +6.5 M instructions; slower.
+- Rows by pointer in drain: no gain; kept the index form.
+- Dropping the agg field from Ctx: S -1, +0.07 ms; not worth it.
+- Plain pieces in file order, not stretch order: S -2, +0.03 ms; kept the stretch order.
+- 18 compiler flag sets (live-range shrinkage, IRA regions, scheduling, alignments and more): cycles 337 to 342 M against 339.6 M; none clear of noise.
+- PGO trained on the full data: 16.92 vs 16.72 ms; no gain now (it gave -0.24 at v53).
+- RUN 32, 48, 96, 128: 16.82, 16.81, 16.86, 16.95 vs 16.72 at 64; 64 stays.
+- Prefetch distance 384, 640, 768; one prefetch: 16.76, 16.82, 16.82, 16.84 vs 16.72 at 512; 512 and two prefetches stay.
+- BATCH 64: 24.45 ms; the rings fill.
+- RING 3 batches, 630 buckets to fit: 16.43 vs 16.27 ms; the ring was not the limit.
+- Senders write straight into the ring, no batch and no memcpy (RING 3 batches, same memory): 16.38 vs 16.27 ms, 2.6 M fewer instructions, 1.1 M more cycles; the copy was only 1 %.
+- The same with RING 2 batches, 672 buckets: 21.25 ms; the rings fill.
+- Clone order reversed, page-table split unchanged: 16.29 vs 16.29 ms, M unchanged; only with the new split (v65).
+- One pass with no Rec staging: +2.2 ms; load stalls hitting L3 on the region table.
+- Cursors kept in arrays: +0.7 ms; memory-carried positions.
+- Three cursors per piece: no gain; complexity for nothing.
+- PIECE 256 KB: +0.8 ms, fewer cycles; rings fill: 293 context switches vs 40.
+- -mtune=alderlake/znver4, -march=alderlake: +0.3 to +0.45 ms; kept x86-64-v3.
+- MADV_POPULATE_READ per piece: +0.2 ms.
+- -fno-tree-slp-vectorize: +0.25 ms.
+- Drain in one loop without its prefetch: +0.2 ms, S -4; not taken.
+- BUCKETS 590: +0.38 ms.
+- Pinning main after thread start: M unchanged.
+- Threads parsing while main faults, drains gated (v29): 17.99 vs 18.01 ms, +5 lines; dropped.
+- -O2, -fno-gcse, -fsched-pressure, -fira-loop-pressure, -fno-ivopts: 18.26 to 18.35 vs 18.24; no gain over -frename-registers.
+- Prefetch in the old pass 1: -0.2 to 0 ms, cycles flat; unclear, dropped.
+- Pinning threads: +0.2 ms; worse.
+- Merging the scan state into Ctx: +0.3 ms; rejected, though it saves 6 lines.
+- Vector per-country totals: no gain.
+- Shared already-sent cache: dead: 90 % of messages are new.
+- Older: pread instead of mapping (v22): 25.0 vs 24.1 ms, board 25.8; the kernel's copy cost 80 M cycles vs 53 M.
+- Older: MADV_POPULATE_READ up front: 28 ms; threads queue on the mapping lock.
+- Older: v44 to v48, winning back the per-CPU charge batches: best M 7.9 to 8.2 MB, T 20.8 to 22.2; M saved cost more T than it paid in K.
+- Older: counting quotes in pass 1 (v40): +35 M instructions, +0.27 ms.
+- Older: region ids read 8 digits at a time: +0.4 ms; each line's start waits on a vector compare.
+- Older: v50, shared name ids, one intern table: 23.00 vs 20.35 ms; kernel cycles nearly doubled.
+- Older: v51, one pass, records read from their start: 22.95 ms, 14 % fewer instructions, more cycles; each record's start waits on the last one's end.
+- Older: v52, two to eight interleaved streams: 23.8 to 25.7 ms; did not recover v51.
 
 Branch misses stayed near 4 % of cycles at v18 and lower since: branch-free rewrites were never the lever; the program is bound by instruction count.
