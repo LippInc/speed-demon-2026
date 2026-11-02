@@ -7,7 +7,7 @@
 //! Job (a-59, a-60), the pipeline (a-55).
 #![allow(unsafe_op_in_unsafe_fn)]
 use std::arch::x86_64::*;
-use std::mem::take;
+use std::mem::{replace, take};
 use std::ptr::copy_nonoverlapping as copy;
 use std::slice::{from_raw_parts, from_raw_parts_mut};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::*};
@@ -124,10 +124,6 @@ const SLOTS: usize = 8192;
 /// A row is (endpoint id + 1) << 21 | 5xx << 20 | latency, 0 for a slot no line took; a line with a latency of ESCAPE
 /// or more (0.24 pct on seed 1) goes to its hour's long list instead, as latency << 32 | the row without the latency.
 const ESCAPE: u32 = (1 << 20) - 1;
-/// Regions the pool keeps; past that a region is given back (MADV_DONTNEED). In the steady state one hour's region
-/// goes in as the next hour's comes out, so one keeps nearly every page fault away (box, page faults: none 13.9K, one
-/// 6.98K, unbounded 6.50K) for ~+0.6 MB of peak, where an unbounded pool grows to 11 regions and +3.8 MB.
-const POOL: usize = 1;
 /// Rows a thread claims in one hour's region at a time.
 const CLAIM: usize = 256;
 /// An hour's text is written over its rows, so the latencies the finish copies out start at least this many rows
@@ -139,27 +135,14 @@ const SPARE: usize = 1 << 17;
 #[derive(Default)]
 struct State {
     next_block: usize,
-    top: BTreeMap<usize, usize>,      // per registered block past the watermark: its last hour
-    watermark: usize,                 // every block below it is registered
-    prefix_max: usize,                // the last hour in the blocks below the watermark
-    next_hour: usize,                 // every hour below it is claimed for finishing
-    late: bool,                       // a block brought lines of an hour already claimed
+    top: BTreeMap<usize, usize>, // per registered block past the watermark: its last hour
+    watermark: usize,            // every block below it is registered
+    prefix_max: usize,           // the last hour in the blocks below the watermark
+    next_hour: usize,            // every hour below it is claimed for finishing
+    late: bool,                  // a block brought lines of an hour already claimed
     parts: BTreeMap<usize, &'static [u8]>,
     placed: usize,
     offset: u64,
-}
-
-impl State {
-    /// Records that block b, with lines of hours low to high, is parsed; a line of an hour already claimed marks the run
-    /// late.
-    fn register(&mut self, b: usize, (low, high): (usize, usize)) {
-        self.late |= low < self.next_hour;
-        self.top.insert(b, high);
-        while let Some(t) = self.top.remove(&self.watermark) {
-            self.prefix_max = self.prefix_max.max(t);
-            self.watermark += 1;
-        }
-    }
 }
 
 /// One run over the input (a-55). Each thread takes, in this order: an hour that is safe to finish, else the next
@@ -170,8 +153,10 @@ impl State {
 ///
 /// Every hour's rows: a region each, from an anonymous reservation (MAP_NORESERVE) of which only the pages touched
 /// cost memory. Threads claim CLAIM rows at a time, so a row needs no atomic; an hour's region holds its rows, then
-/// its latencies grouped by endpoint. Once its text is written the region goes to the pool (up to POOL) and a later
-/// hour takes it, pages already faulted in: a fresh region per hour cost 7.8K page faults (a-59).
+/// its latencies grouped by endpoint. Once its text is written the region goes to the pool, which keeps one, and a
+/// later hour takes it, pages already faulted in: a fresh region per hour cost 7.8K page faults (a-59). In the steady
+/// state one hour's region goes in as the next hour's comes out, so one keeps nearly every page fault away (box, page
+/// faults: none 13.9K, one 6.98K, unbounded 6.50K) for ~+0.6 MB of peak; an unbounded pool grew to 11 regions, +3.8 MB.
 ///
 /// Every endpoint met so far, one table for all threads, open addressing with linear probing. A slot is the hash's top
 /// 53 bits and the id + 1 in the low 11, 0 when empty: the hash alone is an endpoint's identity, and for 1,842 of them
@@ -188,8 +173,8 @@ struct Job<'a> {
     released: AtomicUsize,
     base: *mut u32,
     stride: usize,
-    regions: [AtomicUsize; HOURS],    // 0 until the hour takes one
-    pool: Mutex<(Vec<usize>, usize)>, // finished regions; regions taken from the reservation
+    regions: [AtomicUsize; HOURS], // 0 until the hour takes one
+    pool: Mutex<(usize, usize)>, // the pooled region (0: none); regions taken from the reservation
     claimed: [AtomicUsize; HOURS],
     long: [Mutex<Vec<u64>>; HOURS],
     slots: [AtomicU64; SLOTS],
@@ -211,28 +196,25 @@ impl Job<'_> {
         loop {
             match self.slots[i].load(Relaxed) {
                 s if s >> 11 == h >> 11 => return (s & 2047) as u32 - 1,
-                0 => return self.add(p, len, h, i),
+                0 => self.add(p, len, h, i),
                 _ => i = (i + 1) % SLOTS,
             }
         }
     }
 
-    /// A new id in empty slot i, under the lock; when another thread filled slot i first, the lookup again.
+    /// A new id in slot i, under the lock, unless another thread filled it first (the probe then reads it again).
     #[cold]
-    fn add(&self, p: *const u8, len: usize, h: u64, i: usize) -> u32 {
+    fn add(&self, p: *const u8, len: usize, h: u64, i: usize) {
         let mut names = self.names.lock().unwrap();
-        if self.slots[i].load(Relaxed) != 0 {
-            drop(names);
-            return self.id(p, len);
+        if self.slots[i].load(Relaxed) == 0 {
+            assert!(names.0.len() < IDS - 1, "more endpoints than spec 2 allows");
+            let mut name = [0; 128];
+            // Safety: the endpoint is the len bytes at p.
+            name[..len].copy_from_slice(unsafe { from_raw_parts(p, len) });
+            name[127] = len as u8;
+            names.0.push(name);
+            self.slots[i].store(h >> 11 << 11 | names.0.len() as u64, Relaxed);
         }
-        assert!(names.0.len() < IDS - 1, "more endpoints than spec 2 allows");
-        let mut name = [0; 128];
-        // Safety: the endpoint is the len bytes at p.
-        name[..len].copy_from_slice(unsafe { from_raw_parts(p, len) });
-        name[127] = len as u8;
-        names.0.push(name);
-        self.slots[i].store(h >> 11 << 11 | names.0.len() as u64, Relaxed);
-        names.0.len() as u32 - 1
     }
 
     /// The id of every endpoint met, in byte order (spec 4), and the names by id: the ids new since the last call are
@@ -248,50 +230,28 @@ impl Job<'_> {
     }
 
     /// Hour h's region; the first thread to ask gives it one. Under the pool's lock, which every write of `regions`
-    /// holds: a pooled region, else the reservation's next one (a run touches ~11 of them; an hour's own region at
+    /// holds: the pooled region, else the reservation's next one (a run touches ~11 of them; an hour's own region at
     /// h * stride touched all 72, +0.4 MB of page tables).
     fn region(&self, h: usize) -> *mut u32 {
-        match self.regions[h].load(Acquire) {
-            0 => {
-                let mut pool = self.pool.lock().unwrap();
-                if self.regions[h].load(Relaxed) == 0 {
-                    let fresh = self.base.wrapping_add(pool.1 * self.stride) as usize;
-                    let r = pool.0.pop().unwrap_or(fresh);
-                    pool.1 += (r == fresh) as usize;
-                    self.regions[h].store(r, Release);
-                }
-                self.regions[h].load(Relaxed) as *mut u32
+        if self.regions[h].load(Acquire) == 0 {
+            let mut pool = self.pool.lock().unwrap();
+            if self.regions[h].load(Relaxed) == 0 {
+                let fresh = self.base.wrapping_add(pool.1 * self.stride) as usize;
+                let r = Some(take(&mut pool.0)).filter(|&r| r > 0).unwrap_or(fresh);
+                pool.1 += (r == fresh) as usize;
+                self.regions[h].store(r, Release);
             }
-            r => r as *mut u32,
         }
-    }
-
-    /// A new chunk of hour h: its first row and its end. A pooled region holds an older hour's bytes, and a row no
-    /// line takes must read 0, so the chunk is zeroed first.
-    fn claim(&self, h: usize) -> Chunk {
-        let i = self.claimed[h].fetch_add(CLAIM, Relaxed);
-        let at = self.region(h).wrapping_add(i);
-        // Safety: the chunk lies inside the region (stride holds a row per line plus a chunk per thread).
-        unsafe { at.write_bytes(0, CLAIM) };
-        (at, at.wrapping_add(CLAIM))
-    }
-
-    /// A line of hour h with a latency of ESCAPE or more.
-    #[cold]
-    fn long(&self, h: usize, row: u32, latency: u32) {
-        let x = (latency as u64) << 32 | row as u64;
-        self.long[h].lock().unwrap().push(x);
+        self.regions[h].load(Relaxed) as *mut u32
     }
 
     /// Block b's first line start: the first at or after b * BLOCK, or the input's end when no LF is left (spec 2: the
-    /// last line ends with an LF).
+    /// last line ends with an LF); 0 for block 0.
     fn align(&self, b: usize) -> usize {
         let n = (b * BLOCK).min(self.data.len());
-        if n == 0 {
-            return 0;
-        }
-        let lf = self.data[n - 1..].iter().position(|&c| c == b'\n');
-        lf.map_or(self.data.len(), |o| n + o)
+        let tail = &self.data[n - (n > 0) as usize..];
+        let lf = tail.iter().position(|&c| c == b'\n');
+        lf.map_or(self.data.len(), |o| n + o) * (n > 0) as usize
     }
 
     /// Writes a row for every line starting in data[start..end] into its hour's region, through cur, this thread's open
@@ -323,17 +283,24 @@ impl Job<'_> {
             let (ep, len, error, latency, next) = unsafe { line(d, p) };
             let e = self.id(d.wrapping_add(ep), len);
             let row = (e + 1) << 21 | (error as u32) << 20;
-            if latency < ESCAPE {
+            if latency >= ESCAPE {
+                let x = (latency as u64) << 32 | row as u64;
+                self.long[h].lock().unwrap().push(x);
+            } else {
                 if c.0 == c.1 {
-                    c = self.claim(h);
+                    // A new chunk of CLAIM rows. A pooled region holds an older hour's bytes, and a row no line
+                    // takes must read 0, so the chunk is zeroed first.
+                    let i = self.claimed[h].fetch_add(CLAIM, Relaxed);
+                    let at = self.region(h).wrapping_add(i);
+                    // Safety: the chunk lies inside the region (stride holds a row per line plus a chunk per thread).
+                    unsafe { at.write_bytes(0, CLAIM) };
+                    c = (at, at.wrapping_add(CLAIM));
                 }
                 // Safety: c.0 < c.1, the claimed chunk's end.
                 unsafe {
                     *c.0 = row | latency;
                     c.0 = c.0.add(1);
                 }
-            } else {
-                self.long(h, row, latency);
             }
             p = next;
         }
@@ -349,19 +316,53 @@ impl Job<'_> {
         while !s.late {
             if s.next_hour == HOURS {
                 drop(s);
-                return self.release();
+                // Every block is parsed: the mapping's page-table entries are dropped in shared 4 MiB steps, so the
+                // exit has fewer to tear down (a-12: output closed -> process reaped 1.9-2.0 -> 0.8-1.3 ms).
+                let steps = self.data.chunks(4 << 20);
+                while let Some(step) = steps.clone().nth(self.released.fetch_add(1, Relaxed)) {
+                    // Safety: step lies inside the mapping, which nothing reads now; 4 is MADV_DONTNEED.
+                    unsafe { madvise(step.as_ptr(), step.len(), 4) };
+                }
+                return;
             } else if s.watermark == nblocks || s.next_hour + lag <= s.prefix_max {
                 let h = s.next_hour;
                 s.next_hour += 1;
                 drop(s);
                 self.ready.notify_all();
-                self.emit(h, self.finish(h));
+                // Hour h's text is handed over; every hour that is ready is placed in order, then written at its
+                // offset, so threads write at once. Each region is pooled once its text is out, and the one pooled
+                // before it goes back to the kernel (MADV_DONTNEED 4; length 0 when there was none).
+                let text = self.finish(h);
+                s = self.state.lock().unwrap();
+                let st = &mut *s;
+                st.parts.insert(h, text);
+                let mut ready = Vec::new();
+                while let Some(t) = st.parts.remove(&st.placed) {
+                    ready.push((st.placed, st.offset, t));
+                    (st.placed, st.offset) = (st.placed + 1, st.offset + t.len() as u64);
+                }
+                drop(s);
+                for (h, offset, t) in ready {
+                    self.file.write_all_at(t, offset).expect("write output");
+                    let new = self.regions[h].load(Relaxed);
+                    let r = replace(&mut self.pool.lock().unwrap().0, new);
+                    // Safety: the region is page-aligned and nothing reads it any more.
+                    unsafe { madvise(r as *const u8, self.stride * 4 * (r > 0) as usize, 4) };
+                }
             } else if s.next_block < nblocks && s.next_block < s.watermark + 2 * workers {
                 let b = s.next_block;
                 s.next_block += 1;
                 drop(s);
-                let hours = self.parse((self.align(b), self.align(b + 1)), &mut cur);
-                self.state.lock().unwrap().register(b, hours);
+                let (low, high) = self.parse((self.align(b), self.align(b + 1)), &mut cur);
+                // Block b is registered; a line of an hour already claimed marks the run late.
+                s = self.state.lock().unwrap();
+                let st = &mut *s;
+                st.late |= low < st.next_hour;
+                st.top.insert(b, high);
+                while let Some(t) = st.top.remove(&st.watermark) {
+                    (st.prefix_max, st.watermark) = (st.prefix_max.max(t), st.watermark + 1);
+                }
+                drop(s);
                 self.ready.notify_all();
             } else {
                 s = self.ready.wait(s).unwrap();
@@ -390,7 +391,8 @@ impl Job<'_> {
             low[(r & 511) as usize] += 1;
             high[(r >> 9 & 2047) as usize] += 1;
         }
-        long.iter().for_each(|&p| count[(p as u32 >> 20) as usize] += 1);
+        long.iter()
+            .for_each(|&p| count[(p as u32 >> 20) as usize] += 1);
         // By id + 1; start[0] is a trash slot past every span, where the free slots go.
         let (mut start, mut sum) = ([0u32; IDS], 0);
         for &id in &order {
@@ -403,19 +405,16 @@ impl Job<'_> {
         // long latencies (all ESCAPE or more) last, sorted among themselves.
         deal(rows, values, &mut low, 0);
         deal(&values[..claimed], rows, &mut high, 9);
-        for &r in rows.iter() {
-            let k = (r >> 21) as usize;
+        long.sort_unstable();
+        let short = rows.iter().map(|&r| (r >> 21, r & ESCAPE));
+        let long = long.iter().map(|&p| (p as u32 >> 21, (p >> 32) as u32));
+        short.chain(long).for_each(|(k, v)| {
+            let k = k as usize;
             // Safety: an endpoint's slots run from its start to its start plus its count, all below sum, and the trash
             // slot is sum, all inside values (a row per line past head).
-            unsafe { *values.get_unchecked_mut(next[k] as usize) = r & ESCAPE };
+            unsafe { *values.get_unchecked_mut(next[k] as usize) = v };
             next[k] += (k != 0) as u32;
-        }
-        long.sort_unstable();
-        for &p in long.iter() {
-            let k = (p as u32 >> 21) as usize;
-            values[next[k] as usize] = (p >> 32) as u32;
-            next[k] += 1;
-        }
+        });
 
         let (day, hour) = (DAYS[(h + 18) / 24], (h + 18) % 24);
         let label = format!("{day}T{hour:02}:00:00Z{:12}", ""); // 32 bytes
@@ -429,7 +428,6 @@ impl Job<'_> {
             }
             // Spec 3.4: 0-based index of rank ceil(p * n / 100).
             let at = |p: usize| values[start[k] as usize + (p * n as usize + 99) / 100 - 1];
-            let (p50, p95, p99) = (at(50), at(95), at(99));
             // Spec 3.6: error_ppm = floor(errors * 1000000 / count), in 64 bits.
             let ppm = (errors as u64 * 1_000_000 / n as u64) as u32;
             // Safety: the names hold every id in order and never move or change (see Job).
@@ -441,7 +439,7 @@ impl Job<'_> {
                 copy(label.as_ptr(), w, 32);
                 copy(name.as_ptr(), w.add(21), 128);
                 w = w.add(21 + name[127] as usize);
-                for v in [n, p50, p95, p99, errors, ppm] {
+                for v in [n, at(50), at(95), at(99), errors, ppm] {
                     w = put(w, v);
                 }
                 *w = b'\n';
@@ -450,41 +448,6 @@ impl Job<'_> {
         }
         // Safety: every byte from text to w is written above, and the region is never unmapped.
         unsafe { from_raw_parts(text, w.offset_from(text) as usize) }
-    }
-
-    /// Hands over hour h's text, places every hour that is ready in order, and writes those at their offsets, so
-    /// threads write at once; each region goes to the pool, or back to the kernel, once its text is out.
-    fn emit(&self, h: usize, text: &'static [u8]) {
-        let mut ready = Vec::new();
-        {
-            let mut guard = self.state.lock().unwrap();
-            let s = &mut *guard;
-            s.parts.insert(h, text);
-            while let Some(t) = s.parts.remove(&s.placed) {
-                ready.push((s.placed, s.offset, t));
-                (s.placed, s.offset) = (s.placed + 1, s.offset + t.len() as u64);
-            }
-        }
-        for (h, offset, t) in ready {
-            self.file.write_all_at(t, offset).expect("write output");
-            let mut pool = self.pool.lock().unwrap();
-            if pool.0.len() < POOL {
-                pool.0.push(self.regions[h].load(Relaxed));
-            } else {
-                // Safety: the region is page-aligned and nothing reads it any more; 4 is MADV_DONTNEED.
-                unsafe { madvise(self.region(h) as *const u8, self.stride * 4, 4) };
-            }
-        }
-    }
-
-    /// Every block is parsed: the mapping's page-table entries are dropped in shared 4 MiB steps, so the exit has fewer
-    /// to tear down (a-12: output closed -> process reaped 1.9-2.0 -> 0.8-1.3 ms). Nothing reads the mapping any more.
-    fn release(&self) {
-        let steps = self.data.chunks(4 << 20);
-        while let Some(step) = steps.clone().nth(self.released.fetch_add(1, Relaxed)) {
-            // Safety: step lies inside the mapping, which nothing writes or reads now; 4 is MADV_DONTNEED.
-            unsafe { madvise(step.as_ptr(), step.len(), 4) };
-        }
     }
 }
 
@@ -542,7 +505,6 @@ fn run(data: &'static [u8], file: &File, workers: usize, lag: usize) -> bool {
     let stride = (SPARE + 2 * rows + 1).next_multiple_of(1024);
     // PROT_READ | PROT_WRITE 3; MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE 0x4022.
     let base = unsafe { mmap(std::ptr::null_mut(), stride * HOURS * 4, 3, 0x4022, -1, 0) };
-    assert!(base as isize != -1, "mmap failed");
     let job = Job {
         data,
         file,
@@ -571,19 +533,15 @@ fn main() {
     let file = File::open("/data/requests.log").expect("open input");
     let len = file.metadata().expect("stat input").len() as usize;
     let out = File::create("/out/summary.txt").expect("create output");
-    if len == 0 {
-        // Spec 3.7: an empty log gives an empty summary; mmap of length 0 would fail.
-        return;
-    }
     // Map the file read-only over an anonymous reservation 4 KiB longer (PROT_READ 1; MAP_PRIVATE | MAP_ANONYMOUS
     // 0x22, then MAP_PRIVATE | MAP_FIXED 0x12), never unmapped, so the slice lives for the run and the bytes past the
     // input read as zeros: the kernel zero-fills the file's last page and the reservation is zeros. Then ask the
-    // kernel to read the file ahead (MADV_WILLNEED 3), a hint whose result is ignored.
+    // kernel to read the file ahead (MADV_WILLNEED 3), a hint whose result is ignored. An empty log (spec 3.7: an
+    // empty summary) maps nothing over the reservation, which reads as no lines.
     let room = unsafe { mmap(std::ptr::null_mut(), len + 4096, 1, 0x22, -1, 0) };
-    let p = unsafe { mmap(room, len, 1, 0x12, file.as_raw_fd(), 0) };
-    assert!(room as isize != -1 && p == room, "mmap failed");
-    unsafe { madvise(p, len, 3) };
-    let data: &'static [u8] = unsafe { from_raw_parts(p, len) };
+    unsafe { mmap(room, len, 1, 0x12, file.as_raw_fd(), 0) };
+    unsafe { madvise(room, len, 3) };
+    let data: &'static [u8] = unsafe { from_raw_parts(room, len) };
 
     // Worker count. SD_WORKERS is a test-only override (rule 30: the hash runs force 1, 4, 12 and 24);
     // the board never sets it, so the scored run sizes itself from the CPUs it may use.

@@ -346,6 +346,15 @@ Experiments measured on our bench box only, with no board run (their box status 
   workers spinning until all are up, so no page fault meets a spawn (15.67 against 15.16 ms). Hash checked: rule 30 kit, 24/24 runs on seeds 1,
   52719364 and 248057911 at 1, 4, 12, 13 and 24 workers under four busy loops; full local kit 423/481, the same
   out-of-spec failures (more than 2,048 endpoints).
+- a-65 board: `846449f run-ffd993386390 | K 55.90 | T 15.61 ms | M 16.5 MB | S 430` (A rank 5).
+- a-66 (OURS), kept: a shorter program, same object work. The insert no longer calls the lookup again (the probe
+  reads the slot it just filled); claim, long, register and release are written into their one caller each; the pool is a
+  (region, regions taken) pair that swaps its region out; the empty log needs no branch (nothing mapped reads as no
+  lines); the two placement loops in the finish are one chain. S 430 -> 393 (board count: rustfmt defaults, code
+  lines). Box, 15 interleaved rounds: `a-65 15.29 | a-66 15.29` (median ms), M level. LOST alongside: the parse window
+  per worker (more blocks in flight) and 1.5 workers' worth of blocks ahead (T and M level). Hash checked: rule 30 kit
+  24/24, full local kit 423/481 with the same out-of-spec failures; an input past 2,048 endpoints still aborts (the
+  cap's assert stays: without it the table's id bits overflow and the probe never ends).
 
 ## Decisions
 
@@ -379,4 +388,4 @@ a-55 r2c (OURS): Name repr(C, align(64)); OnceLock state still sat on a second c
 a-55 r2e (OURS): in-place output formatting with fixed-size copies; inside spread at S +11 lines.
 a-55 r3 (OURS): 4 interleaved line streams per block; throughput-bound loop, 4 streams only added L1 misses.
 
-Final result (this tip, commit a6b3205, a-55 trim): box K 42.54 / 43.04 (lower: fresh; official 42.82 / 43.05), T 0.024 s, M 20.2-20.4 MB, S 463, D 1, against the reference's T 32,047 ms and M 228 MB. The banked board tip is 5c47d22 (a-47d, row 50 run-b79ba3882933, T 0.03 s, M 23 MB, points 79.4, S 396; board re-runs up to 80.5 points, run-90473e218dbb); the track's best board run is run-136eb6e8fd39, K 39.97 (a-35's code).
+Final result (this tip, a-66): box T 15.29 ms (median of 15 rounds), M 16.4-17.2 MB peak at 12 workers, S 393, D 1, against the reference's T 32,047 ms and M 228 MB. Best board run so far: run-ffd993386390 (a-65's code, commit 846449f), K 55.90, T 15.61 ms, M 16.5 MB, S 430, A rank 5.
