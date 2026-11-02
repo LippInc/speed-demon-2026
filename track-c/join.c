@@ -68,7 +68,7 @@ typedef struct {
   int32_t cents;
 } Rec;
 typedef struct { // a thread's outgoing messages, totals and pass 2 records
-  _Alignas(64) u64 batch[NT][BATCH]; // each owner's next messages, fill[o] used
+  _Alignas(64) u64 batch[NT * BATCH]; // owner o's next messages: from o * BATCH up to fill[o]
   Rec rec[MAXREC];
   u32 ix[MAXREC + 2]; // the record ends pass 1 found that pass 2 has not used
   u32 fill[NT];
@@ -141,9 +141,10 @@ static inline __m256i fold3(u64 a, u64 b, u64 c) {
                           _mm256_srli_epi64(x, 32));         // 10000a + b
 }
 
-static inline u64 quotes(const u8 *p) { // a bit per quote byte of p[0, 64)
+// A bit per quote byte of 64 bytes: the first 32 in v, then those at p
+static inline u64 quotes(__m256i v, const u8 *p) {
   __m256i q = _mm256_set1_epi8('"');
-  return eq32(p, q) | (u64)eq32(p + 32, q) << 32;
+  return (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, q)) | (u64)eq32(p, q) << 32;
 }
 
 // Name hashing: 32 bytes v at a time go into the 128-bit state h, the first
@@ -290,13 +291,13 @@ static void rest(int *w) { ++*w % 128 ? _mm_pause() : (void)usleep(10); }
 // Every batch but a thread's last is whole, so none wraps the ring.
 static void post(Ctx *x, int o) {
   Ring *r = &mem.ring[x->t][o];
-  u64 n = x->fill[o], t = r->tail;
+  u64 n = x->fill[o] - o * BATCH, t = r->tail;
   for (int w = 0; t + n - r->head > RING;)
     if (!drain(x->t, x->agg))
       rest(&w);
-  memcpy(r->m + t % RING, x->batch[o], 8 * n);
+  memcpy(r->m + t % RING, x->batch + o * BATCH, 8 * n);
   atomic_store_explicit(&r->tail, t + n, memory_order_release);
-  x->fill[o] = 0;
+  x->fill[o] = o * BATCH;
 }
 
 // Pass 2: every record whose end pass 1 has found, in two loops. The first
@@ -356,30 +357,33 @@ static void records(Ctx *x, Scan *z) {
     // follows an odd number of them: a "" flips the count twice (12% of names
     // have one). Both empty forms hash as no bytes (quoting is one-to-one).
     const u8 *p = f + rs[r].name;
-    u64 q = quotes(p), ns = 1, h, nl;
+    __m256i v = load32(p + 1);
+    u64 q = quotes(v, p + 33), ns = 0, h, nl; // q's bits count from p + 1
     if (__builtin_expect(*p == ',', 0)) { // empty, unquoted: 0.5% of records
       nl = 0, h = last(SEED, _mm256_setzero_si256(), 0);
-    } else { // p[0] is the opening quote; r1 counts the quotes from p + 1
-      u64 r1 = q >> 1;
-      u64 odd = _mm_cvtsi128_si64(_mm_clmulepi64_si128(_mm_cvtsi64_si128(r1), _mm_set1_epi8(-1), 0));
-      u64 j = _tzcnt_u64(odd & ~r1), k = j - 1; // the comma, the closing quote
-      nl = k - _mm_popcnt_u64(_bzhi_u64(r1, k)) / 2;
-      h = last(SEED, load32(p + 1), k);
-      ns = j + 2; // past the closing quote and its comma
+    } else { // p[0] is the opening quote
+      u64 odd = _mm_cvtsi128_si64(_mm_clmulepi64_si128(_mm_cvtsi64_si128(q), _mm_set1_epi8(-1), 0));
+      u64 j = _tzcnt_u64(odd & ~q), k = j - 1; // the comma, the closing quote
+      nl = k - _mm_popcnt_u64(_bzhi_u64(q, k)) / 2;
+      h = last(SEED, v, k);
+      ns = j + 1; // past the closing quote's comma
     }
     g->nb += nl;
     // The note, from the one quote mask: an unquoted field is its bytes; a
     // quoted one holds q quotes, its two delimiters and two per "", and
     // loses q / 2 + 1 bytes.
-    u64 len = rs[r].comma - rs[r].name - ns;
+    u64 len = rs[r].comma - rs[r].name - 1 - ns;
     u64 qn = _mm_popcnt_u64(_bzhi_u64(q >> ns, len));
     if (__builtin_expect(ns + len > 64, 0)) // the note runs past the mask: 2%
       for (u64 i = 64; i < ns + len; i += 64)
-        qn += _mm_popcnt_u64(_bzhi_u64(quotes(p + i), ns + len - i));
-    g->tb += len - qn / 2 - (qn > 0);
+        qn += _mm_popcnt_u64(_bzhi_u64(quotes(load32(p + 1 + i), p + 33 + i), ns + len - i));
+    if (__builtin_expect(len != 0, 1)) // unquoted only when empty: 1.5%
+      g->tb += len - qn / 2 - 1;
     u64 o = (h >> 40 & 255) * NT >> 8; // the name's owner: h's bits 40-47
-    x->batch[o][x->fill[o]] = (h & ~255ull) | co;
-    if (++x->fill[o] == BATCH)
+    u32 w = x->fill[o];
+    x->batch[w++] = (h & ~255ull) | co;
+    x->fill[o] = w;
+    if (w % BATCH == 0)
       post(x, o);
   }
   if (n) // else no record ended in these blocks
@@ -391,6 +395,8 @@ static void *worker(void *arg) {
   int t = (int)(intptr_t)arg;
   Ctx *x = &mem.ctx[t];
   x->agg = mem.agg[t], x->t = t;
+  for (int o = 0; o < NT; o++)
+    x->fill[o] = o * BATCH;
   for (int c = 0; c < 256; c++)
     mem.agg[t][c] = (Agg){.min = INT64_MAX, .max = INT64_MIN};
   regions(t);
