@@ -106,7 +106,7 @@ V QUOTE = ALL(0x2222222222222222), DASH = ALL(0x2D2D2D2D2D2D2D2D),
 // Caps fold3's lane 1, the region id: an id above the table reads its last
 // entry, unmatched
 V CAP = {-1, 1000001, -1, -1};
-static const u8 KEEP[64] = {[0 ... 31] = 0xFF}; // KEEP + 32 - n: n bytes kept
+static const u8 KEEP[64] = {[0 ... 31] = 0xFF}; // KEEP + 32 - n keeps n <= 32
 
 // All memory the threads use, on three transparent huge pages that main and
 // one helper fault in before parsing starts, so no other thread ever
@@ -319,7 +319,7 @@ static void post(Ctx *x, int o) {
   x->fill[o] = o * BATCH;
 }
 
-// A bit per byte that follows an odd number of the quotes q, or is one
+// Prefix XOR of q: a bit is set when q has an odd count at or below it
 static inline u64 odd_quotes(u64 q) {
   return _mm_cvtsi128_si64(
       _mm_clmulepi64_si128(_mm_cvtsi64_si128(q), _mm_set1_epi8(-1), 0));
