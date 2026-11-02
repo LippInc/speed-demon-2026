@@ -416,9 +416,9 @@ static int worker(void *arg) {
     x->fill[o] = o * BATCH;
   for (int c = 0; c < 256; c++)
     mem.agg[t][c] = (Agg){.min = INT64_MAX, .max = INT64_MIN};
-  if (t == NT - 1) { // the helper; main does the same with the other huge page and half
+  if (t == NT - 1) { // the helper; main does the same with the other huge page and the rest
     ((volatile u8 *)&mem)[2 << 21] = 0;
-    touch(rec + rsize / 2, rsize - rsize / 2);
+    touch(rec + rsize * 3 / 8, rsize - rsize * 3 / 8);
   } else
     regions(t);
   meet(NT); // the region table is complete
@@ -494,13 +494,14 @@ int main(void) {
   // Plain threads: they share main's thread-local block and use nothing of it
   // but errno, and take no memory for a TLS block or a thread descriptor.
   int fl = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
-  for (long t = 1; t < NT; t++)
+  // The helper first: it starts ahead of main, so it takes 5/8 of the file
+  for (long t = NT - 1; t > 0; t--)
     if (clone(worker, mem.stack[t + 1], fl, (void *)t) < 0)
       die("clone");
   // The other threads fill the region table meanwhile: all they touch before
   // the barrier lies on the first huge page.
   ((volatile u8 *)&mem)[1 << 21] = 0;
-  touch(rec, rsize / 2);
+  touch(rec, rsize * 3 / 8);
   worker(0);
   FILE *o = fopen("/out/aggregates.txt", "w");
   if (!o) die("/out/aggregates.txt");
