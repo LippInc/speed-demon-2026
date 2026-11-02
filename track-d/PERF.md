@@ -95,7 +95,7 @@ The 186x reduction came from six structural changes:
 - **Two-tier per-thread scratch held over n-sized global arrays**: 64K direct-mapped slots backed by 16K L2-sized open-addressing tables avoid O(n) reinitializations and keep label lookups within L2 cache budgets.
 - **Monotone bucket queues traded for radix and binary heaps**: a 2048-bucket ring of width 32 with 64-bit occupancy bitmasks replaced logarithmic heap operations with O(1) bitwise scans.
 - **Atomic reverse CSR placement traded for slab records**: building reverse CSRs via atomic in-degree counting and atomic placement into reused forward buffers eliminated ~30 MB of slab allocations, cutting reverse build time from 24-45 ms to 12-16 ms.
-- **Four-byte packed edges traded for 8-byte/6-byte representations**: packing head node IDs into `hb` bits and weights into `32 - hb` bits with side-table overflow fits 5,000,000 edges into ~20 MB of DRAM, maximizing memory bandwidth.
+- **Four-byte packed edges chosen over 8-byte and 6-byte representations**: packing head node IDs into `hb` bits and weights into `32 - hb` bits with side-table overflow fits 5,000,000 edges into ~20 MB of DRAM, maximizing memory bandwidth.
 - **Landmark (ALT) heuristics discarded**: computing forward and backward landmark potentials cost ~0.127 s of preprocessing and +55 MB memory, exceeding the query search time saved.
 - **Intermediate memory deallocation discarded**: freeing search tables or queue buckets between queries caused malloc churn without lowering RSS, which is anchored during graph construction.
 

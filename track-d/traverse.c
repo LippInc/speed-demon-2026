@@ -147,7 +147,10 @@ static void heavy_put(u32 kind, u64 index, u64 value) {
 }
 
 // Read side; reached only for an edge whose weight field holds the WMAX
-// sentinel, so the common edge never pays a table lookup.
+// sentinel, so the common edge never pays a table lookup. The probe ends because
+// every key is put in an earlier phase than the one that reads it: raw weights
+// in the rows, zone edges in the zones, forward rows in the rename, and reverse
+// rows before the queries.
 static u64 heavy_get(u32 kind, u64 index) {
   u64 key = (u64)kind << 48 | index, i = heavy_slot(key);
   while (heavy_table[i].key != key)
@@ -194,6 +197,9 @@ enum { LEAF = 1, TAKEN = 2, QUERIED = 4 };
 // a number, and the padding keeps those reads inside mapped memory.
 static const u8 *map_file(const char *path, size_t *len) {
   int fd = open(path, O_RDONLY);
+  // A missing input ends the run with its own exit code rather than a fault.
+  if (fd < 0)
+    _exit(3);
   *len = lseek(fd, 0, SEEK_END);
   u8 *p =
       mmap(0, *len + 3 * 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -471,8 +477,9 @@ INLINE int road_step(Zone *z, Road *r) {
   const u32 *row = rows + 4ul * at;
   u32 e0 = row[0], e1 = row[1], ways = 2;
   // A leaf (at most two ways out, not a query endpoint) is walked through, as
-  // long as the walk stays under 64 hops: the cap bounds a road that wanders or
-  // loops without ever offering a choice.
+  // long as the walk stays under 64 hops. The cap bounds a road that wanders or
+  // loops without ever offering a choice; when it trips, the node simply stays
+  // in the graph as a real node, so answers remain exact.
   if (state[at] & LEAF && r->hops++ < 64) {
     u32 ok0 = e0 != ALL_ONES && e0 >> 11 != r->back,
         ok1 = e1 != ALL_ONES && e1 >> 11 != r->back;
