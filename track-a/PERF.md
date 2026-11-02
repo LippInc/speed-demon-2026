@@ -293,6 +293,21 @@ Experiments measured on our bench box only, with no board run (their box status 
   Expected K: T -2.7 %, M +1.2 %, S +3.2 %: +1.6 %. Hash checked at 1, 4, 12 and 24 workers (seed 1 has 0.24 % long
   latencies, so the long path runs).
   - LOST: four 5-bit passes instead of two 10-bit ones (32 buckets stay in L1): 19.29 ms, user instructions 754 M.
+- a-61 board: `4c54723 run-210a1ffa297a | K 49.41 | T 18.35 ms | M 17.4 MB | S 566`.
+- a-62 (KNOWN shape, OURS code), kept: the parse reads forward, on a-61. Each line is read from its start: one 64-byte
+  space mask from byte 28 holds the method's end and, unless the endpoint is long (then 32 bytes more at a time), the
+  endpoint's; the status follows; one 8-byte load finds the latency's digits up to the LF (a SWAR test: after xor 0x30
+  a byte is a digit exactly when adding 0x76 leaves its top bit clear), and the next line starts after them. The 4 KiB
+  LF prescan goes. Two prefetches 1,280 and 1,344 bytes ahead per line: the hardware prefetcher stops at each 4 KiB page.
+  Box, 21 interleaved rounds: `a-61 med 17.96 | a-62 16.41`; perf stat: user instructions 676 -> 573 M, task-clock
+  194 -> 174 ms; peak over 4 runs 16.5-17.3 MB (a-61 16.3-17.0); S 566 -> 557. Expected K: T +4.6 %, M -0.4 %, S +0.2 %.
+  Hash checked: rule 30 kit, 40/40 runs on seeds 1, 52719364 and 248057911 at 1, 4, 12, 13 and 24 workers under four
+  busy loops; full local kit 423/481 against a-61's 418/481, the same out-of-spec failures (more than 2,048 endpoints,
+  hours outside the window) less five that a-61 failed: a last line with no LF now reads right.
+  - LOST: two to eight interleaved streams per block (one line of each in turn, the streams' state in a struct):
+    4 streams 18.47 ms with the prefetches, 18.78 without, 8 streams 19.02, 2 streams 17.72; one stream with its state
+    in locals (a-62) 16.41. Prefetch distance: 640, 1,280 and 2,048 bytes level (17.64-17.71 in that probe), one
+    prefetch 17.90, 4,096 bytes 17.91.
 
 ## Decisions
 

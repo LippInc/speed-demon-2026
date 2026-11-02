@@ -3,7 +3,7 @@
 //! row into its hour's region. An hour is finished (counted, sorted, formatted) as soon as the registered prefix of
 //! the file holds a line two hours later, while other threads keep parsing; its text is written over its rows, placed
 //! in hour order and written at its offset, and the region pooled for a later hour: only a few hours' rows are alive at
-//! once. Main tricks: parse and line (a-56, a-57), Table (a-10, a-40, a-57), finish and deal (a-61), Rows (a-59, a-60),
+//! once. Main tricks: parse and line (a-62), Table (a-10, a-40, a-57), finish and deal (a-61), Rows (a-59, a-60),
 //! the pipeline (a-55).
 use std::arch::x86_64::*;
 use std::sync::atomic::{AtomicUsize, Ordering::*};
@@ -64,34 +64,42 @@ fn digits8(v: u64) -> u64 {
     (r & 0xffff_ffff) * 10_000 + (r >> 32)
 }
 
-/// The endpoint's start and length, the 5xx flag and the latency of the line from p to its LF at lf (spec 2:
-/// "<timestamp> <method> <endpoint> <status> <latency>", the timestamp always 27 bytes). The space after the method
-/// is found from the front (one 32-byte mask: a method has at most 7 bytes) and the one before the latency from the
-/// back (one 16-byte mask: at most 10 digits); the 3-digit status sits just before it, its first digit '5' exactly for
-/// a 5xx. Safety: d + p..d + p + 60 and d + lf - 16..d + lf must be readable.
+/// The endpoint's start and length, the 5xx flag and the latency of the line at p, and the next line's start (spec 2:
+/// "<timestamp> <method> <endpoint> <status> <latency>", the timestamp always 27 bytes). A 64-byte space mask from
+/// the method on holds the space after the method (at most 7 bytes) and, unless the endpoint is long, the one after it;
+/// the 3-digit status follows, its first digit '5' exactly for a 5xx, then the latency, whose digits one 8-byte load
+/// finds up to its LF. Read forward, the next line's start comes out of the latency's length: no LF search first.
+/// Safety: d + p..d + p + 128 must be readable, and so must the line's end + 32.
 #[inline(always)]
-unsafe fn line(d: *const u8, p: usize, lf: usize) -> (usize, usize, u64, u32) {
+unsafe fn line(d: *const u8, p: usize) -> (usize, usize, u64, u32, usize) {
     unsafe {
-        let ep = p + 29 + mask32(d.add(p + 28), b' ').trailing_zeros() as usize;
-        let tail = _mm_loadu_si128(d.add(lf - 16) as _);
-        let spaces = _mm_movemask_epi8(_mm_cmpeq_epi8(tail, _mm_set1_epi8(b' ' as i8))) as u32;
-        let sp = lf - 16 + (31 - spaces.leading_zeros()) as usize;
-        let digits = lf - sp - 1;
-        // The 8 digit bytes ending at `at`, those before the last `keep` zeroed (they are spaces or status digits).
-        let last = |at: usize, keep: usize| {
-            ((d.add(at - 8) as *const u64).read_unaligned() ^ 0x3030_3030_3030_3030)
-                & u64::MAX << (8 * (8 - keep))
-        };
-        let mut latency = digits8(last(lf, digits.min(8)));
-        if digits > 8 {
-            latency += 100_000_000 * digits8(last(lf - 8, digits - 8));
+        let mut at = p + 28;
+        let m = mask32(d.add(at), b' ') as u64 | (mask32(d.add(at + 32), b' ') as u64) << 32;
+        let ep = at + 1 + m.trailing_zeros() as usize;
+        // The space after the endpoint; past the first 64 bytes, 32 at a time (bits stay relative to `at`).
+        let mut rest = m & m.wrapping_sub(1);
+        while rest == 0 {
+            at += 32;
+            rest = (mask32(d.add(at + 32), b' ') as u64) << 32;
         }
-        (
-            ep,
-            sp - 4 - ep,
-            (*d.add(sp - 3) == b'5') as u64,
-            latency as u32,
-        )
+        let sp = at + rest.trailing_zeros() as usize;
+        let v = (d.add(sp + 5) as *const u64).read_unaligned() ^ 0x3030_3030_3030_3030;
+        // After the xor a byte is a digit exactly when it is below 10; adding 0x76 sets the top bit of every other one.
+        let other = (v.wrapping_add(0x7676_7676_7676_7676) | v) & 0x8080_8080_8080_8080;
+        let n = other.trailing_zeros() as usize / 8;
+        let (latency, next) = if other == 0 {
+            // 8 digits or more (spec 2: at most 10): the rest one by one.
+            let (mut latency, mut at) = (digits8(v), sp + 13);
+            while *d.add(at) != b'\n' {
+                latency = latency * 10 + (*d.add(at) - b'0') as u64;
+                at += 1;
+            }
+            (latency, at + 1)
+        } else {
+            (digits8(v << (64 - 8 * n)), sp + 6 + n)
+        };
+        let error = (*d.add(sp + 1) == b'5') as u64;
+        (ep, sp - ep, error, latency as u32, next)
     }
 }
 
@@ -268,13 +276,9 @@ impl Table {
     }
 }
 
-/// Bytes whose LFs are found before their lines are read: 4 KiB keeps the LF list in a few cache lines.
-const CHUNK: usize = 4096;
-
 /// Writes a row for every line starting in data[start..end] into its hour's region (see `Rows`), through cur, this
-/// thread's open chunk per hour, and returns the lowest and highest hour met. Each chunk's LFs are found first, so a
-/// line is read from both its ends and no line waits for the one before it to be parsed. Reads may pass the input's
-/// end by up to 128 bytes: main maps zeros there.
+/// thread's open chunk per hour, and returns the lowest and highest hour met. Reads may pass the input's end by up to
+/// 128 bytes: main maps zeros there.
 fn parse(
     data: &[u8],
     (start, end): (usize, usize),
@@ -284,55 +288,40 @@ fn parse(
     cur: &mut [(*mut u32, *mut u32); HOURS],
 ) -> (usize, usize) {
     let d = data.as_ptr();
-    // Spec 2: every line is at least 40 bytes, so a chunk holds at most CHUNK / 40 + 1 lines, and a 64-byte window at
-    // most two LFs: both possible ones are stored and only the real ones counted.
-    let mut ends = [0u32; CHUNK / 40 + 3];
     let (mut prev_prefix, mut p, mut h, mut low, mut high) = (u64::MAX, start, 0, HOURS, 0);
     let mut c = cur[0]; // hour h's chunk: next row, last row but one
-    for from in (start..end).step_by(CHUNK) {
-        let to = (from + CHUNK).min(end);
-        let mut n = 0;
-        for i in (from..to).step_by(64) {
-            // Safety: the window is inside the input or its zero tail, and n + 2 <= ends.len().
+    while p < end {
+        // Lines usually share the previous line's hour, so compare it first: spec 2's year is always 2026, so bytes
+        // 5..13 ("MM-DDTHH") name the hour, one u64 load (a-56). Two lines ahead are asked for meanwhile: the
+        // prefetcher stops at each 4 KiB page (box: 18.12 -> 17.69 ms).
+        // Safety: a line has at least 40 bytes; a prefetch never faults.
+        let prefix = unsafe {
+            _mm_prefetch::<_MM_HINT_T0>(d.add(p + 1280) as _);
+            _mm_prefetch::<_MM_HINT_T0>(d.add(p + 1344) as _);
+            (d.add(p + 5) as *const u64).read_unaligned()
+        };
+        if prefix != prev_prefix {
+            cur[h] = c;
+            h = hour_index(&data[p..]);
+            (c, low, high, prev_prefix) = (cur[h], low.min(h), high.max(h), prefix);
+        }
+        // Safety: the line and the 128 bytes after its start are inside the input or its zero tail.
+        let (ep, len, error, latency, next) = unsafe { line(d, p) };
+        let e = table.endpoint(dict, data, ep, len);
+        let row = (e + 1) << 21 | (error as u32) << 20;
+        if latency < ESCAPE {
+            if c.0 == c.1 {
+                c = rows.claim(h);
+            }
+            // Safety: c.0 < c.1, the claimed chunk's end.
             unsafe {
-                let m = (mask32(d.add(i), b'\n') as u64
-                    | (mask32(d.add(i + 32), b'\n') as u64) << 32)
-                    & _bzhi_u64(!0, (to - i).min(64) as u32);
-                *ends.get_unchecked_mut(n) = (i - from) as u32 + m.trailing_zeros();
-                *ends.get_unchecked_mut(n + 1) =
-                    (i - from) as u32 + (m & m.wrapping_sub(1)).trailing_zeros();
-                n += m.count_ones() as usize;
+                *c.0 = row | latency;
+                c.0 = c.0.add(1);
             }
+        } else {
+            rows.long(h, row, latency);
         }
-        for &lf in &ends[..n] {
-            let lf = from + lf as usize;
-            // Lines usually share the previous line's hour, so compare it first: spec 2's year is always 2026, so bytes
-            // 5..13 ("MM-DDTHH") name the hour, one u64 load (a-56).
-            // Safety: a line has at least 40 bytes.
-            let prefix = unsafe { (d.add(p + 5) as *const u64).read_unaligned() };
-            if prefix != prev_prefix {
-                cur[h] = c;
-                h = hour_index(&data[p..]);
-                (c, low, high, prev_prefix) = (cur[h], low.min(h), high.max(h), prefix);
-            }
-            // Safety: the line and the 60 bytes after its start are inside the input or its zero tail.
-            let (ep, len, error, latency) = unsafe { line(d, p, lf) };
-            let e = table.endpoint(dict, data, ep, len);
-            let row = (e + 1) << 21 | (error as u32) << 20;
-            if latency < ESCAPE {
-                if c.0 == c.1 {
-                    c = rows.claim(h);
-                }
-                // Safety: c.0 < c.1, the claimed chunk's end.
-                unsafe {
-                    *c.0 = row | latency;
-                    c.0 = c.0.add(1);
-                }
-            } else {
-                rows.long(h, row, latency);
-            }
-            p = lf + 1;
-        }
+        p = next;
     }
     cur[h] = c;
     (low, high)
