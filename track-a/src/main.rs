@@ -16,6 +16,7 @@ use std::ptr::{copy_nonoverlapping as copy, null_mut};
 use std::slice::{from_raw_parts, from_raw_parts_mut};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::*};
 use std::sync::{LazyLock, Mutex, OnceLock};
+use std::{thread::Scope, time::Duration};
 use std::{collections::*, fs::File, process::Command};
 
 // Spec 2: every timestamp lies in the same 72 hours for every seed and scale, 2026-10-30T18:00Z to 2026-11-02T17:59Z.
@@ -140,9 +141,10 @@ type Cell = [u32; 6];
 type Chunk = (*mut u32, *mut u32);
 
 /// The run's shared progress, under one lock. Each thread takes, in this order: an hour that is safe to finish, else the
-/// next block, at most two per thread past the oldest unparsed one, so few rows wait; else, once the input is parsed, the
-/// text of the next hour whose place is known; else it spins a moment and looks again (a sleep costs a wake-up, about
-/// 130 us on the box). Measured effect: PERF.md a-55, a-67, a-69.
+/// next block; else, once the input is parsed, the text of the next hour whose place is known; else it spins a moment and
+/// looks again (a sleep costs a wake-up, about 130 us on the box). Every 32nd look it does sleep: its CPU goes idle, and an
+/// idle CPU takes over a thread that another process has pushed off its own (a-70: 22.0 -> 15.9 ms beside one busy process;
+/// spinning threads leave it waiting for its turn, 3 ms or more). Measured effect: PERF.md a-55, a-67, a-69.
 #[derive(Default)]
 struct State {
     next_block: usize,
@@ -428,9 +430,10 @@ fn deal<const N: usize>(src: &[u32], dst: &mut [u32], hist: &mut [u32; N], shift
 }
 
 /// One of the run's threads; out and cells are the output's and the cells' mappings, as addresses.
-fn work(data: &[u8], out: usize, cells: usize, workers: usize, lag: usize) {
+fn work(data: &[u8], out: usize, cells: usize, lag: usize) {
     let nblocks = data.len().div_ceil(BLOCK);
     let mut cur = [(null_mut(), null_mut()); HOURS];
+    let mut idle = 0;
     let mut s = STATE.lock().unwrap();
     while !s.late && s.next_text < HOURS {
         let parsed = s.watermark == nblocks;
@@ -456,7 +459,7 @@ fn work(data: &[u8], out: usize, cells: usize, workers: usize, lag: usize) {
             drop(s);
             // Safety: nothing reads the region now.
             unsafe { madvise(r, STRIDE * parsed as usize, 4) };
-        } else if s.next_block < nblocks && s.next_block < s.watermark + 2 * workers {
+        } else if s.next_block < nblocks {
             let b = s.next_block;
             s.next_block += 1;
             drop(s);
@@ -484,6 +487,10 @@ fn work(data: &[u8], out: usize, cells: usize, workers: usize, lag: usize) {
             text(h, place, out as *mut u8, cells as *mut Cell);
         } else {
             drop(s);
+            idle += 1;
+            if idle % 32 == 0 {
+                std::thread::sleep(Duration::from_micros(1));
+            }
             (0..64).for_each(|_| std::hint::spin_loop());
         }
         s = STATE.lock().unwrap();
@@ -496,6 +503,14 @@ extern "C" fn holder(_: *mut u8) -> i32 {
     // PR_SET_PDEATHSIG 1, SIGKILL 9.
     unsafe { prctl(1, 9usize) };
     unsafe { pause() }
+}
+
+/// Thread i of a run starts threads 2i and 2i + 1: the last one is up after four spawns, not eleven.
+fn go<'s, 'e>(s: &'s Scope<'s, 'e>, i: usize, job: (&'static [u8], usize, usize, usize, usize)) {
+    for c in [2 * i, 2 * i + 1].into_iter().filter(|&c| c <= job.3) {
+        s.spawn(move || go(s, c, job));
+    }
+    work(job.0, job.1, job.2, job.4);
 }
 
 #[unsafe(no_mangle)]
@@ -530,10 +545,7 @@ extern "C" fn main() -> i32 {
     NAMES.lock().unwrap().0.reserve(IDS);
     let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
     let lag = [LAG, HOURS][(std::env::args().len() > 1) as usize];
-    std::thread::scope(|s| {
-        (1..workers).for_each(|_| drop(s.spawn(move || work(data, out, cells, workers, lag))));
-        work(data, out, cells, workers, lag);
-    });
+    std::thread::scope(|s| go(s, 1, (data, out, cells, workers, lag)));
     let st = STATE.lock().unwrap();
     if st.late {
         // A line came after its hour was finished. Nothing is written yet: again, with no hour finished before every
