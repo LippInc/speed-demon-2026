@@ -37,14 +37,6 @@ typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t
 #define MISS 0x7FFFFFFFu  // lookup value of a token that is no query term
 #define PROBE 0x7FFFFFFEu // a bucket's miss value once a key was probed past it
 
-#ifdef TIMING
-#include <time.h>
-static double t0;
-static double ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
-#define MARK(...) (fprintf(stderr, "%8.2f ", ms() - t0), fprintf(stderr, __VA_ARGS__))
-#else
-#define MARK(...) ((void)0)
-#endif
 
 static void die(const char *m) { fprintf(stderr, "bindex: %s\n", m); exit(1); }
 
@@ -556,7 +548,6 @@ static void *worker(void *arg) {
     if (w == nw - 1) qbase[nw] = nq = base + n;
     parse(qtxt + qs[w], qtxt + qs[w + 1], base);
     pthread_barrier_wait(&bar);
-    if (!w) MARK("parsed\n");
     // 2. sample, sum the samples by slot range, renumber, rewrite the table
     sample(me, w);
     pthread_barrier_wait(&bar);
@@ -580,7 +571,6 @@ static void *worker(void *arg) {
     if (!w) {
         ndense = tot[0]; nsparse = tot[1]; nterms = tot[0] + tot[1] + tot[2];
         if (nsparse > 65536) die("over 65,536 rare BOOL terms");
-        MARK("classified: %u dense, %u rare BOOL terms\n", ndense, nsparse);
     }
     pthread_barrier_wait(&bar);
     // Phrase queries listed per anchor term: counted, offsets summed, filled.
@@ -619,9 +609,7 @@ static void *worker(void *arg) {
         scan_part(me, p);
         uintptr_t a = ((uintptr_t)doc + pstart[p] + 4095) & ~(uintptr_t)4095, b = ((uintptr_t)doc + pstart[p + 1]) & ~(uintptr_t)4095;
         if (a < b) madvise((void *)a, b - a, MADV_DONTNEED);   // the text's page-table entries, dropped in parallel, not at exit
-        if (!w || w == nw - 1) MARK("w%d part %d scanned\n", w, p);
         eval_part(me, p);
-        if (!w || w == nw - 1) MARK("w%d part %d answered\n", w, p);
     }
     madvise(me->heap, me->hsize, MADV_DONTNEED);   // in parallel; munmap would take the lock for writing
     pthread_barrier_wait(&bar);
@@ -636,9 +624,6 @@ static u32 id_at(const u8 *p) { u32 v = 0; while (*p >= '0' && *p <= '9') v = v 
 
 int main(int argc, char **argv) {
     const char *in = argc > 1 ? argv[1] : "/data", *out = argc > 2 ? argv[2] : "/out";
-#ifdef TIMING
-    t0 = ms();
-#endif
     cpu_set_t cs;
     sched_getaffinity(0, sizeof cs, &cs);      // nproc counts every core; the box gives us 12
     nw = getenv("SD_WORKERS") ? atoi(getenv("SD_WORKERS")) : CPU_COUNT(&cs);
@@ -680,7 +665,6 @@ int main(int argc, char **argv) {
     for (int w = 1; w < nw; w++) pthread_create(&th[w], NULL, worker, (void *)(long)w);
     worker(NULL);
     for (int w = 1; w < nw; w++) pthread_join(th[w], NULL);
-    MARK("merged\n");
     char path[4096];
     snprintf(path, sizeof path, "%s/results.txt", out);
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
