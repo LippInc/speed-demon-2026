@@ -143,19 +143,17 @@ The 186x reduction came from six structural changes:
 
 The Rust program above spent 168 ms and 107 MB, and the top of the board stood at half of both, so no single phase could explain the gap. The program was rewritten from nothing in C (`traverse.c`) rather than tuned. Tag KNOWN means a technique already used elsewhere (published work or other entries), written here in our own code. OURS means we have not seen it elsewhere; it is not a claim that nobody has done it.
 
-| Decision | Tag | What it did on the box |
-|---|---|---|
-| Road contraction: a node with at most two ways out and no query on it is walked through | KNOWN | 1.74 M nodes to 1.20 M, 5 M edges to 3.91 M |
-| One BFS pass does contraction, ordering and gathering, with a batch of road walks stepping together | KNOWN | |
-| Four slots per node in the first rows, so a row is one cache miss | KNOWN | |
-| 16-bit labels with a 64-bit redo, blocks handed out in order | KNOWN | |
-| Reverse rows by id slices, with a list for the edges that cross | KNOWN | rev 4.3 ms |
-| Unlocked claims, a duplicate is harmless because heads take the id written last | KNOWN | zones 23.5 -> 17.1 ms |
-| Separator masks flattened in 4 KB runs, three numbers per line in one vector register | KNOWN parts, OURS as combined | parse 7.3 ms against 26 ms in Rust |
-| First rows written in place over the finished bins | OURS | no faults and no frees in that phase |
-| Dropping dead roads at the end of each batch | OURS | 128,000 fewer edges (3 %) than keeping them as self-loops |
-| Source with no in-edges = lightest first edge + normal search, second edge only if it can still win | OURS | fresh seed queries 39.5 -> 29.6 ms |
-| Huge pages for all final rows, one thread per page, one contiguous layout, recycled queue arrays | KNOWN | query phase anonymous memory 53.5 -> 49.8 MB |
+- Road contraction: a node with at most two ways out and no query on it is walked through (KNOWN): 1.74 M nodes to 1.20 M, 5 M edges to 3.91 M.
+- One BFS pass does contraction, ordering and gathering, with a batch of road walks stepping together (KNOWN).
+- Four slots per node in the first rows, so a row is one cache miss (KNOWN).
+- 16-bit labels with a 64-bit redo, blocks handed out in order (KNOWN).
+- Reverse rows by id slices, with a list for the edges that cross (KNOWN): rev 4.3 ms.
+- Unlocked claims, a duplicate is harmless because heads take the id written last (KNOWN): zones 23.5 -> 17.1 ms.
+- Separator masks flattened in 4 KB runs, three numbers per line in one vector register (KNOWN parts, OURS as combined): parse 7.3 ms against 26 ms in Rust.
+- First rows written in place over the finished bins (OURS): no faults and no frees in that phase.
+- Dropping dead roads at the end of each batch (OURS): 128,000 fewer edges (3 %) than keeping them as self-loops.
+- Source with no in-edges = lightest first edge + normal search, second edge only if it can still win (OURS): fresh seed queries 39.5 -> 29.6 ms.
+- Huge pages for all final rows, one thread per page, one contiguous layout, recycled queue arrays (KNOWN): query phase anonymous memory 53.5 -> 49.8 MB.
 
 Reading the compiled code paid twice. gcc turned `take ? nd : old` into a branch that goes either way about half the time; written as a mask, queries went 34.3 -> 27.4 ms. And false sharing cost nearly a third of the zones phase, from `Zone` structs side by side on one cache line (zones 31 -> 23.5 ms).
 
